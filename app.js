@@ -1,0 +1,2359 @@
+/* =====================================================================
+   FOODLINE · Комерційний пульт
+   Аналітика продажів, економіки, промо-плану та результатів промо.
+   ===================================================================== */
+
+/* ------------------------------ СТАН ------------------------------ */
+
+const APP = {
+  cfg: {
+    endpoint: '',
+    token: '',
+    vatIncluded: false,      // виручка у джерелі містить ПДВ
+    vatRate: 20,
+    moneyRate: 25,           // річна вартість грошей, % — для оцінки відтермінування
+    promoShare: 100,         // яку частку глибини знижки фінансує виробник, %
+    logistics: 0             // додаткові логістичні витрати, % від виручки
+  },
+  raw: { sales: null, cost: null, terms: null, promo: null, promoDiag: null, generated: '' },
+  d: {
+    sales: [], cost: {}, terms: [], termsMap: {}, promo: [],
+    skuList: [], chains: [], brands: [], years: [], partners: [],
+    promoMonth: {},          // chainKey|sku|ym -> {weeks, depthAvg, depthMax, plan}
+    promoWeeks: [],          // відсортований список ISO-тижнів
+    matchLog: [], anomalies: []
+  },
+  f: { years: [], chains: [], brands: [], skus: [], search: '', chan: 'all' },
+  view: 'overview',
+  charts: {}
+};
+
+const LS = 'foodline_dash_v1';
+
+/* ------------------------------ УТИЛІТИ ------------------------------ */
+
+const nf0 = new Intl.NumberFormat('uk-UA', { maximumFractionDigits: 0 });
+const nf1 = new Intl.NumberFormat('uk-UA', { minimumFractionDigits: 1, maximumFractionDigits: 1 });
+const nf2 = new Intl.NumberFormat('uk-UA', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+function n0(v) { return isFinite(v) ? nf0.format(Math.round(v)) : '—'; }
+function n1(v) { return isFinite(v) ? nf1.format(v) : '—'; }
+function n2(v) { return isFinite(v) ? nf2.format(v) : '—'; }
+function pct(v, d) { return isFinite(v) ? (d === 1 ? nf1.format(v) : nf0.format(v)) + '%' : '—'; }
+
+/** Компактні гроші для KPI */
+function money(v) {
+  if (!isFinite(v)) return '—';
+  const a = Math.abs(v);
+  if (a >= 1e9) return nf2.format(v / 1e9) + ' млрд';
+  if (a >= 1e6) return nf2.format(v / 1e6) + ' млн';
+  if (a >= 1e4) return nf0.format(v / 1e3) + ' тис';
+  return nf0.format(v);
+}
+function delta(cur, prev) {
+  if (!prev) return null;
+  return (cur / prev - 1) * 100;
+}
+function dEl(v, invert) {
+  if (v === null || !isFinite(v)) return '<span class="d">—</span>';
+  const good = invert ? v < 0 : v > 0;
+  const cls = Math.abs(v) < 0.05 ? '' : (good ? 'up' : 'down');
+  const sign = v > 0 ? '+' : '';
+  return `<span class="d ${cls}">${sign}${n1(v)}% р/р</span>`;
+}
+function ppEl(v) {
+  if (v === null || !isFinite(v)) return '<span class="d">—</span>';
+  const cls = Math.abs(v) < 0.05 ? '' : (v > 0 ? 'up' : 'down');
+  return `<span class="d ${cls}">${v > 0 ? '+' : ''}${n1(v)} п.п. р/р</span>`;
+}
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, c =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+function el(id) { return document.getElementById(id); }
+function sum(arr, f) { let s = 0; for (const x of arr) s += f(x) || 0; return s; }
+function uniq(arr) { return Array.from(new Set(arr)); }
+function median(a) {
+  if (!a.length) return 0;
+  const s = a.slice().sort((x, y) => x - y), m = s.length >> 1;
+  return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+}
+function mean(a) { return a.length ? a.reduce((x, y) => x + y, 0) / a.length : 0; }
+function stdev(a) {
+  if (a.length < 2) return 0;
+  const m = mean(a);
+  return Math.sqrt(a.reduce((s, x) => s + (x - m) ** 2, 0) / (a.length - 1));
+}
+const MONTH_UA = ['', 'січень', 'лютий', 'березень', 'квітень', 'травень', 'червень',
+  'липень', 'серпень', 'вересень', 'жовтень', 'листопад', 'грудень'];
+const MONTH_SH = ['', 'січ', 'лют', 'бер', 'кві', 'тра', 'чер', 'лип', 'сер', 'вер', 'жов', 'лис', 'гру'];
+
+const MONTH_LOOKUP = (() => {
+  const m = {};
+  const ru = ['январь','февраль','март','апрель','май','июнь','июль','август','сентябрь','октябрь','ноябрь','декабрь'];
+  ru.forEach((x, i) => m[x] = i + 1);
+  MONTH_UA.forEach((x, i) => { if (x) m[x] = i; });
+  MONTH_SH.forEach((x, i) => { if (x) m[x] = i; });
+  ['янв','фев','мар','апр','мая','июн','июл','авг','сен','окт','ноя','дек']
+    .forEach((x, i) => m[x] = i + 1);
+  return m;
+})();
+
+/** Приймає і число, і назву місяця українською чи російською */
+function monthNum(v) {
+  if (typeof v === 'number' && v >= 1 && v <= 12) return v;
+  const n = parseInt(v, 10);
+  if (n >= 1 && n <= 12 && String(v).trim() === String(n)) return n;
+  const s = String(v || '').toLowerCase().replace(/[.\s]/g, '');
+  if (MONTH_LOOKUP[s]) return MONTH_LOOKUP[s];
+  for (const k in MONTH_LOOKUP) if (s.startsWith(k)) return MONTH_LOOKUP[k];
+  return 0;
+}
+
+function ymOf(y, m) { return y + '-' + String(m).padStart(2, '0'); }
+function ymLabel(ym) {
+  const [y, m] = ym.split('-');
+  return MONTH_SH[+m] + ' ' + y.slice(2);
+}
+
+const PALETTE = ['#E8A33D', '#6F8FD0', '#86B860', '#D9563F', '#B07AB4', '#55A99B',
+  '#D98BA0', '#C9A227', '#7E93A8', '#A8815C', '#8FB3D9', '#CF8B5B'];
+function colorFor(i) { return PALETTE[i % PALETTE.length]; }
+
+/* ------------------------------ МЕРЕЖІ ------------------------------ */
+
+const CHAIN_RULES = [
+  { key: 'АТБ', re: /атб/i },
+  { key: 'Сільпо (Фоззі-Фуд)', re: /фоззі|фоззи|fozzy|сільпо|сильпо/i },
+  { key: 'ФОРА', re: /\bфора\b/i },
+  { key: 'Новус', re: /новус|novus/i },
+  { key: 'Фудмаркет (Велмарт)', re: /фудмаркет|велмарт|volwest|велмат/i },
+  { key: 'МЕТРО', re: /метро|metro/i },
+  { key: 'Ашан', re: /ашан|auchan/i },
+  { key: 'ЕКО-маркет', re: /еко-?маркет/i },
+  { key: 'Варус (Омега ТОВ)', re: /варус|омега/i },
+  { key: 'Ей Ті Бі', re: /^atb/i }
+];
+const CHAIN_OTHER = 'Інші канали';
+
+function chainOf(partner) {
+  const over = APP.overrides.chain[partner];
+  if (over) return over;
+  for (const r of CHAIN_RULES) if (r.re.test(partner)) return r.key;
+  return CHAIN_OTHER;
+}
+
+/* --------------------- НОРМАЛІЗАЦІЯ НАЗВ SKU --------------------- */
+
+const STOP = new Set(['соус', 'соусы', 'шт', 'х', 'x', 'мл', 'л', 'гр', 'г', 'кг', 'ящ',
+  'пет', 'new', 'та', 'з', 'и', 'с', 'для', 'the', 'sauce']);
+
+function skuTokens(s) {
+  return String(s || '').toLowerCase()
+    .replace(/[«»"'()\[\],.\\/№]/g, ' ')
+    .replace(/[-–—]/g, ' ')
+    .split(/\s+/)
+    .filter(w => w && w.length > 1 && !STOP.has(w) && !/^\d+$/.test(w));
+}
+
+/** Обсяг у мл (рідина) або г (паста) — для перевірки збігу */
+function skuVolume(s) {
+  const t = String(s || '').toLowerCase().replace(/\u00A0/g, ' ');
+  const m = t.match(/(\d+[.,]?\d*)\s*(мл|л\b|гр|г\b|кг)/);
+  if (!m) return null;
+  let v = parseFloat(m[1].replace(',', '.'));
+  const u = m[2];
+  if (u === 'л') v *= 1000;
+  if (u === 'кг') v *= 1000;
+  return Math.round(v);
+}
+
+function jaccard(a, b) {
+  const A = new Set(a), B = new Set(b);
+  let inter = 0;
+  A.forEach(x => { if (B.has(x)) inter++; });
+  const uni = A.size + B.size - inter;
+  return uni ? inter / uni : 0;
+}
+
+/** Підбирає найближчу назву SKU з продажів до назви з промо-плану */
+function matchSku(name, index) {
+  const over = APP.overrides.sku[name];
+  if (over) return { sku: over, score: 1, manual: true };
+  if (index.exact[name]) return { sku: index.exact[name], score: 1 };
+
+  const tk = skuTokens(name), vol = skuVolume(name);
+  let best = null, bestRank = 0, bestSim = 0;
+  for (const c of index.list) {
+    const j = jaccard(tk, c.tk);
+    let rank = j;
+    if (vol && c.vol) rank += (vol === c.vol ? 0.35 : -0.25);
+    else if (vol || c.vol) rank -= 0.05;
+    if (rank > bestRank) { bestRank = rank; bestSim = j; best = c.sku; }
+  }
+  return bestRank >= 0.42
+    ? { sku: best, score: bestSim }
+    : { sku: null, score: bestSim, near: best };
+}
+
+/* ------------------------------ ЗАВАНТАЖЕННЯ ------------------------------ */
+
+function jsonp(url, timeout = 60000) {
+  return new Promise((resolve, reject) => {
+    const cb = 'flcb_' + Math.random().toString(36).slice(2);
+    const s = document.createElement('script');
+    const t = setTimeout(() => { cleanup(); reject(new Error('Таймаут запиту')); }, timeout);
+    function cleanup() { clearTimeout(t); delete window[cb]; s.remove(); }
+    window[cb] = data => { cleanup(); resolve(data); };
+    s.onerror = () => { cleanup(); reject(new Error('Не вдалося звернутися до вебдодатку')); };
+    s.src = url + (url.includes('?') ? '&' : '?') + 'callback=' + cb;
+    document.head.appendChild(s);
+  });
+}
+
+function setStatus(mode, text) {
+  const s = el('status');
+  s.className = 'status ' + mode;
+  el('statusText').textContent = text;
+}
+
+async function loadFromEndpoint(fresh) {
+  const c = APP.cfg;
+  if (!c.endpoint) { setStatus('err', 'джерело не задано'); return false; }
+  setStatus('load', 'завантаження…');
+  try {
+    const url = c.endpoint + '?action=all&token=' + encodeURIComponent(c.token) + (fresh ? '&fresh=1' : '');
+    const r = await jsonp(url);
+    if (!r || r.ok === false) throw new Error(r && r.error === 'BAD_TOKEN' ? 'Невірний токен' : (r && r.error) || 'Порожня відповідь');
+    ingest(r);
+    saveCfg();
+    setStatus('ok', `${n0(APP.d.sales.length)} рядків · ${new Date(r.generated).toLocaleString('uk-UA')}`);
+    return true;
+  } catch (e) {
+    setStatus('err', e.message);
+    return false;
+  }
+}
+
+function ingest(r) {
+  APP.raw = {
+    sales: r.sales || null, cost: r.cost || null, terms: r.terms || null,
+    promo: r.promo || null, promoDiag: r.promoDiag || null, generated: r.generated || ''
+  };
+  try { localStorage.setItem(LS + '_data', JSON.stringify(APP.raw)); } catch (e) { }
+  build();
+}
+
+function tableToObjects(t) {
+  if (!t || !t.rows) return [];
+  const c = t.cols;
+  return t.rows.map(row => {
+    const o = {};
+    for (let i = 0; i < c.length; i++) o[c[i]] = row[i];
+    return o;
+  });
+}
+
+/* ------------------------------ ПОБУДОВА МОДЕЛІ ------------------------------ */
+
+function build() {
+  const R = APP.raw, D = APP.d;
+
+  /* --- собівартість --- */
+  D.cost = {};
+  tableToObjects(R.cost).forEach(o => {
+    D.cost[o.sku] = {
+      unit: +o.unitCost || 0, mat: +o.matPerUnit || 0,
+      wage: +o.wagePerUnit || 0, extra: +o.extraPerUnit || 0
+    };
+  });
+
+  /* --- умови мереж --- */
+  D.terms = tableToObjects(R.terms);
+  D.termsMap = {};
+  D.terms.forEach(t => {
+    D.termsMap[t.chain] = t;
+    // зіставлення з ключем правил
+    for (const r of CHAIN_RULES) if (r.re.test(t.chain)) D.termsMap[r.key] = t;
+  });
+
+  /* --- продажі --- */
+  const vatDiv = APP.cfg.vatIncluded ? (1 + APP.cfg.vatRate / 100) : 1;
+  D.sales = tableToObjects(R.sales).map(o => {
+    const mo = monthNum(o.month);
+    const rev = (+o.revenue || 0) / vatDiv;
+    const qty = +o.qty || 0;
+    const cost = D.cost[o.sku];
+    const unitCost = cost ? cost.unit : null;
+    const cogs = unitCost === null ? null : unitCost * qty;
+    const ck = chainOf(o.partner);
+    const term = D.termsMap[ck];
+    const bonusPct = term ? (+term.totalBonus || 0) : 0;
+    const delayDays = term ? (+term.delayDays || 0) : 0;
+    const bonus = rev * bonusPct / 100;
+    const fin = rev * (delayDays / 365) * (APP.cfg.moneyRate / 100);
+    const logi = rev * (APP.cfg.logistics / 100);
+    const gross = cogs === null ? null : rev - cogs;
+    const net = gross === null ? null : gross - bonus - fin - logi;
+    return {
+      y: +o.year, m: mo, ym: ymOf(+o.year, mo),
+      partner: o.partner, chain: ck, brand: o.brand, sku: o.sku,
+      division: o.division, manager: o.manager,
+      qty, litres: +o.litres || 0, rev, outlets: +o.outlets || 0,
+      unitCost, cogs, gross, bonusPct, bonus, fin, logi, net,
+      price: qty ? rev / qty : 0
+    };
+  });
+
+  D.sales = D.sales.filter(r => r.y > 0 && r.m > 0);
+  D.years = uniq(D.sales.map(r => r.y)).sort();
+  D.chains = uniq(D.sales.map(r => r.chain)).sort();
+  D.brands = uniq(D.sales.map(r => r.brand)).sort();
+  D.partners = uniq(D.sales.map(r => r.partner)).sort();
+  D.skuList = uniq(D.sales.map(r => r.sku)).sort();
+
+  /* --- індекс для зіставлення SKU --- */
+  const idx = { exact: {}, list: [] };
+  D.skuList.forEach(s => {
+    idx.exact[s] = s;
+    idx.list.push({ sku: s, tk: skuTokens(s), vol: skuVolume(s) });
+  });
+  D.skuIndex = idx;
+
+  /* --- промо --- */
+  buildPromo();
+
+  /* --- аномалії --- */
+  detectAnomalies();
+
+  if (!APP.f.years.length) APP.f.years = D.years.slice(-2);
+}
+
+function buildPromo() {
+  const D = APP.d;
+  const rows = tableToObjects(APP.raw.promo);
+  const log = {};
+  const weeks = new Set();
+
+  D.promo = rows.map(o => {
+    const chainKey = chainOfSheet(o.chain);
+    const mm = matchSku(o.sku, D.skuIndex);
+    if (o.sku) {
+      if (!log[o.sku]) log[o.sku] = { promoName: o.sku, sku: mm.sku, score: mm.score, near: mm.near, n: 0, chains: new Set() };
+      log[o.sku].n++;
+      log[o.sku].chains.add(o.chain);
+    }
+    if (o.week) weeks.add(o.week);
+    return {
+      sheet: o.chain, chain: chainKey, brand: o.brand,
+      promoSku: o.sku, sku: mm.sku, matchScore: mm.score,
+      barcode: o.barcode, article: o.article, planPrice: +o.price || 0,
+      week: o.week, metric: o.metric, text: o.text,
+      value: o.value === null || o.value === undefined ? null : +o.value,
+      depth: o.depth === null || o.depth === undefined ? null : +o.depth
+    };
+  });
+
+  D.matchLog = Object.values(log).map(x => ({ ...x, chains: Array.from(x.chains) }))
+    .sort((a, b) => a.score - b.score);
+  D.promoWeeks = Array.from(weeks).sort();
+
+  /* агрегація промо до місяця */
+  const pm = {};
+  D.promo.forEach(p => {
+    if (!p.week || !p.sku) return;
+    const ym = p.week.slice(0, 7);
+    const k = p.chain + '|' + p.sku + '|' + ym;
+    if (!pm[k]) pm[k] = { weeks: 0, depths: [], plan: 0, chain: p.chain, sku: p.sku, ym };
+    if (p.metric === 'промо') {
+      pm[k].weeks++;
+      if (p.depth !== null) pm[k].depths.push(p.depth);
+    } else if (p.value && /план|прогноз|кол-во|кількі/i.test(p.metric)) {
+      pm[k].plan += p.value;
+    }
+  });
+  Object.values(pm).forEach(v => {
+    v.depthAvg = v.depths.length ? mean(v.depths) : null;
+    v.depthMax = v.depths.length ? Math.max(...v.depths) : null;
+  });
+  D.promoMonth = pm;
+}
+
+function chainOfSheet(sheet) {
+  const over = APP.overrides.chain[sheet];
+  if (over) return over;
+  for (const r of CHAIN_RULES) if (r.re.test(sheet)) return r.key;
+  return sheet;
+}
+
+/* ------------------------------ АНОМАЛІЇ ------------------------------ */
+
+function detectAnomalies() {
+  const D = APP.d, out = [];
+
+  /* 1. SKU у продажах без собівартості */
+  const noCost = D.skuList.filter(s => !D.cost[s]);
+  if (noCost.length) {
+    const rev = sum(D.sales.filter(r => !r.unitCost && r.unitCost !== 0), r => r.rev);
+    out.push({
+      lvl: 'warn', t: 'SKU без собівартості',
+      d: `${noCost.length} позицій із продажів відсутні в аркуші «Собівартість». Їхня виручка (${money(rev)} ₴) враховується у обороті, але не в марж.`,
+      items: noCost.slice(0, 40)
+    });
+  }
+
+  /* 2. Літраж не відповідає обсягу з назви */
+  const byS = {};
+  D.sales.forEach(r => {
+    if (!r.qty) return;
+    if (!byS[r.sku]) byS[r.sku] = { qty: 0, lit: 0 };
+    byS[r.sku].qty += r.qty; byS[r.sku].lit += r.litres;
+  });
+  const bad = [];
+  Object.entries(byS).forEach(([sku, v]) => {
+    const vol = skuVolume(sku);
+    if (!vol || !v.qty) return;
+    const actual = v.lit / v.qty;          // л на одиницю
+    const expect = vol / 1000;
+    if (expect > 0 && (actual / expect > 8 || actual / expect < 0.12)) {
+      bad.push({ sku, actual, expect, ratio: actual / expect });
+    }
+  });
+  if (bad.length) {
+    out.push({
+      lvl: 'err', t: 'Помилка одиниць виміру в колонці «Литров»',
+      d: `${bad.length} SKU мають літраж, що розходиться з обсягом у назві більш ніж у 8 разів — найімовірніше, значення записані в мілілітрах замість літрів. Це спотворює будь-який аналіз «за літр».`,
+      items: bad.map(b => `${b.sku}: ${n2(b.actual)} л/од замість ~${n2(b.expect)} (×${n0(b.ratio)})`)
+    });
+  }
+
+  /* 3. Мережі без заповнених умов */
+  const noTerms = D.chains.filter(c => c !== CHAIN_OTHER && !D.termsMap[c]);
+  const emptyTerms = D.terms.filter(t => !(+t.totalBonus) || /⚠|заповнити/i.test(t.status || ''));
+  if (noTerms.length || emptyTerms.length) {
+    out.push({
+      lvl: 'warn', t: 'Умови мереж неповні',
+      d: 'Для цих мереж бонусне навантаження прийнято за 0% — чиста маржа по них завищена.',
+      items: uniq(noTerms.concat(emptyTerms.map(t => t.chain + ' (' + t.status + ')')))
+    });
+  }
+
+  /* 4. Промо-SKU без відповідника у продажах */
+  const unmatched = D.matchLog.filter(m => !m.sku);
+  if (unmatched.length) {
+    out.push({
+      lvl: 'warn', t: 'Позиції промо-плану без пари у продажах',
+      d: `${unmatched.length} назв із промо-плану не зіставилися автоматично. Вони не потраплять в аналіз ефективності промо, доки не задати відповідність вручну.`,
+      items: unmatched.slice(0, 30).map(m => `${m.promoName} → найближче: ${m.near || '—'}`)
+    });
+  }
+
+  /* 5. Продажі нижче собівартості */
+  const below = {};
+  D.sales.forEach(r => {
+    if (r.unitCost === null || !r.qty || r.rev <= 0) return;
+    if (r.price < r.unitCost) {
+      const k = r.sku + '|' + r.chain;
+      if (!below[k]) below[k] = { sku: r.sku, chain: r.chain, rev: 0, loss: 0 };
+      below[k].rev += r.rev;
+      below[k].loss += r.cogs - r.rev;
+    }
+  });
+  const bl = Object.values(below).sort((a, b) => b.loss - a.loss);
+  if (bl.length) {
+    out.push({
+      lvl: 'err', t: 'Відвантаження нижче виробничої собівартості',
+      d: `${bl.length} комбінацій SKU × мережа продані нижче собівартості. Сукупний валовий збиток: ${money(sum(bl, x => x.loss))} ₴.`,
+      items: bl.slice(0, 25).map(x => `${x.sku} → ${x.chain}: −${n0(x.loss)} ₴`)
+    });
+  }
+
+  APP.d.anomalies = out;
+}
+
+/* ------------------------------ ФІЛЬТРИ ------------------------------ */
+
+function rows() {
+  const f = APP.f;
+  return APP.d.sales.filter(r => {
+    if (f.years.length && !f.years.includes(r.y)) return false;
+    if (f.chains.length && !f.chains.includes(r.chain)) return false;
+    if (f.brands.length && !f.brands.includes(r.brand)) return false;
+    if (f.skus.length && !f.skus.includes(r.sku)) return false;
+    if (f.chan === 'retail' && r.chain === CHAIN_OTHER) return false;
+    if (f.chan === 'other' && r.chain !== CHAIN_OTHER) return false;
+    if (f.search) {
+      const q = f.search.toLowerCase();
+      if (!(r.sku.toLowerCase().includes(q) || r.partner.toLowerCase().includes(q) ||
+        r.brand.toLowerCase().includes(q))) return false;
+    }
+    return true;
+  });
+}
+
+/** Агрегація довільного зрізу */
+function agg(rs, keyFn) {
+  const m = new Map();
+  for (const r of rs) {
+    const k = keyFn(r);
+    if (k === null || k === undefined) continue;
+    let a = m.get(k);
+    if (!a) {
+      a = {
+        key: k, qty: 0, litres: 0, rev: 0, cogs: 0, gross: 0, bonus: 0, fin: 0,
+        net: 0, n: 0, noCost: 0, months: new Set(), skus: new Set(), partners: new Set()
+      };
+      m.set(k, a);
+    }
+    a.qty += r.qty; a.litres += r.litres; a.rev += r.rev; a.n++;
+    if (r.cogs === null) { a.noCost += r.rev; }
+    else { a.cogs += r.cogs; a.gross += r.gross; a.net += r.net; }
+    a.bonus += r.bonus; a.fin += r.fin;
+    a.months.add(r.ym); a.skus.add(r.sku); a.partners.add(r.partner);
+  }
+  const out = Array.from(m.values());
+  out.forEach(a => {
+    a.gm = a.rev ? a.gross / a.rev * 100 : 0;
+    a.nm = a.rev ? a.net / a.rev * 100 : 0;
+    a.price = a.qty ? a.rev / a.qty : 0;
+    a.nMonths = a.months.size; a.nSku = a.skus.size; a.nPartners = a.partners.size;
+  });
+  return out;
+}
+
+/** Один прохід: ключ × місяць -> метрика. Замість вкладених filter() у в'ю. */
+function seriesBy(rs, keyFn, valFn) {
+  const m = new Map();
+  for (const r of rs) {
+    const k = keyFn(r);
+    if (k === null || k === undefined) continue;
+    let mm = m.get(k);
+    if (!mm) { mm = new Map(); m.set(k, mm); }
+    mm.set(r.ym, (mm.get(r.ym) || 0) + (valFn(r) || 0));
+  }
+  return m;
+}
+
+function totals(rs) {
+  const t = agg(rs, () => 'all')[0];
+  return t || { qty: 0, litres: 0, rev: 0, cogs: 0, gross: 0, bonus: 0, fin: 0, net: 0, gm: 0, nm: 0, price: 0, noCost: 0, nSku: 0, nPartners: 0 };
+}
+
+/* ------------------------------ ГРАФІКИ ------------------------------ */
+
+function initChartDefaults() {
+  if (!window.Chart) return;
+  Chart.defaults.color = '#9C9083';
+  Chart.defaults.font.family = "'IBM Plex Sans', system-ui, sans-serif";
+  Chart.defaults.font.size = 11;
+  Chart.defaults.borderColor = '#2A241E';
+  Chart.defaults.plugins.legend.labels.boxWidth = 10;
+  Chart.defaults.plugins.legend.labels.boxHeight = 10;
+  Chart.defaults.plugins.legend.labels.padding = 12;
+  Chart.defaults.plugins.tooltip.backgroundColor = '#241F19';
+  Chart.defaults.plugins.tooltip.borderColor = '#3A322A';
+  Chart.defaults.plugins.tooltip.borderWidth = 1;
+  Chart.defaults.plugins.tooltip.titleColor = '#EFE7D9';
+  Chart.defaults.plugins.tooltip.bodyColor = '#C9BEB0';
+  Chart.defaults.plugins.tooltip.padding = 9;
+  Chart.defaults.plugins.tooltip.cornerRadius = 3;
+  Chart.defaults.maintainAspectRatio = false;
+}
+
+function chart(id, cfg) {
+  const c = el(id);
+  if (!c) return;
+  if (!window.Chart) {
+    c.parentElement.innerHTML =
+      '<div class="empty" style="padding:24px">Бібліотеку графіків не завантажено — перевірте доступ до cdnjs.cloudflare.com</div>';
+    return;
+  }
+  if (APP.charts[id]) { APP.charts[id].destroy(); delete APP.charts[id]; }
+  APP.charts[id] = new Chart(c.getContext('2d'), cfg);
+  return APP.charts[id];
+}
+function killCharts() {
+  Object.values(APP.charts).forEach(c => c.destroy());
+  APP.charts = {};
+}
+
+const AX = {
+  x: { grid: { color: '#221D18' }, ticks: { maxRotation: 0, autoSkip: true } },
+  y: { grid: { color: '#221D18' }, ticks: { callback: v => money(v) } },
+  yPct: { grid: { color: '#221D18' }, ticks: { callback: v => v + '%' } }
+};
+
+/* ------------------------------ НАСТРОЙКИ ------------------------------ */
+
+APP.overrides = { chain: {}, sku: {} };
+
+function loadCfg() {
+  try {
+    const s = JSON.parse(localStorage.getItem(LS) || '{}');
+    Object.assign(APP.cfg, s.cfg || {});
+    APP.overrides = Object.assign({ chain: {}, sku: {} }, s.overrides || {});
+  } catch (e) { }
+}
+function saveCfg() {
+  try {
+    localStorage.setItem(LS, JSON.stringify({ cfg: APP.cfg, overrides: APP.overrides }));
+  } catch (e) { }
+}
+function loadCached() {
+  try {
+    const s = localStorage.getItem(LS + '_data');
+    if (!s) return false;
+    APP.raw = JSON.parse(s);
+    build();
+    setStatus('ok', `${n0(APP.d.sales.length)} рядків · з локальної копії`);
+    return true;
+  } catch (e) { return false; }
+}
+
+/* =====================================================================
+   НАВІГАЦІЯ, ФІЛЬТРИ, РОУТЕР
+   ===================================================================== */
+
+const VIEWS = [
+  { id: 'overview', n: '01', t: 'Огляд', grp: 'Результат' },
+  { id: 'clients', n: '02', t: 'Клієнти', grp: 'Результат' },
+  { id: 'brands', n: '03', t: 'Бренди / ТМ', grp: 'Результат' },
+  { id: 'sku', n: '04', t: 'SKU', grp: 'Результат' },
+  { id: 'econ', n: '05', t: 'Економіка SKU', grp: 'Гроші' },
+  { id: 'chains', n: '06', t: 'Умови мереж', grp: 'Гроші' },
+  { id: 'promoplan', n: '07', t: 'Промо-календар', grp: 'Промо' },
+  { id: 'promoeff', n: '08', t: 'Ефективність промо', grp: 'Промо' },
+  { id: 'data', n: '09', t: 'Дані та якість', grp: 'Службове' }
+];
+
+function renderRail() {
+  let h = '', grp = '';
+  VIEWS.forEach(v => {
+    if (v.grp !== grp) { grp = v.grp; h += `<div class="grp">${esc(grp)}</div>`; }
+    h += `<a data-v="${v.id}" class="${APP.view === v.id ? 'on' : ''}" tabindex="0"><span class="n">${v.n}</span>${esc(v.t)}</a>`;
+  });
+  el('rail').innerHTML = h;
+  el('rail').querySelectorAll('a').forEach(a => {
+    a.onclick = () => go(a.dataset.v);
+    a.onkeydown = e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); go(a.dataset.v); } };
+  });
+}
+
+function multiSel(id, label, items, selected, onChange) {
+  const opts = items.map(i =>
+    `<option value="${esc(i)}" ${selected.includes(i) ? 'selected' : ''}>${esc(i)}</option>`).join('');
+  return `<div class="f"><label for="${id}">${esc(label)}</label>
+    <select id="${id}" multiple size="1" style="height:28px">${opts}</select></div>`;
+}
+
+function renderFilters() {
+  const D = APP.d, f = APP.f;
+  if (!D.sales.length) { el('filters').innerHTML = ''; return; }
+
+  const yChips = D.years.map(y =>
+    `<span class="chip ${f.years.includes(y) ? 'on' : ''}" data-y="${y}">${y}</span>`).join('');
+
+  el('filters').innerHTML = `
+    <div class="f"><label>Роки</label><div class="chipbar" id="fYears">${yChips}</div></div>
+    <div class="f"><label>Мережа</label>
+      <select id="fChain"><option value="">усі</option>
+        ${D.chains.map(c => `<option ${f.chains[0] === c ? 'selected' : ''}>${esc(c)}</option>`).join('')}
+      </select></div>
+    <div class="f"><label>ТМ</label>
+      <select id="fBrand"><option value="">усі</option>
+        ${D.brands.map(b => `<option ${f.brands[0] === b ? 'selected' : ''}>${esc(b)}</option>`).join('')}
+      </select></div>
+    <div class="f"><label>Канал</label>
+      <select id="fChan">
+        <option value="all" ${f.chan === 'all' ? 'selected' : ''}>усі</option>
+        <option value="retail" ${f.chan === 'retail' ? 'selected' : ''}>лише мережі</option>
+        <option value="other" ${f.chan === 'other' ? 'selected' : ''}>дистрибуція та інше</option>
+      </select></div>
+    <div class="f"><label>Пошук</label>
+      <input type="text" id="fSearch" placeholder="SKU, партнер, ТМ" value="${esc(f.search)}" style="width:190px"></div>
+    <div class="f"><button class="btn sm ghost" id="fReset">Скинути</button></div>
+    <div class="f" style="margin-left:auto">
+      <span class="pill" id="fCount"></span>
+    </div>`;
+
+  el('fYears').querySelectorAll('.chip').forEach(c => c.onclick = () => {
+    const y = +c.dataset.y;
+    const i = f.years.indexOf(y);
+    if (i >= 0) f.years.splice(i, 1); else f.years.push(y);
+    if (!f.years.length) f.years = D.years.slice();
+    renderFilters(); render();
+  });
+  el('fChain').onchange = e => { f.chains = e.target.value ? [e.target.value] : []; render(); updCount(); };
+  el('fBrand').onchange = e => { f.brands = e.target.value ? [e.target.value] : []; render(); updCount(); };
+  el('fChan').onchange = e => { f.chan = e.target.value; render(); updCount(); };
+  let tmr;
+  el('fSearch').oninput = e => {
+    clearTimeout(tmr);
+    tmr = setTimeout(() => { f.search = e.target.value.trim(); render(); updCount(); }, 260);
+  };
+  el('fReset').onclick = () => {
+    APP.f = { years: D.years.slice(-2), chains: [], brands: [], skus: [], search: '', chan: 'all' };
+    renderFilters(); render();
+  };
+  updCount();
+}
+
+function updCount() {
+  const c = el('fCount');
+  if (!c) return;
+  const rs = rows();
+  c.textContent = `${n0(rs.length)} записів · ${n0(new Set(rs.map(r => r.sku)).size)} SKU · ${money(sum(rs, r => r.rev))} ₴`;
+}
+
+function go(v) {
+  APP.view = v;
+  renderRail();
+  render();
+  window.scrollTo({ top: 0, behavior: 'instant' });
+}
+
+function render() {
+  killCharts();
+  const host = el('view');
+  if (!APP.d.sales.length) { host.innerHTML = emptyState(); bindSource(); return; }
+  const fn = ({
+    overview: viewOverview, clients: viewClients, brands: viewBrands, sku: viewSku,
+    econ: viewEcon, chains: viewChains, promoplan: viewPromoPlan,
+    promoeff: viewPromoEff, data: viewData
+  })[APP.view] || viewOverview;
+  fn(host);
+  updCount();
+}
+
+function emptyState() {
+  return `<div class="card"><div class="body"><div class="empty">
+    <b>Даних ще немає</b>
+    Підключіть вебдодаток Apps Script або завантажте вивантаження JSON.
+    <div style="margin-top:14px"><button class="btn primary" id="emptyBtn">Налаштувати джерело</button></div>
+  </div></div></div>`;
+}
+function bindSource() {
+  const b = el('emptyBtn');
+  if (b) b.onclick = openSource;
+}
+
+/* ------------------------------ ХЕЛПЕРИ РЕНДЕРУ ------------------------------ */
+
+function card(title, body, hint, cls) {
+  return `<div class="card ${cls || ''}"><h3>${esc(title)}${hint ? `<span class="hint">${hint}</span>` : ''}</h3>
+    <div class="body${/tblwrap|calwrap|hm\b/.test(body.slice(0, 60)) ? ' flush' : ''}">${body}</div></div>`;
+}
+function canvas(id, h) { return `<div class="chartbox ${h || 'h220'}"><canvas id="${id}"></canvas></div>`; }
+
+function kpi(label, value, unit, sub, cls) {
+  return `<div class="kpi ${cls || ''}"><div class="k">${esc(label)}</div>
+    <div class="v">${value}${unit ? `<span class="u">${unit}</span>` : ''}</div>${sub || ''}</div>`;
+}
+
+/** Сортована таблиця. cols: [{k,t,f,txt,w}] */
+function dataTable(id, cols, data, opts) {
+  opts = opts || {};
+  const st = dataTable.state[id] || (dataTable.state[id] = { k: opts.sort || cols[1].k, asc: false });
+  const arr = data.slice().sort((a, b) => {
+    const x = a[st.k], y = b[st.k];
+    const r = (typeof x === 'string' || typeof y === 'string')
+      ? String(x).localeCompare(String(y), 'uk') : (x || 0) - (y || 0);
+    return st.asc ? r : -r;
+  });
+  const lim = opts.limit || 400;
+  const shown = arr.slice(0, lim);
+  let h = `<div class="tblwrap"><table class="dt" id="${id}"><thead><tr>`;
+  cols.forEach(c => {
+    h += `<th data-k="${c.k}" class="${c.txt ? 'txt' : ''} ${st.k === c.k ? 'sorted ' + (st.asc ? 'asc' : '') : ''}"
+      ${c.title ? `title="${esc(c.title)}"` : ''}>${esc(c.t)}</th>`;
+  });
+  h += `</tr></thead><tbody>`;
+  shown.forEach(r => {
+    h += '<tr>';
+    cols.forEach(c => {
+      h += `<td class="${c.txt ? 'txt' : ''}">${c.f ? c.f(r[c.k], r) : (r[c.k] ?? '—')}</td>`;
+    });
+    h += '</tr>';
+  });
+  if (opts.total) {
+    h += '<tr class="tot">';
+    cols.forEach(c => h += `<td class="${c.txt ? 'txt' : ''}">${opts.total[c.k] !== undefined ? opts.total[c.k] : ''}</td>`);
+    h += '</tr>';
+  }
+  h += `</tbody></table></div>`;
+  if (arr.length > lim) h += `<div class="note" style="padding:6px 10px">Показано ${lim} з ${n0(arr.length)} рядків — уточніть фільтри.</div>`;
+  return h;
+}
+dataTable.state = {};
+
+function bindTables() {
+  document.querySelectorAll('table.dt th[data-k]').forEach(th => {
+    th.onclick = () => {
+      const id = th.closest('table').id;
+      const st = dataTable.state[id];
+      if (st.k === th.dataset.k) st.asc = !st.asc; else { st.k = th.dataset.k; st.asc = false; }
+      render();
+    };
+  });
+}
+
+/** Колір комірки теплокарти */
+function heat(v, max, neg) {
+  if (!isFinite(v) || !max) return '';
+  const a = Math.min(1, Math.abs(v) / max);
+  if (neg && v < 0) return `background:rgba(217,86,63,${(0.09 + a * 0.55).toFixed(3)})`;
+  return `background:rgba(232,163,61,${(0.07 + a * 0.5).toFixed(3)})`;
+}
+
+/* =====================================================================
+   01 · ОГЛЯД
+   ===================================================================== */
+
+function yoyPair(rs) {
+  const ys = uniq(rs.map(r => r.y)).sort();
+  if (ys.length < 2) return null;
+  const cur = ys[ys.length - 1], prev = ys[ys.length - 2];
+  const curMonths = new Set(rs.filter(r => r.y === cur).map(r => r.m));
+  return {
+    cur, prev,
+    a: rs.filter(r => r.y === cur),
+    b: rs.filter(r => r.y === prev && curMonths.has(r.m)),
+    months: curMonths.size
+  };
+}
+
+function viewOverview(host) {
+  const rs = rows(), T = totals(rs);
+  const yy = yoyPair(rs);
+  const Ta = yy ? totals(yy.a) : null, Tb = yy ? totals(yy.b) : null;
+
+  const k = (lab, v, u, cur, prev, cls, inv) =>
+    kpi(lab, v, u, yy && prev ? dEl(delta(cur, prev), inv) : '', cls);
+
+  const kpis = `<div class="kpis">
+    ${k('Виручка без ПДВ', money(T.rev), '₴', Ta && Ta.rev, Tb && Tb.rev)}
+    ${k('Обсяг', money(T.qty), 'од', Ta && Ta.qty, Tb && Tb.qty)}
+    ${k('Валова маржа', money(T.gross), '₴', Ta && Ta.gross, Tb && Tb.gross, T.gross > 0 ? 'pos' : 'neg')}
+    ${kpi('Валова маржинальність', n1(T.gm), '%', yy ? ppEl(Ta.gm - Tb.gm) : '')}
+    ${k('Бонуси мереж', money(T.bonus), '₴', Ta && Ta.bonus, Tb && Tb.bonus, 'neg', true)}
+    ${k('Чистий внесок', money(T.net), '₴', Ta && Ta.net, Tb && Tb.net, T.net > 0 ? 'pos' : 'neg')}
+    ${kpi('Чиста маржинальність', n1(T.nm), '%', yy ? ppEl(Ta.nm - Tb.nm) : '')}
+    ${kpi('Активних SKU', n0(T.nSku), '', `<span class="d">${n0(T.nPartners)} партнерів</span>`)}
+  </div>`;
+
+  /* динаміка по місяцях */
+  const byM = agg(rs, r => r.ym).sort((a, b) => a.key.localeCompare(b.key));
+
+  /* воронка P&L */
+  const bridge = wfBridge(T);
+
+  /* канали */
+  const byCh = agg(rs, r => r.chain).sort((a, b) => b.rev - a.rev);
+  const byBr = agg(rs, r => r.brand).sort((a, b) => b.rev - a.rev);
+
+  host.innerHTML = `
+    ${kpis}
+    <div class="grid g32" style="margin-top:12px">
+      ${card('Виручка та чиста маржинальність по місяцях', canvas('cMonth', 'h300'),
+    yy ? `${yy.cur} проти ${yy.prev}` : '')}
+      ${card('Від виручки до чистого внеску', bridge, 'за обраний період')}
+    </div>
+    <div class="grid g3" style="margin-top:12px">
+      ${card('Структура за мережами', canvas('cChain', 'h260'), 'частка виручки')}
+      ${card('Структура за ТМ', canvas('cBrand', 'h260'), 'частка виручки')}
+      ${card('Маржинальність каналів', canvas('cChMargin', 'h260'), 'валова / чиста, %')}
+    </div>
+    <div class="grid g2" style="margin-top:12px">
+      ${card('Топ-12 клієнтів', canvas('cTop', 'h360'), 'виручка та чистий внесок')}
+      ${card('Обсяг проти маржинальності', canvas('cScatter', 'h360'), 'бульбашка = виручка SKU')}
+    </div>`;
+
+  /* --- місячна динаміка --- */
+  chart('cMonth', {
+    data: {
+      labels: byM.map(x => ymLabel(x.key)),
+      datasets: [
+        { type: 'bar', label: 'Виручка', data: byM.map(x => x.rev), backgroundColor: '#8A6224', borderRadius: 1, order: 3 },
+        { type: 'bar', label: 'Чистий внесок', data: byM.map(x => x.net), backgroundColor: '#E8A33D', borderRadius: 1, order: 2 },
+        {
+          type: 'line', label: 'Чиста маржа, %', data: byM.map(x => x.nm), yAxisID: 'y1',
+          borderColor: '#86B860', backgroundColor: '#86B860', tension: .3, pointRadius: 2, borderWidth: 2, order: 1
+        }
+      ]
+    },
+    options: {
+      interaction: { mode: 'index', intersect: false },
+      scales: {
+        x: AX.x, y: AX.y,
+        y1: { position: 'right', grid: { display: false }, ticks: { callback: v => v + '%' } }
+      },
+      plugins: {
+        tooltip: {
+          callbacks: {
+            label: c => c.dataset.yAxisID === 'y1'
+              ? ` ${c.dataset.label}: ${n1(c.parsed.y)}%`
+              : ` ${c.dataset.label}: ${n0(c.parsed.y)} ₴`
+          }
+        }
+      }
+    }
+  });
+
+  const doughnut = (id, data, lim) => {
+    const top = data.slice(0, lim);
+    const rest = data.slice(lim);
+    const labels = top.map(x => x.key).concat(rest.length ? ['інші'] : []);
+    const vals = top.map(x => x.rev).concat(rest.length ? [sum(rest, x => x.rev)] : []);
+    chart(id, {
+      type: 'doughnut',
+      data: {
+        labels, datasets: [{
+          data: vals, backgroundColor: labels.map((_, i) => colorFor(i)),
+          borderColor: '#191613', borderWidth: 2
+        }]
+      },
+      options: {
+        cutout: '58%',
+        plugins: {
+          legend: { position: 'right', labels: { font: { size: 10.5 } } },
+          tooltip: {
+            callbacks: {
+              label: c => ` ${c.label}: ${n0(c.parsed)} ₴ (${n1(c.parsed / vals.reduce((a, b) => a + b, 0) * 100)}%)`
+            }
+          }
+        }
+      }
+    });
+  };
+  doughnut('cChain', byCh, 7);
+  doughnut('cBrand', byBr, 8);
+
+  chart('cChMargin', {
+    type: 'bar',
+    data: {
+      labels: byCh.slice(0, 9).map(x => x.key),
+      datasets: [
+        { label: 'Валова, %', data: byCh.slice(0, 9).map(x => x.gm), backgroundColor: '#6F8FD0', borderRadius: 1 },
+        { label: 'Чиста, %', data: byCh.slice(0, 9).map(x => x.nm), backgroundColor: '#E8A33D', borderRadius: 1 }
+      ]
+    },
+    options: {
+      indexAxis: 'y',
+      scales: { x: AX.yPct, y: { grid: { display: false }, ticks: { font: { size: 10 } } } },
+      plugins: { tooltip: { callbacks: { label: c => ` ${c.dataset.label}: ${n1(c.parsed.x)}%` } } }
+    }
+  });
+
+  const byP = agg(rs, r => r.partner).sort((a, b) => b.rev - a.rev).slice(0, 12);
+  chart('cTop', {
+    type: 'bar',
+    data: {
+      labels: byP.map(x => x.key.length > 26 ? x.key.slice(0, 25) + '…' : x.key),
+      datasets: [
+        { label: 'Виручка', data: byP.map(x => x.rev), backgroundColor: '#8A6224', borderRadius: 1 },
+        { label: 'Чистий внесок', data: byP.map(x => x.net), backgroundColor: '#E8A33D', borderRadius: 1 }
+      ]
+    },
+    options: {
+      indexAxis: 'y',
+      scales: { x: AX.y, y: { grid: { display: false }, ticks: { font: { size: 10 } } } },
+      plugins: { tooltip: { callbacks: { label: c => ` ${c.dataset.label}: ${n0(c.parsed.x)} ₴` } } }
+    }
+  });
+
+  const bySku = agg(rs, r => r.sku).filter(x => x.rev > 0 && x.cogs > 0);
+  const maxRev = Math.max(...bySku.map(x => x.rev), 1);
+  chart('cScatter', {
+    type: 'bubble',
+    data: {
+      datasets: [{
+        label: 'SKU',
+        data: bySku.map(x => ({
+          x: x.qty, y: x.gm, r: 3 + Math.sqrt(x.rev / maxRev) * 18, sku: x.key, rev: x.rev
+        })),
+        backgroundColor: 'rgba(232,163,61,.35)', borderColor: '#E8A33D', borderWidth: 1
+      }]
+    },
+    options: {
+      scales: {
+        x: { type: 'logarithmic', grid: { color: '#221D18' }, title: { display: true, text: 'обсяг, од (лог)' }, ticks: { callback: v => money(v) } },
+        y: { grid: { color: '#221D18' }, title: { display: true, text: 'валова маржа, %' }, ticks: { callback: v => v + '%' } }
+      },
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          callbacks: {
+            label: c => [c.raw.sku, `обсяг: ${n0(c.raw.x)} од`,
+            `маржа: ${n1(c.raw.y)}%`, `виручка: ${n0(c.raw.rev)} ₴`]
+          }
+        }
+      }
+    }
+  });
+}
+
+function wfBridge(T) {
+  const base = T.rev || 1;
+  const steps = [
+    { l: 'Виручка без ПДВ', v: T.rev, kind: 'start' },
+    { l: 'Виробнича собівартість', v: -T.cogs, kind: 'neg' },
+    { l: 'Валова маржа', v: T.gross, kind: 'mid' },
+    { l: 'Бонуси мереж', v: -T.bonus, kind: 'neg' },
+    { l: 'Вартість відтермінування', v: -T.fin, kind: 'neg' },
+    { l: 'Чистий внесок', v: T.net, kind: 'end' }
+  ];
+  const colors = { start: '#6F8FD0', neg: '#D9563F', mid: '#C9A227', end: '#86B860' };
+  let h = '<div class="wf">';
+  steps.forEach(s => {
+    const w = Math.min(100, Math.abs(s.v) / base * 100);
+    h += `<div class="row">
+      <div class="lab">${esc(s.l)}</div>
+      <div class="track"><div class="seg" style="left:0;width:${w.toFixed(1)}%;background:${colors[s.kind]}"></div></div>
+      <div class="val">${s.v < 0 ? '−' : ''}${n0(Math.abs(s.v))}<span style="color:var(--dim)"> ₴</span></div>
+    </div>`;
+  });
+  h += '</div>';
+  h += `<div class="note" style="margin-top:10px">
+    Валова маржа <b>${n1(T.gm)}%</b> · бонусне навантаження <b>${n1(T.rev ? T.bonus / T.rev * 100 : 0)}%</b>
+    · чистий внесок <b>${n1(T.nm)}%</b> від виручки.
+    ${T.noCost > 0 ? `<br>Увага: ${money(T.noCost)} ₴ виручки не має собівартості — маржа занижена на цю частину обороту.` : ''}
+  </div>`;
+  return h;
+}
+
+/* =====================================================================
+   02 · КЛІЄНТИ
+   ===================================================================== */
+
+function viewClients(host) {
+  const rs = rows();
+  const byP = agg(rs, r => r.partner).sort((a, b) => b.rev - a.rev);
+  const T = totals(rs);
+
+  /* Парето */
+  let cum = 0;
+  const pareto = byP.map(x => { cum += x.rev; return { key: x.key, rev: x.rev, cum: T.rev ? cum / T.rev * 100 : 0 }; });
+  const n80 = pareto.findIndex(x => x.cum >= 80) + 1;
+
+  /* YoY по клієнту */
+  const yy = yoyPair(rs);
+  const prevMap = {};
+  if (yy) agg(yy.b, r => r.partner).forEach(x => prevMap[x.key] = x);
+  const curMap = {};
+  if (yy) agg(yy.a, r => r.partner).forEach(x => curMap[x.key] = x);
+
+  const data = byP.map(x => {
+    const p = prevMap[x.key], c = curMap[x.key];
+    return {
+      partner: x.key, chain: chainOf(x.key),
+      rev: x.rev, qty: x.qty, share: T.rev ? x.rev / T.rev * 100 : 0,
+      gm: x.gm, bonusPct: x.rev ? x.bonus / x.rev * 100 : 0, nm: x.nm,
+      net: x.net, nSku: x.nSku, nMonths: x.nMonths,
+      yoy: (yy && p && c) ? delta(c.rev, p.rev) : null
+    };
+  });
+
+  const cols = [
+    { k: 'partner', t: 'Клієнт', txt: true },
+    { k: 'chain', t: 'Мережа', txt: true, f: v => `<span class="tag">${esc(v)}</span>` },
+    { k: 'rev', t: 'Виручка, ₴', f: v => n0(v) },
+    { k: 'share', t: 'Частка', f: v => n1(v) + '%' },
+    { k: 'yoy', t: 'Δ р/р', f: v => v === null ? '—' : `<span class="${v > 0 ? 'up' : 'down'}">${v > 0 ? '+' : ''}${n1(v)}%</span>` },
+    { k: 'qty', t: 'Обсяг, од', f: v => n0(v) },
+    { k: 'gm', t: 'Валова, %', f: v => n1(v) },
+    { k: 'bonusPct', t: 'Бонуси, %', f: v => v ? `<span class="down">${n1(v)}</span>` : '0' },
+    { k: 'nm', t: 'Чиста, %', f: v => `<span class="${v > 0 ? 'up' : 'down'}">${n1(v)}</span>` },
+    { k: 'net', t: 'Чистий внесок, ₴', f: v => n0(v) },
+    { k: 'nSku', t: 'SKU', f: v => n0(v) },
+    { k: 'nMonths', t: 'Міс.', f: v => n0(v) }
+  ];
+
+  const top10 = sum(byP.slice(0, 10), x => x.rev) / (T.rev || 1) * 100;
+
+  host.innerHTML = `
+    <div class="kpis">
+      ${kpi('Клієнтів у періоді', n0(byP.length))}
+      ${kpi('Дають 80% виручки', n0(n80), 'клієнтів', `<span class="d">${n1(n80 / byP.length * 100)}% бази</span>`)}
+      ${kpi('Частка топ-10', n1(top10), '%', '', top10 > 70 ? 'neg' : '')}
+      ${kpi('Виручка на клієнта', money(T.rev / (byP.length || 1)), '₴')}
+      ${kpi('Клієнтів із від\'ємним внеском', n0(data.filter(d => d.net < 0).length), '', '', data.filter(d => d.net < 0).length ? 'neg' : 'pos')}
+    </div>
+    <div class="grid g2" style="margin-top:12px">
+      ${card('Концентрація виручки (Парето)', canvas('cPareto', 'h300'),
+    `${n0(n80)} клієнтів дають 80%`)}
+      ${card('Виручка проти чистої маржинальності', canvas('cCliBub', 'h300'), 'бульбашка = обсяг')}
+    </div>
+    <div style="margin-top:12px">
+      ${card('Клієнти: повний зріз', dataTable('tCli', cols, data, { sort: 'rev' }),
+      'клік по заголовку — сортування')}
+    </div>`;
+
+  const P = pareto.slice(0, 30);
+  chart('cPareto', {
+    data: {
+      labels: P.map(x => x.key.length > 20 ? x.key.slice(0, 19) + '…' : x.key),
+      datasets: [
+        { type: 'bar', label: 'Виручка', data: P.map(x => x.rev), backgroundColor: '#E8A33D', borderRadius: 1 },
+        {
+          type: 'line', label: 'Накопичено, %', data: P.map(x => x.cum), yAxisID: 'y1',
+          borderColor: '#6F8FD0', tension: .25, pointRadius: 0, borderWidth: 2
+        }
+      ]
+    },
+    options: {
+      scales: {
+        x: { grid: { display: false }, ticks: { maxRotation: 60, minRotation: 60, font: { size: 9 } } },
+        y: AX.y,
+        y1: { position: 'right', min: 0, max: 100, grid: { display: false }, ticks: { callback: v => v + '%' } }
+      }
+    }
+  });
+
+  const maxQ = Math.max(...data.map(d => d.qty), 1);
+  chart('cCliBub', {
+    type: 'bubble',
+    data: {
+      datasets: [{
+        data: data.filter(d => d.rev > 0).map(d => ({
+          x: d.rev, y: d.nm, r: 3 + Math.sqrt(d.qty / maxQ) * 20, l: d.partner
+        })),
+        backgroundColor: 'rgba(111,143,208,.32)', borderColor: '#6F8FD0', borderWidth: 1
+      }]
+    },
+    options: {
+      scales: {
+        x: { type: 'logarithmic', grid: { color: '#221D18' }, ticks: { callback: v => money(v) }, title: { display: true, text: 'виручка, ₴ (лог)' } },
+        y: { grid: { color: '#221D18' }, ticks: { callback: v => v + '%' }, title: { display: true, text: 'чиста маржа, %' } }
+      },
+      plugins: {
+        legend: { display: false },
+        tooltip: { callbacks: { label: c => [c.raw.l, `${n0(c.raw.x)} ₴`, `${n1(c.raw.y)}%`] } }
+      }
+    }
+  });
+  bindTables();
+}
+
+/* =====================================================================
+   03 · БРЕНДИ / ТМ
+   ===================================================================== */
+
+function viewBrands(host) {
+  const rs = rows(), T = totals(rs);
+  const byB = agg(rs, r => r.brand).sort((a, b) => b.rev - a.rev);
+  const months = uniq(rs.map(r => r.ym)).sort();
+
+  const yy = yoyPair(rs);
+  const prev = {}, cur = {};
+  if (yy) { agg(yy.b, r => r.brand).forEach(x => prev[x.key] = x); agg(yy.a, r => r.brand).forEach(x => cur[x.key] = x); }
+
+  const data = byB.map(x => ({
+    brand: x.key, rev: x.rev, share: T.rev ? x.rev / T.rev * 100 : 0,
+    qty: x.qty, litres: x.litres, price: x.price,
+    gm: x.gm, nm: x.nm, net: x.net, nSku: x.nSku, nPartners: x.nPartners,
+    revPerL: x.litres ? x.rev / x.litres : 0,
+    yoy: (yy && prev[x.key] && cur[x.key]) ? delta(cur[x.key].rev, prev[x.key].rev) : null
+  }));
+
+  const cols = [
+    { k: 'brand', t: 'ТМ', txt: true },
+    { k: 'rev', t: 'Виручка, ₴', f: v => n0(v) },
+    { k: 'share', t: 'Частка', f: v => `${n1(v)}%<span class="bar" style="width:${Math.min(100, v)}%"></span>` },
+    { k: 'yoy', t: 'Δ р/р', f: v => v === null ? '—' : `<span class="${v > 0 ? 'up' : 'down'}">${v > 0 ? '+' : ''}${n1(v)}%</span>` },
+    { k: 'qty', t: 'Обсяг, од', f: v => n0(v) },
+    { k: 'price', t: 'Ціна/од, ₴', f: v => n2(v) },
+    { k: 'revPerL', t: 'Виручка/л, ₴', f: v => n2(v) },
+    { k: 'gm', t: 'Валова, %', f: v => n1(v) },
+    { k: 'nm', t: 'Чиста, %', f: v => `<span class="${v > 0 ? 'up' : 'down'}">${n1(v)}</span>` },
+    { k: 'net', t: 'Чистий внесок, ₴', f: v => n0(v) },
+    { k: 'nSku', t: 'SKU', f: v => n0(v) },
+    { k: 'nPartners', t: 'Клієнтів', f: v => n0(v) }
+  ];
+
+  /* матриця ТМ × мережа */
+  const chains = agg(rs, r => r.chain).sort((a, b) => b.rev - a.rev).map(x => x.key);
+  const mtx = {};
+  agg(rs, r => r.brand + '§' + r.chain).forEach(x => mtx[x.key] = x);
+  const maxCell = Math.max(...Object.values(mtx).map(x => x.rev), 1);
+
+  let hm = `<div class="hm"><table class="hmt"><thead><tr><th class="rowh">ТМ / мережа</th>`;
+  chains.forEach(c => hm += `<th>${esc(c)}</th>`);
+  hm += `<th>Разом</th></tr></thead><tbody>`;
+  byB.slice(0, 16).forEach(b => {
+    hm += `<tr><td class="rowh" title="${esc(b.key)}">${esc(b.key)}</td>`;
+    chains.forEach(c => {
+      const cell = mtx[b.key + '§' + c];
+      hm += `<td style="${cell ? heat(cell.rev, maxCell) : ''}" title="${cell ? esc(b.key + ' × ' + c) + ': ' + n0(cell.rev) + ' ₴, чиста ' + n1(cell.nm) + '%' : ''}">${cell ? money(cell.rev) : '<span style="color:#3A322A">·</span>'}</td>`;
+    });
+    hm += `<td style="font-weight:600">${money(b.rev)}</td></tr>`;
+  });
+  hm += `</tbody></table></div>`;
+
+  host.innerHTML = `
+    <div class="kpis">
+      ${kpi('ТМ у портфелі', n0(byB.length))}
+      ${kpi('Лідер', esc((byB[0] ? byB[0].key : '—').slice(0, 18)), '', byB[0] ? `<span class="d">${n1(byB[0].rev / (T.rev || 1) * 100)}% виручки</span>` : '')}
+      ${kpi('Найвища валова', esc((byB.filter(x => x.cogs > 0).sort((a, b) => b.gm - a.gm)[0]?.key || '—').slice(0, 16)), '',
+    `<span class="d">${n1(byB.filter(x => x.cogs > 0).sort((a, b) => b.gm - a.gm)[0]?.gm || 0)}%</span>`, 'pos')}
+      ${kpi('Найнижча чиста', esc((byB.filter(x => x.cogs > 0).sort((a, b) => a.nm - b.nm)[0]?.key || '—').slice(0, 16)), '',
+      `<span class="d">${n1(byB.filter(x => x.cogs > 0).sort((a, b) => a.nm - b.nm)[0]?.nm || 0)}%</span>`, 'neg')}
+      ${kpi('Виручка на літр', n2(T.litres ? T.rev / T.litres : 0), '₴/л')}
+    </div>
+    <div class="grid g32" style="margin-top:12px">
+      ${card('Динаміка ТМ по місяцях', canvas('cBrandArea', 'h320'), 'частка виручки')}
+      ${card('Позиція ТМ', canvas('cBrandPos', 'h320'), 'обсяг · маржа · виручка')}
+    </div>
+    <div style="margin-top:12px">
+      ${card('ТМ × мережа: виручка', hm, 'інтенсивність кольору = обсяг виручки')}
+    </div>
+    <div style="margin-top:12px">
+      ${card('Бренди: повний зріз', dataTable('tBr', cols, data, { sort: 'rev' }))}
+    </div>`;
+
+  const topB = byB.slice(0, 8).map(x => x.key);
+  const revBy = seriesBy(rs, r => r.brand, r => r.rev);
+  const series = topB.map((b, i) => {
+    const mm = revBy.get(b) || new Map();
+    return {
+      label: b,
+      data: months.map(m => mm.get(m) || 0),
+      backgroundColor: colorFor(i), borderColor: colorFor(i), fill: true, tension: .25, pointRadius: 0
+    };
+  });
+  chart('cBrandArea', {
+    type: 'line',
+    data: { labels: months.map(ymLabel), datasets: series },
+    options: {
+      interaction: { mode: 'index', intersect: false },
+      scales: { x: AX.x, y: { stacked: true, grid: { color: '#221D18' }, ticks: { callback: v => money(v) } } },
+      plugins: {
+        legend: { position: 'bottom', labels: { font: { size: 10 } } },
+        tooltip: { callbacks: { label: c => ` ${c.dataset.label}: ${n0(c.parsed.y)} ₴` } }
+      },
+      elements: { line: { borderWidth: 1 } }
+    }
+  });
+
+  const maxR = Math.max(...byB.map(x => x.rev), 1);
+  chart('cBrandPos', {
+    type: 'bubble',
+    data: {
+      datasets: byB.filter(x => x.cogs > 0).slice(0, 14).map((x, i) => ({
+        label: x.key,
+        data: [{ x: x.qty, y: x.gm, r: 5 + Math.sqrt(x.rev / maxR) * 22 }],
+        backgroundColor: colorFor(i) + '66', borderColor: colorFor(i), borderWidth: 1.5
+      }))
+    },
+    options: {
+      scales: {
+        x: { type: 'logarithmic', grid: { color: '#221D18' }, ticks: { callback: v => money(v) }, title: { display: true, text: 'обсяг, од (лог)' } },
+        y: { grid: { color: '#221D18' }, ticks: { callback: v => v + '%' }, title: { display: true, text: 'валова маржа, %' } }
+      },
+      plugins: {
+        legend: { position: 'bottom', labels: { font: { size: 9.5 }, boxWidth: 8 } },
+        tooltip: { callbacks: { label: c => ` ${c.dataset.label}: ${n0(c.parsed.x)} од · ${n1(c.parsed.y)}%` } }
+      }
+    }
+  });
+  bindTables();
+}
+
+/* =====================================================================
+   04 · SKU (ABC-XYZ)
+   ===================================================================== */
+
+function skuMatrix(rs) {
+  const T = totals(rs);
+  const byS = agg(rs, r => r.sku).sort((a, b) => b.rev - a.rev);
+  const months = uniq(rs.map(r => r.ym)).sort();
+
+  const qtyBy = seriesBy(rs, r => r.sku, r => r.qty);
+  const brandBy = new Map();
+  for (const r of rs) if (!brandBy.has(r.sku)) brandBy.set(r.sku, r.brand);
+
+  let cum = 0;
+  return byS.map(x => {
+    cum += x.rev;
+    const cumShare = T.rev ? cum / T.rev * 100 : 0;
+    const abc = cumShare <= 80 ? 'A' : cumShare <= 95 ? 'B' : 'C';
+
+    const mm = qtyBy.get(x.key) || new Map();
+    const series = months.map(m => mm.get(m) || 0);
+    const mu = mean(series), sd = stdev(series);
+    const cv = mu ? sd / mu * 100 : 0;
+    const xyz = cv < 25 ? 'X' : cv < 60 ? 'Y' : 'Z';
+
+    const c = APP.d.cost[x.key];
+    return {
+      sku: x.key, brand: brandBy.get(x.key) || '',
+      rev: x.rev, share: T.rev ? x.rev / T.rev * 100 : 0, cumShare,
+      qty: x.qty, litres: x.litres, price: x.price,
+      unitCost: c ? c.unit : null,
+      unitGross: c ? x.price - c.unit : null,
+      gm: x.gm, nm: x.nm, net: x.net,
+      abc, xyz, cv, nMonths: x.nMonths, nPartners: x.nPartners,
+      series
+    };
+  });
+}
+
+function viewSku(host) {
+  const rs = rows();
+  const data = skuMatrix(rs);
+  const T = totals(rs);
+  const cnt = k => data.filter(d => d.abc + d.xyz === k).length;
+
+  const cols = [
+    { k: 'sku', t: 'Номенклатура', txt: true },
+    { k: 'brand', t: 'ТМ', txt: true, f: v => `<span class="tag">${esc(v)}</span>` },
+    {
+      k: 'abc', t: 'ABC', f: (v, r) => `<span class="tag ${v === 'A' ? 'a' : v === 'B' ? 'b' : 'c'}">${v}${r.xyz}</span>`,
+      title: 'ABC — внесок у виручку, XYZ — стабільність попиту'
+    },
+    { k: 'rev', t: 'Виручка, ₴', f: v => n0(v) },
+    { k: 'share', t: 'Частка', f: v => n1(v) + '%' },
+    { k: 'qty', t: 'Обсяг, од', f: v => n0(v) },
+    { k: 'price', t: 'Ціна/од, ₴', f: v => n2(v) },
+    { k: 'unitCost', t: 'Собів./од, ₴', f: v => v === null ? '<span class="down">нема</span>' : n2(v) },
+    { k: 'unitGross', t: 'Маржа/од, ₴', f: v => v === null ? '—' : `<span class="${v > 0 ? 'up' : 'down'}">${n2(v)}</span>` },
+    { k: 'gm', t: 'Валова, %', f: v => n1(v) },
+    { k: 'nm', t: 'Чиста, %', f: v => `<span class="${v > 0 ? 'up' : 'down'}">${n1(v)}</span>` },
+    { k: 'net', t: 'Внесок, ₴', f: v => n0(v) },
+    { k: 'cv', t: 'Варіація', f: v => n0(v) + '%', title: 'Коефіцієнт варіації місячних обсягів' },
+    { k: 'nPartners', t: 'Клієнтів', f: v => n0(v) }
+  ];
+
+  /* матриця ABC×XYZ */
+  const grid = ['A', 'B', 'C'].map(a => ['X', 'Y', 'Z'].map(x => {
+    const items = data.filter(d => d.abc === a && d.xyz === x);
+    return { a, x, n: items.length, rev: sum(items, i => i.rev) };
+  }));
+  const maxG = Math.max(...grid.flat().map(g => g.rev), 1);
+  let gh = `<table class="hmt" style="width:100%"><thead><tr><th class="rowh"></th><th>X · стабільні</th><th>Y · змінні</th><th>Z · епізодичні</th></tr></thead><tbody>`;
+  ['A', 'B', 'C'].forEach((a, i) => {
+    const lab = { A: 'A · 80% виручки', B: 'B · наступні 15%', C: 'C · останні 5%' }[a];
+    gh += `<tr><td class="rowh">${lab}</td>`;
+    grid[i].forEach(g => {
+      gh += `<td style="${heat(g.rev, maxG)};text-align:center">
+        <div style="font-size:15px">${g.n}</div>
+        <div style="font-size:9.5px;color:var(--dim)">${money(g.rev)} ₴</div></td>`;
+    });
+    gh += `</tr>`;
+  });
+  gh += `</tbody></table>
+    <div class="note" style="padding:10px">
+      <b>AX</b> — ядро асортименту, тримати запас і не ставити в глибоке промо.
+      <b>AZ</b> — великий оборот при рваному попиті: перевірити, чи це не наслідок промо-піків.
+      <b>CZ</b> (${cnt('CZ')} поз.) — кандидати на виведення або перехід у виробництво під замовлення.
+    </div>`;
+
+  const losers = data.filter(d => d.net < 0).sort((a, b) => a.net - b.net);
+
+  host.innerHTML = `
+    <div class="kpis">
+      ${kpi('SKU у періоді', n0(data.length))}
+      ${kpi('Група A', n0(data.filter(d => d.abc === 'A').length), 'SKU', `<span class="d">80% виручки</span>`)}
+      ${kpi('Хвіст C', n0(data.filter(d => d.abc === 'C').length), 'SKU',
+    `<span class="d">${n1(sum(data.filter(d => d.abc === 'C'), d => d.rev) / (T.rev || 1) * 100)}% виручки</span>`)}
+      ${kpi('Збиткових SKU', n0(losers.length), '', losers.length ? `<span class="d down">${money(sum(losers, l => l.net))} ₴</span>` : '', losers.length ? 'neg' : 'pos')}
+      ${kpi('Без собівартості', n0(data.filter(d => d.unitCost === null).length), 'SKU', '', data.some(d => d.unitCost === null) ? 'neg' : '')}
+    </div>
+    <div class="grid g23" style="margin-top:12px">
+      ${card('Матриця ABC × XYZ', gh, 'кількість SKU та їхня виручка')}
+      ${card('Карта портфеля', canvas('cSkuMap', 'h340'),
+      'вісь X — обсяг, Y — чиста маржа, розмір — виручка')}
+    </div>
+    ${losers.length ? `<div style="margin-top:12px">${card('SKU, що з\'їдають маржу',
+        dataTable('tLose', [
+          { k: 'sku', t: 'Номенклатура', txt: true },
+          { k: 'rev', t: 'Виручка, ₴', f: v => n0(v) },
+          { k: 'price', t: 'Ціна/од', f: v => n2(v) },
+          { k: 'unitCost', t: 'Собів./од', f: v => v === null ? '—' : n2(v) },
+          { k: 'gm', t: 'Валова, %', f: v => n1(v) },
+          { k: 'nm', t: 'Чиста, %', f: v => `<span class="down">${n1(v)}</span>` },
+          { k: 'net', t: 'Втрата, ₴', f: v => `<span class="down">${n0(v)}</span>` }
+        ], losers, { sort: 'net', limit: 40 }),
+        'чистий внесок після бонусів мереж — від\'ємний')}</div>` : ''}
+    <div style="margin-top:12px">
+      ${card('SKU: повний зріз', dataTable('tSku', cols, data, { sort: 'rev' }))}
+    </div>`;
+
+  const maxR = Math.max(...data.map(d => d.rev), 1);
+  const grp = { A: [], B: [], C: [] };
+  data.filter(d => d.unitCost !== null).forEach(d => grp[d.abc].push({
+    x: Math.max(d.qty, 1), y: d.nm, r: 3 + Math.sqrt(d.rev / maxR) * 20, l: d.sku, rev: d.rev
+  }));
+  chart('cSkuMap', {
+    type: 'bubble',
+    data: {
+      datasets: [
+        { label: 'A', data: grp.A, backgroundColor: 'rgba(134,184,96,.35)', borderColor: '#86B860', borderWidth: 1 },
+        { label: 'B', data: grp.B, backgroundColor: 'rgba(232,163,61,.3)', borderColor: '#E8A33D', borderWidth: 1 },
+        { label: 'C', data: grp.C, backgroundColor: 'rgba(155,143,131,.22)', borderColor: '#6E655B', borderWidth: 1 }
+      ]
+    },
+    options: {
+      scales: {
+        x: { type: 'logarithmic', grid: { color: '#221D18' }, ticks: { callback: v => money(v) }, title: { display: true, text: 'обсяг, од (лог)' } },
+        y: { grid: { color: '#221D18' }, ticks: { callback: v => v + '%' }, title: { display: true, text: 'чиста маржа, %' } }
+      },
+      plugins: {
+        legend: { position: 'bottom' },
+        tooltip: { callbacks: { label: c => [c.raw.l, `${n0(c.raw.x)} од · ${n1(c.raw.y)}%`, `${n0(c.raw.rev)} ₴`] } }
+      }
+    }
+  });
+  bindTables();
+}
+
+/* =====================================================================
+   05 · ЕКОНОМІКА SKU
+   ===================================================================== */
+
+function finRateOf(chainKey) {
+  const t = APP.d.termsMap[chainKey];
+  const d = t ? (+t.delayDays || 0) : 0;
+  return d / 365 * (APP.cfg.moneyRate / 100);
+}
+function bonusOf(chainKey) {
+  const t = APP.d.termsMap[chainKey];
+  return t ? (+t.totalBonus || 0) / 100 : 0;
+}
+
+/** Гранична глибина знижки, за якої чистий внесок = 0 */
+function breakEven(price, cost, chainKey) {
+  if (!price || cost === null) return null;
+  const k = 1 - bonusOf(chainKey) - finRateOf(chainKey) - APP.cfg.logistics / 100;
+  if (k <= 0) return null;
+  const dUs = 1 - cost / (price * k);          // знижка від нашої ціни
+  const share = Math.max(1, APP.cfg.promoShare) / 100;
+  return { us: dUs * 100, shelf: dUs / share * 100, k };
+}
+
+function viewEcon(host) {
+  const rs = rows();
+  const chains = APP.d.chains.filter(c => c !== CHAIN_OTHER);
+  const selChain = APP.econChain && chains.includes(APP.econChain) ? APP.econChain : (chains[0] || CHAIN_OTHER);
+  const chRows = rs.filter(r => r.chain === selChain);
+
+  const byS = agg(chRows, r => r.sku).sort((a, b) => b.rev - a.rev);
+
+  /* найглибше заплановане промо по SKU в цій мережі */
+  const planned = {};
+  APP.d.promo.forEach(p => {
+    if (p.chain !== selChain || !p.sku || p.depth === null) return;
+    if (!planned[p.sku] || p.depth > planned[p.sku]) planned[p.sku] = p.depth;
+  });
+
+  const data = byS.map(x => {
+    const c = APP.d.cost[x.key];
+    const be = c ? breakEven(x.price, c.unit, selChain) : null;
+    const plan = planned[x.key] ?? null;
+    return {
+      sku: x.key, rev: x.rev, qty: x.qty, price: x.price,
+      cost: c ? c.unit : null, mat: c ? c.mat : null, wage: c ? c.wage : null, extra: c ? c.extra : null,
+      unitGross: c ? x.price - c.unit : null,
+      gm: x.gm, nm: x.nm,
+      be: be ? be.shelf : null,
+      plan,
+      gap: (be && plan !== null) ? be.shelf - plan : null
+    };
+  });
+
+  const risky = data.filter(d => d.gap !== null && d.gap < 0).sort((a, b) => a.gap - b.gap);
+  const t = APP.d.termsMap[selChain];
+
+  const cols = [
+    { k: 'sku', t: 'Номенклатура', txt: true },
+    { k: 'qty', t: 'Обсяг, од', f: v => n0(v) },
+    { k: 'price', t: 'Ціна/од, ₴', f: v => n2(v) },
+    { k: 'cost', t: 'Собів./од, ₴', f: v => v === null ? '—' : n2(v) },
+    { k: 'unitGross', t: 'Валова/од, ₴', f: v => v === null ? '—' : `<span class="${v > 0 ? 'up' : 'down'}">${n2(v)}</span>` },
+    { k: 'gm', t: 'Валова, %', f: v => n1(v) },
+    { k: 'nm', t: 'Чиста, %', f: v => `<span class="${v > 0 ? 'up' : 'down'}">${n1(v)}</span>` },
+    {
+      k: 'be', t: 'Гранична знижка', f: v => v === null ? '—' : `<b>${n1(v)}%</b>`,
+      title: 'Глибина полиці, за якої чистий внесок дорівнює нулю'
+    },
+    { k: 'plan', t: 'План промо', f: v => v === null ? '—' : n0(v) + '%' },
+    {
+      k: 'gap', t: 'Запас', f: v => v === null ? '—' :
+        `<span class="${v >= 0 ? 'up' : 'down'}">${v > 0 ? '+' : ''}${n1(v)} п.п.</span>`
+    }
+  ];
+
+  const assumptions = `
+    <div class="grid g2" style="gap:10px">
+      <div class="field"><label>Виручка у джерелі</label>
+        <select id="aVat">
+          <option value="0" ${!APP.cfg.vatIncluded ? 'selected' : ''}>без ПДВ</option>
+          <option value="1" ${APP.cfg.vatIncluded ? 'selected' : ''}>з ПДВ (${APP.cfg.vatRate}%)</option>
+        </select></div>
+      <div class="field"><label>Вартість грошей, % річних</label>
+        <input type="number" id="aRate" value="${APP.cfg.moneyRate}" min="0" max="100" step="1"></div>
+      <div class="field"><label>Частка знижки, яку фінансує виробник, %</label>
+        <input type="number" id="aShare" value="${APP.cfg.promoShare}" min="1" max="100" step="5"></div>
+      <div class="field"><label>Логістика та інше, % від виручки</label>
+        <input type="number" id="aLog" value="${APP.cfg.logistics}" min="0" max="30" step="0.5"></div>
+    </div>
+    <div class="note">Ці припущення впливають на чисту маржу, граничну знижку та ROI промо в усіх розділах.
+    Собівартість береться з аркуша «Собівартість» як сума матеріалів, відрядної оплати та додаткових витрат на одиницю.</div>`;
+
+  const termCard = t ? `<dl class="kv">
+      <dt>Ретро-бонус</dt><dd>${n1(+t.retro)}%</dd>
+      <dt>Маркетинговий бюджет</dt><dd>${n1(+t.mb)}%</dd>
+      <dt>Компенсація</dt><dd>${n1(+t.compensation)}%</dd>
+      <dt>Логістичний бонус</dt><dd>${n1(+t.lb)}%</dd>
+      <dt>Додатковий бюджет</dt><dd>${n1(+t.extraBudget)}%</dd>
+      <dt style="color:var(--ink)">Разом бонуси</dt><dd style="color:var(--amber)">${n1(+t.totalBonus)}%</dd>
+      <dt>Відтермінування</dt><dd>${n0(+t.delayDays)} дн</dd>
+      <dt>Вартість відтермінування</dt><dd>${n2(finRateOf(selChain) * 100)}%</dd>
+      <dt style="color:var(--ink)">Разом навантаження</dt><dd style="color:var(--chili)">${n1((bonusOf(selChain) + finRateOf(selChain) + APP.cfg.logistics / 100) * 100)}%</dd>
+    </dl>` : `<div class="warnbox">Для мережі «${esc(selChain)}» умови не заповнені — розрахунок веде себе так, наче бонусів немає, тож маржа завищена.</div>`;
+
+  host.innerHTML = `
+    <div class="split" style="margin-bottom:12px">
+      <span class="pill">Мережа для розрахунку</span>
+      <select id="econChain">${chains.concat([CHAIN_OTHER]).map(c =>
+    `<option ${c === selChain ? 'selected' : ''}>${esc(c)}</option>`).join('')}</select>
+      <span class="pill">${n0(byS.length)} SKU · ${money(sum(chRows, r => r.rev))} ₴</span>
+    </div>
+    <div class="grid g3">
+      ${card('Умови мережі', termCard, esc(selChain))}
+      ${card('Припущення розрахунку', assumptions)}
+      ${card('Скільки витримує полиця', canvas('cBE', 'h260'), 'гранична знижка проти планової')}
+    </div>
+    ${risky.length ? `<div style="margin-top:12px">${card('Промо, що не окупається',
+      `<div class="warnbox" style="margin:12px 12px 0">${risky.length} позицій заплановані глибше за граничну знижку.
+        На цих механіках чистий внесок стає від'ємним ще до врахування логістики промо-обсягів.</div>` +
+      dataTable('tRisk', [
+        { k: 'sku', t: 'Номенклатура', txt: true },
+        { k: 'price', t: 'Ціна/од, ₴', f: v => n2(v) },
+        { k: 'cost', t: 'Собів./од, ₴', f: v => n2(v) },
+        { k: 'be', t: 'Гранична', f: v => n1(v) + '%' },
+        { k: 'plan', t: 'Планова', f: v => `<span class="down">${n0(v)}%</span>` },
+        { k: 'gap', t: 'Перебір', f: v => `<span class="down">${n1(Math.abs(v))} п.п.</span>` },
+        { k: 'qty', t: 'Обсяг, од', f: v => n0(v) }
+      ], risky, { sort: 'gap', limit: 40 }), 'ризик за обраною мережею')}</div>` : ''}
+    <div style="margin-top:12px">
+      ${card('Юніт-економіка по SKU', dataTable('tEcon', cols, data, { sort: 'rev' }), esc(selChain))}
+    </div>`;
+
+  el('econChain').onchange = e => { APP.econChain = e.target.value; render(); };
+  el('aVat').onchange = e => { APP.cfg.vatIncluded = e.target.value === '1'; saveCfg(); build(); render(); };
+  ['aRate', 'aShare', 'aLog'].forEach(id => {
+    el(id).onchange = e => {
+      const v = parseFloat(e.target.value) || 0;
+      if (id === 'aRate') APP.cfg.moneyRate = v;
+      if (id === 'aShare') APP.cfg.promoShare = Math.max(1, v);
+      if (id === 'aLog') APP.cfg.logistics = v;
+      saveCfg(); build(); render();
+    };
+  });
+
+  const top = data.filter(d => d.be !== null).sort((a, b) => b.rev - a.rev).slice(0, 14);
+  chart('cBE', {
+    type: 'bar',
+    data: {
+      labels: top.map(d => d.sku.length > 24 ? d.sku.slice(0, 23) + '…' : d.sku),
+      datasets: [
+        { label: 'Гранична знижка', data: top.map(d => d.be), backgroundColor: '#86B860', borderRadius: 1 },
+        { label: 'Планова глибина', data: top.map(d => d.plan ?? 0), backgroundColor: '#D9563F', borderRadius: 1 }
+      ]
+    },
+    options: {
+      indexAxis: 'y',
+      scales: { x: AX.yPct, y: { grid: { display: false }, ticks: { font: { size: 9 } } } },
+      plugins: { tooltip: { callbacks: { label: c => ` ${c.dataset.label}: ${n1(c.parsed.x)}%` } } }
+    }
+  });
+  bindTables();
+}
+
+/* =====================================================================
+   06 · УМОВИ МЕРЕЖ
+   ===================================================================== */
+
+function viewChains(host) {
+  const rs = rows();
+  const byC = agg(rs, r => r.chain).sort((a, b) => b.rev - a.rev);
+
+  const data = byC.map(x => {
+    const t = APP.d.termsMap[x.key];
+    const fin = finRateOf(x.key);
+    return {
+      chain: x.key,
+      retro: t ? +t.retro : null, mb: t ? +t.mb : null, comp: t ? +t.compensation : null,
+      lb: t ? +t.lb : null, extra: t ? +t.extraBudget : null,
+      bonus: t ? +t.totalBonus : 0, delay: t ? +t.delayDays : 0,
+      finPct: fin * 100, load: (t ? +t.totalBonus : 0) + fin * 100,
+      status: t ? t.status : 'немає в довіднику',
+      rev: x.rev, qty: x.qty, gross: x.gross, gm: x.gm, net: x.net, nm: x.nm,
+      bonusUah: x.rev * (t ? +t.totalBonus : 0) / 100,
+      finUah: x.rev * fin,
+      wc: x.rev * (t ? +t.delayDays : 0) / 365,
+      perPoint: x.rev / 100
+    };
+  });
+
+  const cols = [
+    { k: 'chain', t: 'Мережа', txt: true },
+    { k: 'rev', t: 'Виручка, ₴', f: v => n0(v) },
+    { k: 'retro', t: 'Ретро', f: v => v === null ? '—' : n1(v) + '%' },
+    { k: 'mb', t: 'МБ', f: v => v === null ? '—' : n1(v) + '%' },
+    { k: 'comp', t: 'Компенс.', f: v => v === null ? '—' : n1(v) + '%' },
+    { k: 'lb', t: 'ЛБ', f: v => v === null ? '—' : n1(v) + '%' },
+    { k: 'extra', t: 'Дод.', f: v => v === null ? '—' : n1(v) + '%' },
+    { k: 'bonus', t: 'Разом бонуси', f: v => `<b>${n1(v)}%</b>` },
+    { k: 'delay', t: 'Відтерм., дн', f: v => n0(v) },
+    { k: 'finPct', t: 'Ціна грошей', f: v => n2(v) + '%' },
+    { k: 'load', t: 'Навантаження', f: v => `<span class="${v > 30 ? 'down' : ''}">${n1(v)}%</span>` },
+    { k: 'gm', t: 'Валова, %', f: v => n1(v) },
+    { k: 'nm', t: 'Чиста, %', f: v => `<span class="${v > 0 ? 'up' : 'down'}">${n1(v)}</span>` },
+    { k: 'bonusUah', t: 'Бонуси, ₴', f: v => n0(v) },
+    { k: 'wc', t: 'Заморожено, ₴', f: v => n0(v), title: 'Середній залишок дебіторки при цьому обороті' },
+    { k: 'perPoint', t: '1 п.п. ретро, ₴', f: v => n0(v) }
+  ];
+
+  const T = totals(rs);
+  const totalBonus = sum(data, d => d.bonusUah);
+  const totalWc = sum(data, d => d.wc);
+
+  host.innerHTML = `
+    <div class="kpis">
+      ${kpi('Бонуси мереж', money(totalBonus), '₴', `<span class="d">${n1(totalBonus / (T.rev || 1) * 100)}% виручки</span>`, 'neg')}
+      ${kpi('Заморожено в дебіторці', money(totalWc), '₴', `<span class="d">середній залишок</span>`)}
+      ${kpi('Вартість відтермінування', money(sum(data, d => d.finUah)), '₴', `<span class="d">${APP.cfg.moneyRate}% річних</span>`)}
+      ${kpi('Найважча мережа', esc((data.slice().sort((a, b) => b.load - a.load)[0]?.chain || '—').slice(0, 16)), '',
+    `<span class="d">${n1(data.slice().sort((a, b) => b.load - a.load)[0]?.load || 0)}% навантаження</span>`, 'neg')}
+      ${kpi('Мереж без умов', n0(data.filter(d => d.retro === null).length), '', '', data.some(d => d.retro === null) ? 'neg' : 'pos')}
+    </div>
+    <div class="grid g2" style="margin-top:12px">
+      ${card('Структура бонусного навантаження', canvas('cBonus', 'h320'), '% від виручки')}
+      ${card('Що залишається виробнику', canvas('cChainNet', 'h320'), 'валова → чиста маржа')}
+    </div>
+    <div style="margin-top:12px">
+      ${card('Умови та їхня ціна', dataTable('tChains', cols, data, { sort: 'rev' }),
+      'колонка «1 п.п. ретро» — скільки коштує кожен відсоток у переговорах')}
+    </div>
+    <div style="margin-top:12px">
+      ${card('Як читати', `<div class="note">
+        <b>Навантаження</b> — сума всіх бонусів плюс вартість відтермінування за поточної ставки ${APP.cfg.moneyRate}% річних.
+        Це те, що мережа фактично забирає з кожної гривні відвантаження, ще до промо-знижок.<br><br>
+        <b>1 п.п. ретро</b> — скільки коштує один відсотковий пункт при поточному обороті. Це орієнтир для торгу:
+        якщо мережа просить +2 п.п. ретро в обмін на розширення матриці, приріст обороту має перекрити цю суму.<br><br>
+        <b>Заморожено</b> — середній залишок дебіторки за формулою оборот × дні / 365. Це робочий капітал,
+        який не працює, і саме він робить довгі відтермінування дорожчими, ніж здається.
+      </div>`)}
+    </div>`;
+
+  const D = data.filter(d => d.retro !== null);
+  chart('cBonus', {
+    type: 'bar',
+    data: {
+      labels: D.map(d => d.chain),
+      datasets: [
+        { label: 'Ретро', data: D.map(d => d.retro), backgroundColor: '#E8A33D' },
+        { label: 'Маркетинговий бюджет', data: D.map(d => d.mb), backgroundColor: '#6F8FD0' },
+        { label: 'Компенсація', data: D.map(d => d.comp), backgroundColor: '#86B860' },
+        { label: 'Логістичний бонус', data: D.map(d => d.lb), backgroundColor: '#B07AB4' },
+        { label: 'Додатковий бюджет', data: D.map(d => d.extra), backgroundColor: '#55A99B' },
+        { label: 'Ціна відтермінування', data: D.map(d => d.finPct), backgroundColor: '#D9563F' }
+      ]
+    },
+    options: {
+      scales: {
+        x: { stacked: true, grid: { display: false }, ticks: { font: { size: 9.5 }, maxRotation: 45, minRotation: 45 } },
+        y: { stacked: true, grid: { color: '#221D18' }, ticks: { callback: v => v + '%' } }
+      },
+      plugins: {
+        legend: { position: 'bottom', labels: { font: { size: 10 } } },
+        tooltip: { callbacks: { label: c => ` ${c.dataset.label}: ${n1(c.parsed.y)}%` } }
+      }
+    }
+  });
+
+  const D2 = data.filter(d => d.rev > 0).slice(0, 12);
+  chart('cChainNet', {
+    type: 'bar',
+    data: {
+      labels: D2.map(d => d.chain),
+      datasets: [
+        { label: 'Валова маржа, %', data: D2.map(d => d.gm), backgroundColor: '#6F8FD0', borderRadius: 1 },
+        { label: 'Чиста маржа, %', data: D2.map(d => d.nm), backgroundColor: '#E8A33D', borderRadius: 1 }
+      ]
+    },
+    options: {
+      scales: {
+        x: { grid: { display: false }, ticks: { font: { size: 9.5 }, maxRotation: 45, minRotation: 45 } },
+        y: AX.yPct
+      },
+      plugins: { tooltip: { callbacks: { label: c => ` ${c.dataset.label}: ${n1(c.parsed.y)}%` } } }
+    }
+  });
+  bindTables();
+}
+
+/* =====================================================================
+   07 · ПРОМО-КАЛЕНДАР  (сигнатурний блок)
+   ===================================================================== */
+
+function promoSheets() { return uniq(APP.d.promo.map(p => p.sheet)).sort(); }
+
+function viewPromoPlan(host) {
+  const P = APP.d.promo;
+  if (!P.length) {
+    host.innerHTML = card('Промо-календар', `<div class="empty">
+      <b>Промо-план не завантажено</b>
+      Бекенд не повернув жодного рядка з таблиці «ПРОМО ПЛАН».
+      Перевірте діагностику парсера в розділі «Дані та якість».</div>`);
+    return;
+  }
+
+  const sheets = promoSheets();
+  const sel = sheets.includes(APP.promoSheet) ? APP.promoSheet : sheets[0];
+  const years = uniq(P.map(p => p.week && p.week.slice(0, 4)).filter(Boolean)).sort();
+  const yr = years.includes(APP.promoYear) ? APP.promoYear : years[years.length - 1];
+
+  const rowsP = P.filter(p => p.sheet === sel && p.week && p.week.slice(0, 4) === yr);
+  const weeks = uniq(rowsP.map(p => p.week)).sort();
+
+  /* SKU у порядку виручки */
+  const revBySku = {};
+  agg(APP.d.sales.filter(r => r.chain === chainOfSheet(sel)), r => r.sku)
+    .forEach(x => revBySku[x.key] = x.rev);
+  const firstOf = new Map();
+  rowsP.forEach(p => { if (!firstOf.has(p.promoSku)) firstOf.set(p.promoSku, p); });
+  const skus = Array.from(firstOf.keys()).sort((a, b) =>
+    (revBySku[firstOf.get(b).sku] || 0) - (revBySku[firstOf.get(a).sku] || 0));
+
+  /* карта комірок */
+  const cell = {};
+  rowsP.forEach(p => {
+    const k = p.promoSku + '|' + p.week;
+    if (!cell[k]) cell[k] = { depth: null, plan: 0, start: false, notes: [], sku: p.sku };
+    if (p.metric === 'промо') {
+      cell[k].promo = true;
+      if (p.depth !== null && (cell[k].depth === null || p.depth > cell[k].depth)) cell[k].depth = p.depth;
+      if (p.text) cell[k].notes.push(p.text);
+    } else if (p.metric === 'старт відвантажень') {
+      cell[k].start = true; cell[k].notes.push('старт: ' + p.text);
+    } else if (p.value) {
+      cell[k].plan += p.value;
+      cell[k].notes.push(p.metric + ': ' + n0(p.value));
+    }
+  });
+
+  /* заголовки з групуванням по місяцях */
+  let monHdr = '<tr><th class="sku" rowspan="2">Номенклатура</th>';
+  let wkHdr = '<tr>';
+  let curM = '', span = 0, buf = [];
+  weeks.forEach((w, i) => {
+    const m = w.slice(0, 7);
+    if (m !== curM) { if (curM) buf.push([curM, span]); curM = m; span = 1; }
+    else span++;
+    if (i === weeks.length - 1) buf.push([curM, span]);
+  });
+  buf.forEach(([m, sp]) => monHdr += `<th class="mon" colspan="${sp}">${MONTH_SH[+m.slice(5)]}</th>`);
+  monHdr += '</tr>';
+  let prevM = '';
+  weeks.forEach(w => {
+    const m1 = w.slice(0, 7) !== prevM; prevM = w.slice(0, 7);
+    wkHdr += `<th class="wk ${m1 ? 'm1' : ''}" title="${w}">${w.slice(8, 10)}</th>`;
+  });
+  wkHdr += '</tr>';
+
+  let body = '';
+  skus.forEach(s => {
+    const first = firstOf.get(s);
+    const matched = first && first.sku;
+    body += `<tr><td class="sku" title="${esc(s)}${matched ? '\n→ ' + esc(matched) : '\n(без пари у продажах)'}">${matched ? '' : '<span style="color:var(--chili)">◦ </span>'}${esc(s)}</td>`;
+    prevM = '';
+    weeks.forEach(w => {
+      const m1 = w.slice(0, 7) !== prevM; prevM = w.slice(0, 7);
+      const c = cell[s + '|' + w];
+      let cls = 'c' + (m1 ? ' m1' : '');
+      let title = '';
+      if (c) {
+        if (c.promo) {
+          const d = c.depth;
+          cls += ' ' + (d === null ? 'd2' : d < 15 ? 'd1' : d < 22 ? 'd2' : d < 28 ? 'd3' : d < 35 ? 'd4' : 'd5');
+        }
+        if (c.plan) cls += ' plan';
+        if (c.start) cls += ' start';
+        title = `${s}\n${w}\n${c.notes.join('\n')}`;
+      }
+      body += `<td class="${cls}" title="${esc(title)}"></td>`;
+    });
+    body += '</tr>';
+  });
+
+  const cal = `<div class="calwrap"><table class="cal">
+    <thead>${monHdr}${wkHdr}</thead><tbody>${body}</tbody></table></div>`;
+
+  /* метрики тиску */
+  const cells = Object.values(cell);
+  const promoCells = cells.filter(c => c.promo);
+  const depths = promoCells.map(c => c.depth).filter(d => d !== null);
+  const load = weeks.length && skus.length ? promoCells.length / (weeks.length * skus.length) * 100 : 0;
+
+  const perSku = skus.map(s => {
+    const cs = weeks.map(w => cell[s + '|' + w]).filter(c => c && c.promo);
+    const ds = cs.map(c => c.depth).filter(d => d !== null);
+    const f = firstOf.get(s);
+    return {
+      sku: s, matched: f && f.sku ? 'так' : 'ні',
+      weeks: cs.length, share: weeks.length ? cs.length / weeks.length * 100 : 0,
+      avgDepth: ds.length ? mean(ds) : null, maxDepth: ds.length ? Math.max(...ds) : null,
+      plan: sum(weeks.map(w => cell[s + '|' + w]).filter(Boolean), c => c.plan),
+      rev: revBySku[f && f.sku] || 0
+    };
+  });
+
+  /* тиждень за тижнем: скільки SKU в промо */
+  const perWeek = weeks.map(w => ({
+    w, n: skus.filter(s => cell[s + '|' + w] && cell[s + '|' + w].promo).length,
+    d: mean(skus.map(s => cell[s + '|' + w]).filter(c => c && c.depth !== null).map(c => c.depth))
+  }));
+
+  host.innerHTML = `
+    <div class="split" style="margin-bottom:12px">
+      <span class="pill">Мережа</span>
+      <select id="pSheet">${sheets.map(s => `<option ${s === sel ? 'selected' : ''}>${esc(s)}</option>`).join('')}</select>
+      <span class="pill">Рік</span>
+      <select id="pYear">${years.map(y => `<option ${y === yr ? 'selected' : ''}>${y}</option>`).join('')}</select>
+      <span class="pill">${skus.length} SKU · ${weeks.length} тижнів</span>
+    </div>
+    <div class="kpis">
+      ${kpi('Промо-тиск', n1(load), '%', `<span class="d">${n0(promoCells.length)} з ${n0(weeks.length * skus.length)} клітинок</span>`, load > 40 ? 'neg' : '')}
+      ${kpi('Середня глибина', depths.length ? n1(mean(depths)) : '—', '%', `<span class="d">макс ${depths.length ? n0(Math.max(...depths)) : '—'}%</span>`)}
+      ${kpi('SKU у промо', n0(perSku.filter(s => s.weeks).length), 'з ' + skus.length)}
+      ${kpi('Пік тижня', n0(Math.max(...perWeek.map(w => w.n), 0)), 'SKU одночасно')}
+      ${kpi('Тижнів без промо', n0(perWeek.filter(w => !w.n).length), 'з ' + weeks.length, '',
+    perWeek.filter(w => !w.n).length < weeks.length * 0.3 ? 'neg' : 'pos')}
+    </div>
+    <div style="margin-top:12px">
+      ${card('Календар промо-активності', cal,
+      `<span class="calscale">глибина:
+        <i style="background:rgba(232,163,61,.28)"></i>&lt;15%
+        <i style="background:rgba(232,163,61,.48)"></i>15–22
+        <i style="background:rgba(232,163,61,.72)"></i>22–28
+        <i style="background:#E8A33D"></i>28–35
+        <i style="background:#D9563F"></i>&gt;35%
+        · <i style="background:#1A1713;box-shadow:inset 2px 0 0 #86B860"></i>старт відвантажень
+       </span>`)}
+    </div>
+    <div class="grid g2" style="margin-top:12px">
+      ${card('Промо-тиск по тижнях', canvas('cWeek', 'h260'), 'кількість SKU та середня глибина')}
+      ${card('Найбільш «промотовані» позиції', canvas('cSkuLoad', 'h260'), 'частка тижнів у промо')}
+    </div>
+    <div style="margin-top:12px">
+      ${card('Промо-план по SKU', dataTable('tPlan', [
+        { k: 'sku', t: 'Номенклатура промо-плану', txt: true },
+        { k: 'matched', t: 'Пара', f: v => v === 'так' ? '<span class="tag a">є</span>' : '<span class="tag c">нема</span>' },
+        { k: 'weeks', t: 'Тижнів', f: v => n0(v) },
+        { k: 'share', t: 'Частка року', f: v => `${n1(v)}%<span class="bar" style="width:${Math.min(100, v)}%"></span>` },
+        { k: 'avgDepth', t: 'Сер. глибина', f: v => v === null ? '—' : n1(v) + '%' },
+        { k: 'maxDepth', t: 'Макс', f: v => v === null ? '—' : n0(v) + '%' },
+        { k: 'plan', t: 'План, од', f: v => v ? n0(v) : '—' },
+        { k: 'rev', t: 'Факт виручка, ₴', f: v => v ? n0(v) : '—' }
+      ], perSku, { sort: 'weeks' }))}
+    </div>`;
+
+  el('pSheet').onchange = e => { APP.promoSheet = e.target.value; render(); };
+  el('pYear').onchange = e => { APP.promoYear = e.target.value; render(); };
+
+  chart('cWeek', {
+    data: {
+      labels: perWeek.map(w => w.w.slice(8, 10) + '.' + w.w.slice(5, 7)),
+      datasets: [
+        { type: 'bar', label: 'SKU у промо', data: perWeek.map(w => w.n), backgroundColor: '#E8A33D', borderRadius: 1 },
+        {
+          type: 'line', label: 'Середня глибина, %', data: perWeek.map(w => isFinite(w.d) ? w.d : null),
+          yAxisID: 'y1', borderColor: '#D9563F', tension: .3, pointRadius: 0, borderWidth: 2, spanGaps: true
+        }
+      ]
+    },
+    options: {
+      scales: {
+        x: { grid: { display: false }, ticks: { font: { size: 8.5 }, maxRotation: 90, minRotation: 90 } },
+        y: { grid: { color: '#221D18' }, ticks: { precision: 0 } },
+        y1: { position: 'right', grid: { display: false }, ticks: { callback: v => v + '%' } }
+      }
+    }
+  });
+
+  const topL = perSku.filter(s => s.weeks).sort((a, b) => b.share - a.share).slice(0, 14);
+  chart('cSkuLoad', {
+    type: 'bar',
+    data: {
+      labels: topL.map(s => s.sku.length > 26 ? s.sku.slice(0, 25) + '…' : s.sku),
+      datasets: [
+        { label: 'Частка тижнів у промо, %', data: topL.map(s => s.share), backgroundColor: '#B07AB4', borderRadius: 1 },
+        { label: 'Середня глибина, %', data: topL.map(s => s.avgDepth || 0), backgroundColor: '#55A99B', borderRadius: 1 }
+      ]
+    },
+    options: {
+      indexAxis: 'y',
+      scales: { x: AX.yPct, y: { grid: { display: false }, ticks: { font: { size: 9 } } } },
+      plugins: { tooltip: { callbacks: { label: c => ` ${c.dataset.label}: ${n1(c.parsed.x)}%` } } }
+    }
+  });
+  bindTables();
+}
+
+/* =====================================================================
+   08 · ЕФЕКТИВНІСТЬ ПРОМО
+   ===================================================================== */
+
+function promoEffect() {
+  const D = APP.d;
+  const out = [];
+  const share = Math.max(1, APP.cfg.promoShare) / 100;
+
+  /* факт по мережа×sku×місяць */
+  const fact = {};
+  D.sales.forEach(r => {
+    const k = r.chain + '|' + r.sku;
+    if (!fact[k]) fact[k] = {};
+    const f = fact[k][r.ym] || (fact[k][r.ym] = { qty: 0, rev: 0, cogs: 0, gross: 0 });
+    f.qty += r.qty; f.rev += r.rev;
+    if (r.cogs !== null) { f.cogs += r.cogs; f.gross += r.gross; }
+  });
+
+  Object.entries(fact).forEach(([k, byM]) => {
+    const [chain, sku] = k.split('|');
+    const months = Object.keys(byM).sort();
+    if (months.length < 4) return;
+
+    const withP = [], without = [];
+    months.forEach(m => {
+      const pm = D.promoMonth[chain + '|' + sku + '|' + m];
+      const on = pm && pm.weeks > 0;
+      (on ? withP : without).push({ m, ...byM[m], weeks: on ? pm.weeks : 0, depth: on ? pm.depthAvg : null });
+    });
+    if (!withP.length || without.length < 2) return;
+
+    const base = median(without.map(x => x.qty));
+    if (base <= 0) return;
+    const basePrice = mean(without.map(x => x.qty ? x.rev / x.qty : 0).filter(Boolean));
+    const cost = D.cost[sku] ? D.cost[sku].unit : null;
+
+    const promoQty = sum(withP, x => x.qty);
+    const incQty = promoQty - base * withP.length;
+    const depth = mean(withP.map(x => x.depth).filter(d => d !== null && isFinite(d)));
+    const promoPrice = mean(withP.map(x => x.qty ? x.rev / x.qty : 0).filter(Boolean));
+
+    const invest = isFinite(depth) ? promoQty * basePrice * (depth / 100) * share : null;
+    const incGross = cost === null ? null : incQty * (promoPrice - cost);
+    const roi = (invest && incGross !== null) ? (incGross - invest) / invest * 100 : null;
+
+    out.push({
+      chain, sku,
+      months: months.length, promoMonths: withP.length, baseMonths: without.length,
+      base, promoAvg: promoQty / withP.length,
+      uplift: base ? (promoQty / withP.length / base - 1) * 100 : null,
+      incQty, depth: isFinite(depth) ? depth : null,
+      basePrice, promoPrice,
+      priceDrop: basePrice ? (1 - promoPrice / basePrice) * 100 : null,
+      invest, incGross, roi,
+      rev: sum(months.map(m => byM[m]), x => x.rev)
+    });
+  });
+  return out.sort((a, b) => b.rev - a.rev);
+}
+
+function viewPromoEff(host) {
+  const data = promoEffect();
+  if (!data.length) {
+    host.innerHTML = card('Ефективність промо', `<div class="empty">
+      <b>Недостатньо даних для порівняння</b>
+      Потрібно щонайменше 2 місяці без промо та 1 з промо на комбінацію мережа × SKU,
+      а також успішне зіставлення назв промо-плану з номенклатурою продажів.</div>`);
+    return;
+  }
+
+  const sel = data.filter(d => d.roi !== null);
+  const good = sel.filter(d => d.roi > 0), bad = sel.filter(d => d.roi <= 0);
+  const totInv = sum(sel, d => d.invest), totInc = sum(sel, d => d.incGross);
+
+  const cols = [
+    { k: 'sku', t: 'Номенклатура', txt: true },
+    { k: 'chain', t: 'Мережа', txt: true, f: v => `<span class="tag">${esc(v)}</span>` },
+    { k: 'promoMonths', t: 'Міс. з промо', f: v => n0(v) },
+    { k: 'base', t: 'База, од/міс', f: v => n0(v) },
+    { k: 'promoAvg', t: 'Промо, од/міс', f: v => n0(v) },
+    { k: 'uplift', t: 'Приріст', f: v => v === null ? '—' : `<span class="${v > 0 ? 'up' : 'down'}">${v > 0 ? '+' : ''}${n0(v)}%</span>` },
+    { k: 'depth', t: 'Глибина', f: v => v === null ? '—' : n1(v) + '%' },
+    { k: 'priceDrop', t: 'Падіння ціни', f: v => v === null ? '—' : n1(v) + '%', title: 'Фактичне падіння середньої ціни відвантаження' },
+    { k: 'incQty', t: 'Дод. обсяг, од', f: v => `<span class="${v > 0 ? 'up' : 'down'}">${n0(v)}</span>` },
+    { k: 'invest', t: 'Інвестиція, ₴', f: v => v === null ? '—' : n0(v) },
+    { k: 'incGross', t: 'Дод. маржа, ₴', f: v => v === null ? '—' : `<span class="${v > 0 ? 'up' : 'down'}">${n0(v)}</span>` },
+    { k: 'roi', t: 'ROI', f: v => v === null ? '—' : `<span class="${v > 0 ? 'up' : 'down'}">${v > 0 ? '+' : ''}${n0(v)}%</span>` }
+  ];
+
+  /* залежність приросту від глибини */
+  const pts = sel.filter(d => d.depth !== null && d.uplift !== null && isFinite(d.uplift));
+  let slope = null, r2 = null;
+  if (pts.length > 4) {
+    const xs = pts.map(p => p.depth), ys = pts.map(p => p.uplift);
+    const mx = mean(xs), my = mean(ys);
+    const cov = sum(pts.map((_, i) => (xs[i] - mx) * (ys[i] - my)), v => v);
+    const vx = sum(xs.map(x => (x - mx) ** 2), v => v);
+    slope = vx ? cov / vx : null;
+    if (slope !== null) {
+      const pred = xs.map(x => my + slope * (x - mx));
+      const ssRes = sum(ys.map((y, i) => (y - pred[i]) ** 2), v => v);
+      const ssTot = sum(ys.map(y => (y - my) ** 2), v => v);
+      r2 = ssTot ? 1 - ssRes / ssTot : null;
+    }
+  }
+
+  host.innerHTML = `
+    <div class="kpis">
+      ${kpi('Пар мережа × SKU', n0(data.length), '', `<span class="d">${n0(sel.length)} з повним розрахунком</span>`)}
+      ${kpi('Промо в плюс', n0(good.length), '', `<span class="d">${n1(sel.length ? good.length / sel.length * 100 : 0)}% випадків</span>`, 'pos')}
+      ${kpi('Промо в мінус', n0(bad.length), '', `<span class="d">${money(sum(bad, d => d.invest - d.incGross))} ₴ втрат</span>`, 'neg')}
+      ${kpi('Інвестовано у знижку', money(totInv), '₴')}
+      ${kpi('Додаткова маржа', money(totInc), '₴', dEl(totInv ? (totInc / totInv - 1) * 100 : null), totInc > totInv ? 'pos' : 'neg')}
+      ${kpi('Сукупний ROI', totInv ? n0((totInc - totInv) / totInv * 100) : '—', '%', '', totInc > totInv ? 'pos' : 'neg')}
+    </div>
+
+    <div class="grid g2" style="margin-top:12px">
+      ${card('Приріст обсягу проти глибини знижки', canvas('cElast', 'h300'),
+    slope !== null ? `нахил ${n1(slope)} % обсягу на 1 п.п. знижки · R² ${n2(r2)}` : 'мало спостережень')}
+      ${card('Куди йдуть гроші промо', canvas('cRoi', 'h300'), 'інвестиція проти додаткової маржі')}
+    </div>
+
+    <div style="margin-top:12px">
+      ${card('Ефективність по парах', dataTable('tEff', cols, data, { sort: 'rev' }),
+      'сортування за виручкою; клік по заголовку змінює порядок')}
+    </div>
+
+    <div style="margin-top:12px">
+      ${card('Як рахується та де межі методу', `<div class="note">
+        <b>База</b> — медіана місячних обсягів у місяцях без промо для конкретної пари мережа × SKU.
+        Медіана, а не середнє, щоб один аномальний місяць не зсував орієнтир.<br><br>
+        <b>Приріст</b> — наскільки середній промо-місяць вищий за базу. <b>Додатковий обсяг</b> — різниця
+        фактичного та базового обсягу за всі промо-місяці.<br><br>
+        <b>Інвестиція</b> — увесь промо-обсяг × базова ціна × глибина × частка фінансування виробником
+        (${APP.cfg.promoShare}%, змінюється в розділі «Економіка SKU»).<br><br>
+        <b>Чого метод не бачить:</b> перетікання попиту з сусідніх місяців (закупівля про запас перед промо
+        і провал після), канібалізацію між SKU однієї ТМ, сезонність, і той факт, що продажі тут —
+        це відвантаження мережі, а не sell-out із полиці. Тому цифри читаються як напрямок, а не як точна сума.
+        Пари з 1–2 промо-місяцями ненадійні за визначенням.
+      </div>`)}
+    </div>`;
+
+  chart('cElast', {
+    type: 'scatter',
+    data: {
+      datasets: [
+        {
+          label: 'пара мережа × SKU',
+          data: pts.map(p => ({ x: p.depth, y: p.uplift, l: p.sku, c: p.chain })),
+          backgroundColor: pts.map(p => p.roi > 0 ? 'rgba(134,184,96,.55)' : 'rgba(217,86,63,.55)'),
+          borderColor: pts.map(p => p.roi > 0 ? '#86B860' : '#D9563F'), borderWidth: 1, pointRadius: 5
+        }
+      ].concat(slope !== null ? [{
+        type: 'line', label: 'тренд',
+        data: [{ x: Math.min(...pts.map(p => p.depth)), y: 0 }, { x: Math.max(...pts.map(p => p.depth)), y: 0 }]
+          .map(pt => ({ x: pt.x, y: mean(pts.map(p => p.uplift)) + slope * (pt.x - mean(pts.map(p => p.depth))) })),
+        borderColor: '#E8A33D', borderWidth: 2, pointRadius: 0, borderDash: [5, 4]
+      }] : [])
+    },
+    options: {
+      scales: {
+        x: { grid: { color: '#221D18' }, ticks: { callback: v => v + '%' }, title: { display: true, text: 'глибина знижки' } },
+        y: { grid: { color: '#221D18' }, ticks: { callback: v => v + '%' }, title: { display: true, text: 'приріст обсягу' } }
+      },
+      plugins: {
+        legend: { display: false },
+        tooltip: { callbacks: { label: c => c.raw.l ? [c.raw.l, c.raw.c, `${n1(c.raw.x)}% знижки → ${n0(c.raw.y)}% приросту`] : '' } }
+      }
+    }
+  });
+
+  const topR = sel.slice().sort((a, b) => b.invest - a.invest).slice(0, 14);
+  chart('cRoi', {
+    type: 'bar',
+    data: {
+      labels: topR.map(d => (d.sku.length > 22 ? d.sku.slice(0, 21) + '…' : d.sku)),
+      datasets: [
+        { label: 'Інвестиція у знижку', data: topR.map(d => d.invest), backgroundColor: '#D9563F', borderRadius: 1 },
+        { label: 'Додаткова маржа', data: topR.map(d => d.incGross), backgroundColor: '#86B860', borderRadius: 1 }
+      ]
+    },
+    options: {
+      indexAxis: 'y',
+      scales: { x: AX.y, y: { grid: { display: false }, ticks: { font: { size: 9 } } } },
+      plugins: { tooltip: { callbacks: { label: c => ` ${c.dataset.label}: ${n0(c.parsed.x)} ₴` } } }
+    }
+  });
+  bindTables();
+}
+
+/* =====================================================================
+   09 · ДАНІ ТА ЯКІСТЬ
+   ===================================================================== */
+
+/** Позначає обраний варіант у готовому рядку <option>, не ламаючись на спецсимволах */
+function withSelected(optionsHtml, value) {
+  const needle = 'value="' + esc(value) + '"';
+  const i = optionsHtml.indexOf(needle);
+  if (i < 0) return optionsHtml;
+  return optionsHtml.slice(0, i + needle.length) + ' selected' + optionsHtml.slice(i + needle.length);
+}
+
+function viewData(host) {
+  const R = APP.raw, D = APP.d;
+
+  const stats = `<dl class="kv">
+    <dt>Продажі, агрегованих рядків</dt><dd>${n0(D.sales.length)}</dd>
+    <dt>Вихідних рядків у джерелі</dt><dd>${R.sales && R.sales.sourceRows ? n0(R.sales.sourceRows) : '—'}</dd>
+    <dt>Позицій собівартості</dt><dd>${n0(Object.keys(D.cost).length)}</dd>
+    <dt>Мереж в умовах</dt><dd>${n0(D.terms.length)}</dd>
+    <dt>Рядків промо-плану</dt><dd>${n0(D.promo.length)}</dd>
+    <dt>Період продажів</dt><dd>${D.years.length ? D.years[0] + '–' + D.years[D.years.length - 1] : '—'}</dd>
+    <dt>Оновлено</dt><dd>${R.generated ? new Date(R.generated).toLocaleString('uk-UA') : '—'}</dd>
+  </dl>
+  <div class="split" style="margin-top:12px">
+    <button class="btn primary" id="dReload">Оновити з джерела</button>
+    <button class="btn" id="dSource">Налаштування підключення</button>
+    <button class="btn" id="dExport">Вивантажити JSON</button>
+    <button class="btn ghost" id="dClear">Очистити локальну копію</button>
+  </div>`;
+
+  /* аномалії */
+  let an = '';
+  if (!D.anomalies.length) an = '<div class="okbox">Критичних розбіжностей не знайдено.</div>';
+  D.anomalies.forEach((a, i) => {
+    an += `<div class="${a.lvl === 'err' ? 'warnbox' : 'infobox'}" style="margin-bottom:10px">
+      <div style="font-weight:600;margin-bottom:3px">${a.lvl === 'err' ? '⚠ ' : ''}${esc(a.t)}</div>
+      <div style="color:var(--muted);font-size:11.5px">${a.d}</div>
+      ${a.items && a.items.length ? `<details style="margin-top:6px">
+        <summary style="cursor:pointer;color:var(--amber);font-size:11.5px">показати позиції (${a.items.length})</summary>
+        <div style="font-family:var(--f-mono);font-size:10.5px;color:var(--muted);margin-top:5px;max-height:200px;overflow:auto">
+          ${a.items.map(x => esc(x)).join('<br>')}</div></details>` : ''}
+    </div>`;
+  });
+
+  /* діагностика парсера промо */
+  let diag = '<div class="note" style="padding:12px">Бекенд не повернув діагностику.</div>';
+  if (R.promoDiag && R.promoDiag.length) {
+    diag = `<div class="tblwrap"><table class="dt"><thead><tr>
+      <th class="txt">Аркуш</th><th>Рядок з тижнями</th><th>Тижнів</th><th>Кол. назви</th>
+      <th>Кол. мітки</th><th>SKU</th><th>Заповнених клітинок</th></tr></thead><tbody>` +
+      R.promoDiag.map(d => `<tr>
+        <td class="txt">${esc(d.sheet)}${d.skipped ? ' <span class="tag c">пропущено</span>' : ''}</td>
+        <td>${d.weekHeaderRow ?? '—'}</td><td>${d.weeks ?? (d.reason ? esc(d.reason) : '—')}</td>
+        <td>${d.nameCol ?? '—'}</td><td>${d.labelCol ?? '—'}</td>
+        <td>${d.skus ?? '—'}</td><td>${d.cells != null ? n0(d.cells) : '—'}</td></tr>`).join('') +
+      '</tbody></table></div>';
+  }
+
+  /* зіставлення SKU */
+  const ml = D.matchLog.slice(0, 300);
+  const skuOpts = ['<option value="">— не зіставляти —</option>']
+    .concat(D.skuList.map(s => `<option value="${esc(s)}">${esc(s)}</option>`)).join('');
+  let match = `<div class="tblwrap"><table class="dt"><thead><tr>
+    <th class="txt">Назва у промо-плані</th><th>Мережі</th><th>Точність</th>
+    <th class="txt">Номенклатура продажів</th></tr></thead><tbody>`;
+  ml.forEach(m => {
+    const cur = APP.overrides.sku[m.promoName] || m.sku || '';
+    match += `<tr>
+      <td class="txt">${esc(m.promoName)}</td>
+      <td>${m.chains.length}</td>
+      <td>${m.manual ? '<span class="tag x">вручну</span>' :
+        m.sku ? `<span class="tag ${m.score > .8 ? 'a' : 'b'}">${n2(m.score)}</span>`
+          : '<span class="tag c">нема</span>'}</td>
+      <td class="txt"><select class="mSel" data-p="${esc(m.promoName)}" style="width:100%;font-size:11px">
+        ${withSelected(skuOpts, cur)}
+      </select></td></tr>`;
+  });
+  match += '</tbody></table></div>';
+
+  /* зіставлення мереж */
+  const chainNames = uniq(D.partners.concat(promoSheets()));
+  const chainOpts = ['<option value="">авто</option>']
+    .concat(D.terms.map(t => `<option value="${esc(t.chain)}">${esc(t.chain)}</option>`))
+    .concat([`<option value="${CHAIN_OTHER}">${CHAIN_OTHER}</option>`]).join('');
+  const unmappedPartners = D.partners.filter(p => chainOf(p) === CHAIN_OTHER);
+  let chmap = `<div class="note" style="padding:10px 12px">
+      ${n0(unmappedPartners.length)} партнерів віднесено до «${CHAIN_OTHER}» — для них бонусне навантаження дорівнює нулю.
+      Якщо серед них є мережа з довідника умов, задайте відповідність тут.</div>
+    <div class="tblwrap" style="max-height:420px"><table class="dt"><thead><tr>
+      <th class="txt">Партнер / аркуш промо</th><th>Зараз</th><th class="txt">Призначити мережу</th>
+    </tr></thead><tbody>`;
+  chainNames.forEach(p => {
+    const cur = APP.overrides.chain[p] || '';
+    chmap += `<tr><td class="txt">${esc(p)}</td>
+      <td><span class="tag ${chainOf(p) === CHAIN_OTHER ? '' : 'a'}">${esc(chainOf(p))}</span></td>
+      <td class="txt"><select class="cSel" data-p="${esc(p)}" style="width:100%;font-size:11px">
+        ${withSelected(chainOpts, cur)}
+      </select></td></tr>`;
+  });
+  chmap += '</tbody></table></div>';
+
+  host.innerHTML = `
+    <div class="grid g2">
+      ${card('Підключення та обсяг даних', stats)}
+      ${card('Що варто перевірити у джерелі', an || '', 'автоматичні перевірки')}
+    </div>
+    <div style="margin-top:12px">
+      ${card('Як парсер прочитав промо-план', diag,
+    'якщо аркуш пропущено або знайдено мало тижнів — структуру треба вирівняти')}
+    </div>
+    <div class="grid g2" style="margin-top:12px">
+      ${card('Зіставлення номенклатури', match, 'промо-план ↔ продажі')}
+      ${card('Зіставлення мереж', chmap, 'партнер ↔ довідник умов')}
+    </div>`;
+
+  el('dReload').onclick = () => loadFromEndpoint(true).then(() => render());
+  el('dSource').onclick = openSource;
+  el('dExport').onclick = () => {
+    const blob = new Blob([JSON.stringify(APP.raw)], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'foodline-data-' + new Date().toISOString().slice(0, 10) + '.json';
+    a.click();
+  };
+  el('dClear').onclick = () => {
+    if (!confirm('Видалити локальну копію даних із цього браузера?')) return;
+    try { localStorage.removeItem(LS + '_data'); } catch (e) { }
+    location.reload();
+  };
+  document.querySelectorAll('.mSel').forEach(s => s.onchange = e => {
+    const p = e.target.dataset.p;
+    if (e.target.value) APP.overrides.sku[p] = e.target.value;
+    else delete APP.overrides.sku[p];
+    saveCfg(); buildPromo(); detectAnomalies(); render();
+  });
+  document.querySelectorAll('.cSel').forEach(s => s.onchange = e => {
+    const p = e.target.dataset.p;
+    if (e.target.value) APP.overrides.chain[p] = e.target.value;
+    else delete APP.overrides.chain[p];
+    saveCfg(); build(); render();
+  });
+}
+
+/* =====================================================================
+   ДЖЕРЕЛО ДАНИХ
+   ===================================================================== */
+
+function openSource() {
+  const m = document.createElement('div');
+  m.className = 'modal';
+  m.innerHTML = `<div class="box">
+    <h3>Джерело даних</h3>
+    <div class="bd">
+      <div class="field">
+        <label>URL вебдодатку Apps Script</label>
+        <input type="url" id="sUrl" placeholder="https://script.google.com/macros/s/…/exec" value="${esc(APP.cfg.endpoint)}">
+      </div>
+      <div class="field">
+        <label>Токен</label>
+        <input type="text" id="sTok" placeholder="значення API_TOKEN зі скрипта" value="${esc(APP.cfg.token)}">
+      </div>
+      <div class="split">
+        <button class="btn primary" id="sTest">Підключитися</button>
+        <button class="btn" id="sPing">Перевірити зв'язок</button>
+        <span id="sMsg" class="pill" style="display:none"></span>
+      </div>
+      <hr style="border:0;border-top:1px solid var(--line);margin:16px 0">
+      <div class="field">
+        <label>Або завантажити файл вивантаження</label>
+        <input type="file" id="sFile" accept=".json,application/json">
+      </div>
+      <div class="field">
+        <label>Або вставити JSON</label>
+        <textarea id="sJson" placeholder='{"sales":{"cols":[…],"rows":[…]}, "cost":…, "terms":…, "promo":…}'></textarea>
+        <button class="btn" id="sPaste" style="margin-top:6px">Прийняти JSON</button>
+      </div>
+      <div class="note">Дані зберігаються лише у цьому браузері. Нічого не надсилається нікуди, окрім вашого власного вебдодатку.</div>
+      <div class="split" style="margin-top:14px;justify-content:flex-end">
+        <button class="btn ghost" id="sClose">Закрити</button>
+      </div>
+    </div></div>`;
+  document.body.appendChild(m);
+  const close = () => m.remove();
+  m.onclick = e => { if (e.target === m) close(); };
+  el('sClose').onclick = close;
+
+  const msg = (t, ok) => {
+    const s = el('sMsg');
+    s.style.display = 'inline-block';
+    s.textContent = t;
+    s.style.color = ok ? 'var(--wasabi)' : 'var(--chili)';
+  };
+
+  el('sPing').onclick = async () => {
+    APP.cfg.endpoint = el('sUrl').value.trim();
+    APP.cfg.token = el('sTok').value.trim();
+    saveCfg();
+    msg('перевіряю…', true);
+    try {
+      const r = await jsonp(APP.cfg.endpoint + '?action=ping&token=' + encodeURIComponent(APP.cfg.token), 20000);
+      msg(r && r.ok ? 'зв\'язок є, версія ' + (r.version || '?') : 'відповідь: ' + (r && r.error), !!(r && r.ok));
+    } catch (e) { msg(e.message, false); }
+  };
+
+  el('sTest').onclick = async () => {
+    APP.cfg.endpoint = el('sUrl').value.trim();
+    APP.cfg.token = el('sTok').value.trim();
+    saveCfg();
+    msg('завантажую…', true);
+    const ok = await loadFromEndpoint(true);
+    if (ok) { close(); renderFilters(); render(); }
+    else msg(el('statusText').textContent, false);
+  };
+
+  el('sFile').onchange = e => {
+    const f = e.target.files[0];
+    if (!f) return;
+    const fr = new FileReader();
+    fr.onload = () => {
+      try {
+        ingest(JSON.parse(fr.result));
+        setStatus('ok', `${n0(APP.d.sales.length)} рядків · з файлу`);
+        close(); renderFilters(); render();
+      } catch (err) { msg('файл не розібрано: ' + err.message, false); }
+    };
+    fr.readAsText(f);
+  };
+
+  el('sPaste').onclick = () => {
+    try {
+      ingest(JSON.parse(el('sJson').value));
+      setStatus('ok', `${n0(APP.d.sales.length)} рядків · вставлено`);
+      close(); renderFilters(); render();
+    } catch (err) { msg('JSON не розібрано: ' + err.message, false); }
+  };
+}
+
+/* =====================================================================
+   СТАРТ
+   ===================================================================== */
+
+function boot() {
+  initChartDefaults();
+  loadCfg();
+  renderRail();
+
+  el('btnSource').onclick = openSource;
+  el('btnReload').onclick = async () => {
+    const ok = await loadFromEndpoint(true);
+    if (ok) { renderFilters(); render(); }
+  };
+
+  const hasCache = loadCached();
+  if (hasCache) { renderFilters(); render(); }
+  else { setStatus('', 'не підключено'); render(); }
+
+  if (APP.cfg.endpoint) {
+    loadFromEndpoint(false).then(ok => { if (ok) { renderFilters(); render(); } });
+  }
+}
+
+document.addEventListener('DOMContentLoaded', boot);
+
