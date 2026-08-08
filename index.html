@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#12100E">
+<title>Foodline · Комерційний пульт</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans+Condensed:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap&subset=cyrillic,cyrillic-ext,latin" rel="stylesheet">
+<link rel="stylesheet" href="assets/styles.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="mark"><i></i><b>FOODLINE</b><span>Комерційний пульт</span></div>
+  <div class="spacer"></div>
+  <div class="status" id="status"><span class="dot"></span><span id="statusText">не підключено</span></div>
+  <button class="btn sm" id="btnReload" title="Перезавантажити з джерела">Оновити</button>
+  <button class="btn sm" id="btnSource">Джерело даних</button>
+</header>
+
+<div class="shell">
+  <nav class="rail" id="rail"></nav>
+
+  <div class="main">
+    <div class="filters" id="filters"></div>
+    <div class="wrap" id="view"></div>
+  </div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script src="assets/app.js"></script>
+</body>
+</html>
