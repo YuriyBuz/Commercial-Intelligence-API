@@ -12,10 +12,25 @@
 </head>
 <body>
 
+<canvas id="stars" aria-hidden="true"></canvas>
+
+<div id="boot" role="status" aria-label="Запуск панелі">
+  <div class="ring"><i></i><i></i><i></i><b>FL</b></div>
+  <div class="lines">
+    <div>канал даних<span>готово</span></div>
+    <div>собівартість і умови мереж<span>звірено</span></div>
+    <div>промо-календар<span>розібрано</span></div>
+    <div>рентабельність по клієнтах<span>зчитано</span></div>
+    <div>панель<span>до роботи</span></div>
+  </div>
+  <div class="bar"><i></i></div>
+</div>
+
 <header class="topbar">
   <div class="mark"><i></i><b>FOODLINE</b><span>Комерційний пульт</span></div>
   <div class="spacer"></div>
   <div class="status" id="status"><span class="dot"></span><span id="statusText">не підключено</span></div>
+  <button class="btn sm" id="btnCalm" title="Вимкнути рух інтерфейсу">Спокій</button>
   <button class="btn sm" id="btnReload" title="Перезавантажити з джерела">Оновити</button>
   <button class="btn sm" id="btnSource">Джерело даних</button>
 </header>
