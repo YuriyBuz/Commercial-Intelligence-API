@@ -15,9 +15,9 @@ const APP = {
     promoShare: 100,         // яку частку глибини знижки фінансує виробник, %
     logistics: 0             // додаткові логістичні витрати, % від виручки
   },
-  raw: { sales: null, cost: null, terms: null, promo: null, promoDiag: null, generated: '' },
+  raw: { sales: null, cost: null, terms: null, promo: null, promoDiag: null, profit: null, profitDiag: null, generated: '' },
   d: {
-    sales: [], cost: {}, terms: [], termsMap: {}, promo: [],
+    sales: [], cost: {}, terms: [], termsMap: {}, promo: [], profit: [],
     skuList: [], chains: [], brands: [], years: [], partners: [],
     promoMonth: {},          // chainKey|sku|ym -> {weeks, depthAvg, depthMax, plan}
     promoWeeks: [],          // відсортований список ISO-тижнів
@@ -238,7 +238,9 @@ async function loadFromEndpoint(fresh) {
 function ingest(r) {
   APP.raw = {
     sales: r.sales || null, cost: r.cost || null, terms: r.terms || null,
-    promo: r.promo || null, promoDiag: r.promoDiag || null, generated: r.generated || ''
+    promo: r.promo || null, promoDiag: r.promoDiag || null,
+    profit: r.profit || null, profitDiag: r.profitDiag || null,
+    generated: r.generated || ''
   };
   try { localStorage.setItem(LS + '_data', JSON.stringify(APP.raw)); } catch (e) { }
   build();
@@ -320,6 +322,9 @@ function build() {
   });
   D.skuIndex = idx;
 
+  /* --- рентабельність (факт) --- */
+  buildProfit();
+
   /* --- промо --- */
   buildPromo();
 
@@ -327,6 +332,33 @@ function build() {
   detectAnomalies();
 
   if (!APP.f.years.length) APP.f.years = D.years.slice(-2);
+}
+
+/** Аркуш «рент»: ієрархія партнер → бренд → SKU з фактичним маркетингом */
+function buildProfit() {
+  const D = APP.d;
+  const pos = v => Math.abs(+v || 0);
+  D.profit = tableToObjects(APP.raw.profit).map(o => {
+    const rev = +o.revenue || 0;
+    const mkt = pos(o.mktBuyers) + pos(o.mktSuppliers) + pos(o.delivery)
+      + pos(o.oneTimeBuyers) + pos(o.oneTimeSuppliers);
+    const cogs = pos(o.cogs);
+    return {
+      y: +o.year, m: +o.month, ym: ymOf(+o.year, +o.month),
+      level: +o.level, partner: o.partner || '', brand: o.brand || '', sku: o.sku || '',
+      name: o.sku || o.brand || o.partner || '',
+      rev, cogs, gross: rev - cogs,
+      income: +o.income || 0,
+      mktBuyers: pos(o.mktBuyers), mktSuppliers: pos(o.mktSuppliers),
+      delivery: pos(o.delivery), oneBuyers: pos(o.oneTimeBuyers), oneSuppliers: pos(o.oneTimeSuppliers),
+      mkt,
+      ros: rev ? (rev - cogs) / rev * 100 : 0,
+      roTotal: rev ? (+o.income || 0) / rev * 100 : 0,
+      mktPct: rev ? mkt / rev * 100 : 0
+    };
+  }).filter(r => r.y > 0 && r.m > 0 && r.name);
+  D.profitPartners = uniq(D.profit.filter(r => r.level === 1).map(r => r.partner)).sort();
+  D.profitMonths = uniq(D.profit.map(r => r.ym)).sort();
 }
 
 function buildPromo() {
@@ -466,6 +498,42 @@ function detectAnomalies() {
       d: `${bl.length} комбінацій SKU × мережа продані нижче собівартості. Сукупний валовий збиток: ${money(sum(bl, x => x.loss))} ₴.`,
       items: bl.slice(0, 25).map(x => `${x.sku} → ${x.chain}: −${n0(x.loss)} ₴`)
     });
+  }
+
+  /* 6. підозрілі відсотки в довіднику умов */
+  const wild = D.terms.filter(t => (+t.totalBonus) > 60 || (+t.retro) > 60);
+  if (wild.length) {
+    out.push({
+      lvl: 'err', t: 'Некоректні відсотки в умовах мереж',
+      d: 'Значення понад 60% зазвичай означають, що число введено як 19,71 замість 19,71%. ' +
+        'Панель бере його як є, тож маржа по цих мережах порахована неправильно.',
+      items: wild.map(t => `${t.chain}: ретро ${n1(+t.retro)}%, разом ${n1(+t.totalBonus)}%`)
+    });
+  }
+
+  /* 7. факт маркетингу проти довідника */
+  if (D.profit && D.profit.length) {
+    const byP = {};
+    D.profit.filter(r => r.level === 1).forEach(r => {
+      const a = byP[r.partner] || (byP[r.partner] = { rev: 0, mkt: 0 });
+      a.rev += r.rev; a.mkt += r.mkt;
+    });
+    const diffs = [];
+    Object.entries(byP).forEach(([p, a]) => {
+      if (a.rev < 50000) return;
+      const t = D.termsMap[chainOf(p)];
+      if (!t) return;
+      const fact = a.mkt / a.rev * 100, term = +t.totalBonus || 0;
+      if (Math.abs(fact - term) > 8) diffs.push({ p, fact, term });
+    });
+    if (diffs.length) {
+      out.push({
+        lvl: 'warn', t: 'Довідник умов розходиться з фактом',
+        d: `Для ${diffs.length} клієнтів фактичний маркетинг зі звіту відрізняється від умов більш ніж на 8 п.п. Розрахунки граничної знижки спираються на довідник, тож там варто оновити цифри.`,
+        items: diffs.sort((a, b) => Math.abs(b.fact - b.term) - Math.abs(a.fact - a.term))
+          .slice(0, 25).map(d => `${d.p}: факт ${n1(d.fact)}% проти ${n1(d.term)}% в умовах`)
+      });
+    }
   }
 
   APP.d.anomalies = out;
@@ -620,10 +688,11 @@ const VIEWS = [
   { id: 'brands', n: '03', t: 'Бренди / ТМ', grp: 'Результат' },
   { id: 'sku', n: '04', t: 'SKU', grp: 'Результат' },
   { id: 'econ', n: '05', t: 'Економіка SKU', grp: 'Гроші' },
-  { id: 'chains', n: '06', t: 'Умови мереж', grp: 'Гроші' },
-  { id: 'promoplan', n: '07', t: 'Промо-календар', grp: 'Промо' },
-  { id: 'promoeff', n: '08', t: 'Ефективність промо', grp: 'Промо' },
-  { id: 'data', n: '09', t: 'Дані та якість', grp: 'Службове' }
+  { id: 'profit', n: '06', t: 'Рентабельність факт', grp: 'Гроші' },
+  { id: 'chains', n: '07', t: 'Умови мереж', grp: 'Гроші' },
+  { id: 'promoplan', n: '08', t: 'Промо-календар', grp: 'Промо' },
+  { id: 'promoeff', n: '09', t: 'Ефективність промо', grp: 'Промо' },
+  { id: 'data', n: '10', t: 'Дані та якість', grp: 'Службове' }
 ];
 
 function renderRail() {
@@ -718,11 +787,12 @@ function render() {
   if (!APP.d.sales.length) { host.innerHTML = emptyState(); bindSource(); return; }
   const fn = ({
     overview: viewOverview, clients: viewClients, brands: viewBrands, sku: viewSku,
-    econ: viewEcon, chains: viewChains, promoplan: viewPromoPlan,
+    econ: viewEcon, profit: viewProfit, chains: viewChains, promoplan: viewPromoPlan,
     promoeff: viewPromoEff, data: viewData
   })[APP.view] || viewOverview;
   fn(host);
   updCount();
+  countUp();
 }
 
 function emptyState() {
@@ -1735,7 +1805,7 @@ function viewPromoPlan(host) {
     if (p.metric === 'промо') {
       cell[k].promo = true;
       if (p.depth !== null && (cell[k].depth === null || p.depth > cell[k].depth)) cell[k].depth = p.depth;
-      if (p.text) cell[k].notes.push(p.text);
+      if (p.text) { cell[k].notes.push(p.text); if (!cell[k].label) cell[k].label = p.text; }
     } else if (p.metric === 'старт відвантажень') {
       cell[k].start = true; cell[k].notes.push('старт: ' + p.text);
     } else if (p.value) {
@@ -1763,32 +1833,72 @@ function viewPromoPlan(host) {
   });
   wkHdr += '</tr>';
 
+  const ribbon = APP.promoMode !== 'grid';
+  const depthClass = d => d === null ? 'd2' : d < 15 ? 'd1' : d < 22 ? 'd2' : d < 28 ? 'd3' : d < 35 ? 'd4' : 'd5';
+
+  /* акції = послідовні тижні з однаковою механікою */
+  const events = [];
+  skus.forEach(s => {
+    let run = null;
+    weeks.forEach((w, i) => {
+      const c = cell[s + '|' + w];
+      const on = c && c.promo;
+      const label = on ? (c.label || 'СЦ') : null;
+      if (on && run && run.label === label && run.end === i - 1) {
+        run.end = i; run.weeks++;
+        if (c.depth !== null && (run.depth === null || c.depth > run.depth)) run.depth = c.depth;
+        if (c.start) run.start = true;
+      } else {
+        if (run) events.push(run);
+        run = on ? {
+          sku: s, matched: firstOf.get(s) && firstOf.get(s).sku,
+          label, depth: c.depth, start: !!c.start,
+          from: w, toWeek: w, begin: i, end: i, weeks: 1
+        } : null;
+      }
+      if (run && on) run.toWeek = w;
+      if (!on && run) { events.push(run); run = null; }
+      if (i === weeks.length - 1 && run) { events.push(run); run = null; }
+    });
+  });
+  const runIndex = {};
+  events.forEach(e => { runIndex[e.sku + '|' + e.begin] = e; });
+
   let body = '';
   skus.forEach(s => {
     const first = firstOf.get(s);
     const matched = first && first.sku;
     body += `<tr><td class="sku" title="${esc(s)}${matched ? '\n→ ' + esc(matched) : '\n(без пари у продажах)'}">${matched ? '' : '<span style="color:var(--chili)">◦ </span>'}${esc(s)}</td>`;
     prevM = '';
-    weeks.forEach(w => {
+    for (let i = 0; i < weeks.length; i++) {
+      const w = weeks[i];
       const m1 = w.slice(0, 7) !== prevM; prevM = w.slice(0, 7);
       const c = cell[s + '|' + w];
+      const run = runIndex[s + '|' + i];
+
+      if (ribbon && run) {
+        const title = `${s}\n${run.label}\n${run.from} – ${run.toWeek} · ${run.weeks} тиж.`;
+        body += `<td class="run ${depthClass(run.depth)}${run.start ? ' start' : ''}" colspan="${run.weeks}" title="${esc(title)}">${esc(run.label)}</td>`;
+        for (let k = 1; k < run.weeks; k++) { prevM = weeks[i + k].slice(0, 7); }
+        i += run.weeks - 1;
+        continue;
+      }
+      if (ribbon && c && c.promo) continue;
+
       let cls = 'c' + (m1 ? ' m1' : '');
       let title = '';
       if (c) {
-        if (c.promo) {
-          const d = c.depth;
-          cls += ' ' + (d === null ? 'd2' : d < 15 ? 'd1' : d < 22 ? 'd2' : d < 28 ? 'd3' : d < 35 ? 'd4' : 'd5');
-        }
+        if (c.promo) cls += ' ' + depthClass(c.depth);
         if (c.plan) cls += ' plan';
         if (c.start) cls += ' start';
         title = `${s}\n${w}\n${c.notes.join('\n')}`;
       }
       body += `<td class="${cls}" title="${esc(title)}"></td>`;
-    });
+    }
     body += '</tr>';
   });
 
-  const cal = `<div class="calwrap"><table class="cal">
+  const cal = `<div class="calwrap"><table class="cal${ribbon ? ' ribbon' : ''}">
     <thead>${monHdr}${wkHdr}</thead><tbody>${body}</tbody></table></div>`;
 
   /* метрики тиску */
@@ -1823,11 +1933,14 @@ function viewPromoPlan(host) {
       <span class="pill">Рік</span>
       <select id="pYear">${years.map(y => `<option ${y === yr ? 'selected' : ''}>${y}</option>`).join('')}</select>
       <span class="pill">${skus.length} SKU · ${weeks.length} тижнів</span>
+      <button class="btn sm ${ribbon ? 'primary' : ''}" id="pRibbon">Стрічка з назвами</button>
+      <button class="btn sm ${ribbon ? '' : 'primary'}" id="pGrid">Щільна сітка</button>
     </div>
     <div class="kpis">
       ${kpi('Промо-тиск', n1(load), '%', `<span class="d">${n0(promoCells.length)} з ${n0(weeks.length * skus.length)} клітинок</span>`, load > 40 ? 'neg' : '')}
       ${kpi('Середня глибина', depths.length ? n1(mean(depths)) : '—', '%', `<span class="d">макс ${depths.length ? n0(Math.max(...depths)) : '—'}%</span>`)}
       ${kpi('SKU у промо', n0(perSku.filter(s => s.weeks).length), 'з ' + skus.length)}
+      ${kpi('Акцій у плані', n0(events.length), '', `<span class="d">сер. ${n1(events.length ? mean(events.map(e => e.weeks)) : 0)} тиж.</span>`)}
       ${kpi('Пік тижня', n0(Math.max(...perWeek.map(w => w.n), 0)), 'SKU одночасно')}
       ${kpi('Тижнів без промо', n0(perWeek.filter(w => !w.n).length), 'з ' + weeks.length, '',
     perWeek.filter(w => !w.n).length < weeks.length * 0.3 ? 'neg' : 'pos')}
@@ -1848,6 +1961,18 @@ function viewPromoPlan(host) {
       ${card('Найбільш «промотовані» позиції', canvas('cSkuLoad', 'h260'), 'частка тижнів у промо')}
     </div>
     <div style="margin-top:12px">
+      ${card('Перелік акцій', dataTable('tEvents', [
+        { k: 'label', t: 'Механіка', txt: true },
+        { k: 'sku', t: 'Номенклатура', txt: true },
+        { k: 'depth', t: 'Глибина', f: v => v === null ? '—' : `<b>${n0(v)}%</b>` },
+        { k: 'from', t: 'Старт', f: v => v.slice(8, 10) + '.' + v.slice(5, 7) },
+        { k: 'toWeek', t: 'Фініш', f: v => v.slice(8, 10) + '.' + v.slice(5, 7) },
+        { k: 'weeks', t: 'Тижнів', f: v => n0(v) },
+        { k: 'matched', t: 'Пара у продажах', txt: true, f: v => v ? esc(v) : '<span class="tag c">нема</span>' }
+      ], events, { sort: 'from', limit: 500 }),
+      `${events.length} акцій у ${esc(sel)} за ${yr} рік`)}
+    </div>
+    <div style="margin-top:12px">
       ${card('Промо-план по SKU', dataTable('tPlan', [
         { k: 'sku', t: 'Номенклатура промо-плану', txt: true },
         { k: 'matched', t: 'Пара', f: v => v === 'так' ? '<span class="tag a">є</span>' : '<span class="tag c">нема</span>' },
@@ -1862,6 +1987,8 @@ function viewPromoPlan(host) {
 
   el('pSheet').onchange = e => { APP.promoSheet = e.target.value; render(); };
   el('pYear').onchange = e => { APP.promoYear = e.target.value; render(); };
+  el('pRibbon').onclick = () => { APP.promoMode = 'ribbon'; render(); };
+  el('pGrid').onclick = () => { APP.promoMode = 'grid'; render(); };
 
   chart('cWeek', {
     data: {
@@ -2114,6 +2241,7 @@ function viewData(host) {
     <dt>Позицій собівартості</dt><dd>${n0(Object.keys(D.cost).length)}</dd>
     <dt>Мереж в умовах</dt><dd>${n0(D.terms.length)}</dd>
     <dt>Рядків промо-плану</dt><dd>${n0(D.promo.length)}</dd>
+    <dt>Рядків рентабельності</dt><dd>${n0(D.profit.length)}</dd>
     <dt>Період продажів</dt><dd>${D.years.length ? D.years[0] + '–' + D.years[D.years.length - 1] : '—'}</dd>
     <dt>Оновлено</dt><dd>${R.generated ? new Date(R.generated).toLocaleString('uk-UA') : '—'}</dd>
   </dl>
@@ -2195,10 +2323,32 @@ function viewData(host) {
   });
   chmap += '</tbody></table></div>';
 
+  let pfd = '<div class="note" style="padding:12px">Аркуш рентабельності не завантажено.</div>';
+  if (R.profitDiag) {
+    const d = R.profitDiag;
+    pfd = d.error
+      ? `<div class="warnbox">${esc(d.error)}</div>`
+      : `<dl class="kv">
+          <dt>Аркуш</dt><dd>${esc(d.sheet)}</dd>
+          <dt>Рядок шапки</dt><dd>${d.headerRow}</dd>
+          <dt>Колонка назви</dt><dd>${d.nameCol}</dd>
+          <dt>Рядків рівня «клієнт»</dt><dd>${n0(d.counts.partner)}</dd>
+          <dt>Рівня «ТМ»</dt><dd>${n0(d.counts.brand)}</dd>
+          <dt>Рівня «номенклатура»</dt><dd>${n0(d.counts.sku)}</dd>
+          <dt>Пропущено</dt><dd>${n0(d.counts.skipped)}</dd>
+        </dl>
+        <div class="note" style="margin-top:8px">Рівень визначається за назвою: рядки з обсягом у назві —
+        номенклатура, з «ТОВ», «ФОП», «ГРУП» — клієнт, решта — торгова марка.
+        Якщо клієнтів підозріло багато або мало, перевірте назви в аркуші.</div>`;
+  }
+
   host.innerHTML = `
     <div class="grid g2">
       ${card('Підключення та обсяг даних', stats)}
       ${card('Що варто перевірити у джерелі', an || '', 'автоматичні перевірки')}
+    </div>
+    <div style="margin-top:12px">
+      ${card('Як парсер прочитав аркуш рентабельності', pfd, 'рівні ієрархії')}
     </div>
     <div style="margin-top:12px">
       ${card('Як парсер прочитав промо-план', diag,
@@ -2332,6 +2482,135 @@ function openSource() {
 }
 
 /* =====================================================================
+   РУХ ІНТЕРФЕЙСУ
+   ===================================================================== */
+
+const CALM_KEY = LS + '_calm';
+
+function calmOn() {
+  try { return localStorage.getItem(CALM_KEY) === '1'; } catch (e) { return false; }
+}
+function setCalm(v) {
+  document.body.classList.toggle('calm', v);
+  try { localStorage.setItem(CALM_KEY, v ? '1' : '0'); } catch (e) { }
+  const b = el('btnCalm');
+  if (b) b.textContent = v ? 'Рух' : 'Спокій';
+  if (v) stopStars(); else startStars();
+}
+
+/* --- амбієнтне тло: повільний дрейф частинок і горизонт --- */
+let starTimer = null, starParts = [];
+
+function startStars() {
+  const c = el('stars');
+  if (!c || starTimer || calmOn()) return;
+  if (window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+  let ctx = null;
+  try { ctx = c.getContext('2d'); } catch (e) { return; }
+  if (!ctx || typeof ctx.setTransform !== 'function' || typeof ctx.arc !== 'function') return;
+  let w = 0, h = 0, dpr = Math.min(2, window.devicePixelRatio || 1);
+
+  function size() {
+    w = c.clientWidth; h = c.clientHeight;
+    c.width = w * dpr; c.height = h * dpr;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  size();
+  window.addEventListener('resize', size);
+
+  starParts = Array.from({ length: 80 }, () => ({
+    x: Math.random(), y: Math.random(),
+    z: 0.25 + Math.random() * 0.75,
+    r: 0.4 + Math.random() * 1.1
+  }));
+
+  let t = 0;
+  function frame() {
+    if (document.hidden) { starTimer = requestAnimationFrame(frame); return; }
+    t += 0.0016;
+    ctx.clearRect(0, 0, w, h);
+
+    // горизонт: рідкі лінії, що дуже повільно пливуть угору
+    ctx.strokeStyle = 'rgba(232,163,61,.05)';
+    ctx.lineWidth = 1;
+    for (let i = 0; i < 7; i++) {
+      const p = ((t * 0.35 + i / 7) % 1);
+      const y = h - Math.pow(p, 2.4) * h * 0.55;
+      ctx.globalAlpha = 1 - p;
+      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+
+    for (const s of starParts) {
+      s.y -= 0.00013 * s.z;
+      if (s.y < -0.02) { s.y = 1.02; s.x = Math.random(); }
+      const px = s.x * w, py = s.y * h;
+      const a = 0.1 + s.z * 0.3 + Math.sin(t * 9 + s.x * 40) * 0.06;
+      ctx.fillStyle = `rgba(232,196,141,${Math.max(0, a).toFixed(3)})`;
+      ctx.beginPath(); ctx.arc(px, py, s.r * s.z, 0, 6.283); ctx.fill();
+    }
+    starTimer = requestAnimationFrame(frame);
+  }
+  starTimer = requestAnimationFrame(frame);
+}
+
+function stopStars() {
+  if (starTimer) { cancelAnimationFrame(starTimer); starTimer = null; }
+  const c = el('stars');
+  if (!c) return;
+  try {
+    const ctx = c.getContext('2d');
+    if (ctx && ctx.clearRect) ctx.clearRect(0, 0, c.width, c.height);
+  } catch (e) { }
+}
+
+/* --- показники набігають, а не з'являються різко --- */
+function countUp() {
+  if (calmOn()) return;
+  if (window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+  document.querySelectorAll('.kpi .v').forEach((node, idx) => {
+    const raw = node.childNodes[0];
+    if (!raw || raw.nodeType !== 3) return;
+    const text = raw.nodeValue.trim();
+    const m = text.match(/^(-?[\d\s\u00A0]+(?:,\d+)?)(.*)$/);
+    if (!m) return;
+    const target = parseFloat(m[1].replace(/[\s\u00A0]/g, '').replace(',', '.'));
+    if (!isFinite(target) || Math.abs(target) < 0.001) return;
+    const tail = m[2] || '';
+    const dec = (m[1].split(',')[1] || '').length;
+    const fmt = dec === 0 ? nf0 : (dec === 1 ? nf1 : nf2);
+    const dur = 620, t0 = performance.now(), delay = idx * 45;
+    function step(now) {
+      const p = Math.min(1, Math.max(0, (now - t0 - delay) / dur));
+      const e = 1 - Math.pow(1 - p, 3);
+      raw.nodeValue = fmt.format(target * e) + tail;
+      if (p < 1) requestAnimationFrame(step);
+      else raw.nodeValue = text;
+    }
+    raw.nodeValue = fmt.format(0) + tail;
+    requestAnimationFrame(step);
+  });
+}
+
+/* --- підсвітка кнопок під курсором --- */
+function bindGlow() {
+  document.addEventListener('pointermove', e => {
+    const b = e.target.closest && e.target.closest('.btn');
+    if (!b) return;
+    const r = b.getBoundingClientRect();
+    b.style.setProperty('--mx', ((e.clientX - r.left) / r.width * 100) + '%');
+    b.style.setProperty('--my', ((e.clientY - r.top) / r.height * 100) + '%');
+  }, { passive: true });
+}
+
+function dismissBoot() {
+  const b = el('boot');
+  if (!b) return;
+  b.classList.add('out');
+  setTimeout(() => b.remove(), 520);
+}
+
+/* =====================================================================
    СТАРТ
    ===================================================================== */
 
@@ -2339,6 +2618,20 @@ function boot() {
   initChartDefaults();
   loadCfg();
   renderRail();
+
+  document.body.classList.toggle('calm', calmOn());
+  const bc = el('btnCalm');
+  if (bc) {
+    bc.textContent = calmOn() ? 'Рух' : 'Спокій';
+    bc.onclick = () => setCalm(!document.body.classList.contains('calm'));
+  }
+  bindGlow();
+  startStars();
+  const bootEl = el('boot');
+  if (bootEl) {
+    bootEl.onclick = dismissBoot;
+    setTimeout(dismissBoot, calmOn() ? 0 : 1750);
+  }
 
   el('btnSource').onclick = openSource;
   el('btnReload').onclick = async () => {
@@ -2357,3 +2650,218 @@ function boot() {
 
 document.addEventListener('DOMContentLoaded', boot);
 
+/* =====================================================================
+   06 · РЕНТАБЕЛЬНІСТЬ (ФАКТ) — з аркуша «рент»
+   ===================================================================== */
+
+function viewProfit(host) {
+  const P = APP.d.profit;
+  if (!P.length) {
+    host.innerHTML = card('Рентабельність факт', `<div class="empty">
+      <b>Аркуш «рент» не завантажено</b>
+      Оновіть дані з джерела. Якщо аркуш є, а рядків немає — подивіться діагностику
+      в розділі «Дані та якість».</div>`);
+    return;
+  }
+
+  const months = APP.d.profitMonths;
+  const selM = APP.profitMonth && months.includes(APP.profitMonth) ? APP.profitMonth : 'all';
+  const scope = selM === 'all' ? P : P.filter(r => r.ym === selM);
+
+  const L1 = scope.filter(r => r.level === 1);
+  const L2 = scope.filter(r => r.level === 2);
+  const L3 = scope.filter(r => r.level === 3);
+
+  const roll = (arr, keyFn) => {
+    const m = new Map();
+    arr.forEach(r => {
+      const k = keyFn(r);
+      let a = m.get(k);
+      if (!a) {
+        a = {
+          key: k, rev: 0, cogs: 0, gross: 0, income: 0, mkt: 0,
+          mktBuyers: 0, mktSuppliers: 0, delivery: 0, oneBuyers: 0, oneSuppliers: 0, n: 0
+        };
+        m.set(k, a);
+      }
+      a.rev += r.rev; a.cogs += r.cogs; a.gross += r.gross; a.income += r.income;
+      a.mkt += r.mkt; a.mktBuyers += r.mktBuyers; a.mktSuppliers += r.mktSuppliers;
+      a.delivery += r.delivery; a.oneBuyers += r.oneBuyers; a.oneSuppliers += r.oneSuppliers; a.n++;
+    });
+    const out = Array.from(m.values());
+    out.forEach(a => {
+      a.ros = a.rev ? a.gross / a.rev * 100 : 0;
+      a.roTotal = a.rev ? a.income / a.rev * 100 : 0;
+      a.mktPct = a.rev ? a.mkt / a.rev * 100 : 0;
+    });
+    return out.sort((x, y) => y.rev - x.rev);
+  };
+
+  const byP = roll(L1, r => r.partner);
+  const T = roll(L1, () => 'all')[0] || { rev: 0, gross: 0, income: 0, mkt: 0, ros: 0, roTotal: 0, mktPct: 0 };
+
+  const losers = byP.filter(p => p.income <= 0);
+  const skuLoss = roll(L3, r => r.partner + ' · ' + r.sku).filter(x => x.income < 0);
+
+  /* факт проти довідника умов */
+  const cmp = byP.map(p => {
+    const ck = chainOf(p.key);
+    const t = APP.d.termsMap[ck];
+    return {
+      partner: p.key, chain: ck,
+      factPct: p.mktPct,
+      termPct: t ? +t.totalBonus : null,
+      gap: t ? p.mktPct - (+t.totalBonus) : null,
+      rev: p.rev, mkt: p.mkt
+    };
+  }).filter(x => x.termPct !== null).sort((a, b) => Math.abs(b.gap) - Math.abs(a.gap));
+
+  const colsP = [
+    { k: 'key', t: 'Клієнт', txt: true },
+    { k: 'rev', t: 'Виручка, ₴', f: v => n0(v) },
+    { k: 'gross', t: 'Валовий, ₴', f: v => n0(v) },
+    { k: 'ros', t: 'Рент. продажу, %', f: v => n1(v) },
+    { k: 'mkt', t: 'Маркетинг, ₴', f: v => `<span class="down">${n0(v)}</span>` },
+    { k: 'mktPct', t: 'Навантаження, %', f: v => `<span class="${v > 25 ? 'down' : ''}">${n1(v)}</span>` },
+    { k: 'income', t: 'Дохід, ₴', f: v => `<span class="${v > 0 ? 'up' : 'down'}">${n0(v)}</span>` },
+    { k: 'roTotal', t: 'Рент. загальна, %', f: v => `<span class="${v > 0 ? 'up' : 'down'}">${n1(v)}</span>` },
+    { k: 'mktBuyers', t: 'Марк. покупці', f: v => n0(v) },
+    { k: 'oneBuyers', t: 'Разовий', f: v => n0(v) },
+    { k: 'delivery', t: 'Доставка', f: v => n0(v) }
+  ];
+
+  const colsS = [
+    { k: 'key', t: 'Клієнт · номенклатура', txt: true },
+    { k: 'rev', t: 'Виручка, ₴', f: v => n0(v) },
+    { k: 'ros', t: 'Рент. продажу, %', f: v => n1(v) },
+    { k: 'mkt', t: 'Маркетинг, ₴', f: v => n0(v) },
+    { k: 'mktPct', t: 'Навантаження, %', f: v => n1(v) },
+    { k: 'income', t: 'Дохід, ₴', f: v => `<span class="${v > 0 ? 'up' : 'down'}">${n0(v)}</span>` },
+    { k: 'roTotal', t: 'Рент. загальна, %', f: v => `<span class="${v > 0 ? 'up' : 'down'}">${n1(v)}</span>` }
+  ];
+
+  /* теплокарта клієнт × місяць */
+  const mtx = {};
+  roll(P.filter(r => r.level === 1), r => r.partner + '§' + r.ym).forEach(x => mtx[x.key] = x);
+  let hm = `<div class="hm"><table class="hmt"><thead><tr><th class="rowh">Клієнт / місяць</th>`;
+  months.forEach(m => hm += `<th>${ymLabel(m)}</th>`);
+  hm += `<th>Разом</th></tr></thead><tbody>`;
+  byP.slice(0, 18).forEach(p => {
+    hm += `<tr><td class="rowh" title="${esc(p.key)}">${esc(p.key)}</td>`;
+    months.forEach(m => {
+      const c = mtx[p.key + '§' + m];
+      const v = c ? c.roTotal : null;
+      hm += `<td style="${v === null ? '' : heat(v, 40, true)}" title="${c ? esc(p.key) + ' · ' + ymLabel(m) + ': дохід ' + n0(c.income) + ' ₴' : ''}">${v === null ? '<span style="color:#3A322A">·</span>' : `<span class="${v > 0 ? '' : 'down'}">${n1(v)}</span>`}</td>`;
+    });
+    hm += `<td style="font-weight:600" class="${p.roTotal > 0 ? '' : 'down'}">${n1(p.roTotal)}</td></tr>`;
+  });
+  hm += `</tbody></table></div>`;
+
+  host.innerHTML = `
+    <div class="split" style="margin-bottom:12px">
+      <span class="pill">Період</span>
+      <select id="pfMonth">
+        <option value="all" ${selM === 'all' ? 'selected' : ''}>усі місяці (${months.length})</option>
+        ${months.map(m => `<option value="${m}" ${m === selM ? 'selected' : ''}>${ymLabel(m)}</option>`).join('')}
+      </select>
+      <span class="pill">${byP.length} клієнтів · ${L3.length} рядків номенклатури</span>
+    </div>
+
+    <div class="kpis">
+      ${kpi('Виручка', money(T.rev), '₴')}
+      ${kpi('Валовий прибуток', money(T.gross), '₴', `<span class="d">рент. продажу ${n1(T.ros)}%</span>`, 'pos')}
+      ${kpi('Маркетинг', money(T.mkt), '₴', `<span class="d down">${n1(T.mktPct)}% виручки</span>`, 'neg')}
+      ${kpi('Дохід', money(T.income), '₴', `<span class="d">рент. загальна ${n1(T.roTotal)}%</span>`, T.income > 0 ? 'pos' : 'neg')}
+      ${kpi('Зʼїдено маркетингом', n1(T.ros - T.roTotal), 'п.п.', `<span class="d">від рентабельності продажу</span>`, 'neg')}
+      ${kpi('Клієнтів у нулі або мінусі', n0(losers.length), '', losers.length ? `<span class="d down">${money(sum(losers, l => l.income))} ₴</span>` : '', losers.length ? 'neg' : 'pos')}
+    </div>
+
+    <div class="grid g32" style="margin-top:12px">
+      ${card('Що залишається після маркетингу', canvas('cPfBridge', 'h320'),
+    'рентабельність продажу проти загальної')}
+      ${card('З чого складається маркетинг', canvas('cPfMkt', 'h320'), 'частки від виручки клієнта')}
+    </div>
+
+    ${cmp.length ? `<div style="margin-top:12px">${card('Факт проти довідника умов',
+      `<div class="infobox" style="margin:12px 12px 0">Ліворуч — скільки насправді пішло на клієнта за звітом,
+        праворуч — скільки закладено в аркуші «Умови мереж». Різниця показує, наскільки договірні відсотки
+        відображають реальні витрати.</div>` +
+      dataTable('tCmp', [
+        { k: 'partner', t: 'Клієнт', txt: true },
+        { k: 'chain', t: 'Мережа в довіднику', txt: true, f: v => `<span class="tag">${esc(v)}</span>` },
+        { k: 'rev', t: 'Виручка, ₴', f: v => n0(v) },
+        { k: 'factPct', t: 'Факт, %', f: v => `<b>${n1(v)}</b>` },
+        { k: 'termPct', t: 'Довідник, %', f: v => n1(v) },
+        {
+          k: 'gap', t: 'Різниця', f: v =>
+            `<span class="${v > 0 ? 'down' : 'up'}">${v > 0 ? '+' : ''}${n1(v)} п.п.</span>`
+        },
+        { k: 'mkt', t: 'Маркетинг, ₴', f: v => n0(v) }
+      ], cmp, { sort: 'gap', limit: 30 }), 'де умови розходяться з життям')}</div>` : ''}
+
+    <div style="margin-top:12px">
+      ${card('Рентабельність загальна: клієнт × місяць', hm,
+      'червоне — місяці, у яких клієнт не окупив маркетинг')}
+    </div>
+
+    ${skuLoss.length ? `<div style="margin-top:12px">${card('Позиції з відʼємним доходом',
+        dataTable('tPfLoss', colsS, skuLoss, { sort: 'income', limit: 40 }),
+        `${skuLoss.length} комбінацій клієнт × SKU · разом ${money(sum(skuLoss, x => x.income))} ₴`)}</div>` : ''}
+
+    <div style="margin-top:12px">
+      ${card('Клієнти: факт по звіту', dataTable('tPf', colsP, byP, { sort: 'rev' }))}
+    </div>
+
+    <div style="margin-top:12px">
+      ${card('Номенклатура по клієнтах', dataTable('tPfSku', colsS, roll(L3, r => r.partner + ' · ' + r.sku), { sort: 'rev', limit: 300 }))}
+    </div>`;
+
+  el('pfMonth').onchange = e => { APP.profitMonth = e.target.value; render(); };
+
+  const top = byP.slice(0, 12);
+  chart('cPfBridge', {
+    data: {
+      labels: top.map(p => p.key.length > 22 ? p.key.slice(0, 21) + '…' : p.key),
+      datasets: [
+        { type: 'bar', label: 'Рентабельність продажу, %', data: top.map(p => p.ros), backgroundColor: '#6F8FD0', borderRadius: 1 },
+        { type: 'bar', label: 'Рентабельність загальна, %', data: top.map(p => p.roTotal), backgroundColor: '#E8A33D', borderRadius: 1 },
+        {
+          type: 'line', label: 'Маркетинг, % виручки', data: top.map(p => p.mktPct),
+          borderColor: '#D9563F', borderWidth: 2, pointRadius: 3, tension: .25
+        }
+      ]
+    },
+    options: {
+      scales: {
+        x: { grid: { display: false }, ticks: { font: { size: 9 }, maxRotation: 45, minRotation: 45 } },
+        y: AX.yPct
+      },
+      plugins: { tooltip: { callbacks: { label: c => ` ${c.dataset.label}: ${n1(c.parsed.y)}%` } } }
+    }
+  });
+
+  const t2 = byP.slice(0, 12);
+  chart('cPfMkt', {
+    type: 'bar',
+    data: {
+      labels: t2.map(p => p.key.length > 22 ? p.key.slice(0, 21) + '…' : p.key),
+      datasets: [
+        { label: 'Маркетинг покупці', data: t2.map(p => p.rev ? p.mktBuyers / p.rev * 100 : 0), backgroundColor: '#E8A33D' },
+        { label: 'Маркетинг постачальники', data: t2.map(p => p.rev ? p.mktSuppliers / p.rev * 100 : 0), backgroundColor: '#55A99B' },
+        { label: 'Разовий маркетинг', data: t2.map(p => p.rev ? p.oneBuyers / p.rev * 100 : 0), backgroundColor: '#B07AB4' },
+        { label: 'Тариф доставки', data: t2.map(p => p.rev ? p.delivery / p.rev * 100 : 0), backgroundColor: '#6F8FD0' }
+      ]
+    },
+    options: {
+      scales: {
+        x: { stacked: true, grid: { display: false }, ticks: { font: { size: 9 }, maxRotation: 45, minRotation: 45 } },
+        y: { stacked: true, grid: { color: '#221D18' }, ticks: { callback: v => v + '%' } }
+      },
+      plugins: {
+        legend: { position: 'bottom', labels: { font: { size: 10 } } },
+        tooltip: { callbacks: { label: c => ` ${c.dataset.label}: ${n1(c.parsed.y)}%` } }
+      }
+    }
+  });
+  bindTables();
+}
