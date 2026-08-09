@@ -217,21 +217,56 @@ function setStatus(mode, text) {
   el('statusText').textContent = text;
 }
 
-async function loadFromEndpoint(fresh) {
+/**
+ * Дві хвилі: спершу довідники, промо і рентабельність — панель уже працює,
+ * потім важкий масив продажів. Так не треба чекати все одним куском.
+ */
+async function loadFromEndpoint(fresh, onPartial) {
   const c = APP.cfg;
   if (!c.endpoint) { setStatus('err', 'джерело не задано'); return false; }
-  setStatus('load', 'завантаження…');
+  const q = a => c.endpoint + '?action=' + a + '&token=' + encodeURIComponent(c.token) + (fresh ? '&fresh=1' : '');
+  const t0 = Date.now();
   try {
-    const url = c.endpoint + '?action=all&token=' + encodeURIComponent(c.token) + (fresh ? '&fresh=1' : '');
-    const r = await jsonp(url);
-    if (!r || r.ok === false) throw new Error(r && r.error === 'BAD_TOKEN' ? 'Невірний токен' : (r && r.error) || 'Порожня відповідь');
-    ingest(r);
+    setStatus('load', 'довідники, промо, рентабельність…');
+    const light = await jsonp(q('light'), 180000);
+    if (!light || light.ok === false) {
+      throw new Error(light && light.error === 'BAD_TOKEN' ? 'Невірний токен' : (light && light.error) || 'Порожня відповідь');
+    }
+    ingestPart(light);
+    if (onPartial) onPartial();
+
+    setStatus('load', 'продажі, це найдовше…');
+    const sales = await jsonp(q('sales'), 300000);
+    if (!sales || sales.ok === false) throw new Error((sales && sales.error) || 'Продажі не прийшли');
+    ingestPart(sales);
+    persist();
     saveCfg();
-    setStatus('ok', `${n0(APP.d.sales.length)} рядків · ${new Date(r.generated).toLocaleString('uk-UA')}`);
+
+    setStatus('ok', `${n0(APP.d.sales.length)} рядків · ${((Date.now() - t0) / 1000).toFixed(0)} с · ${new Date().toLocaleTimeString('uk-UA')}`);
     return true;
   } catch (e) {
     setStatus('err', e.message);
-    return false;
+    return APP.d.sales.length > 0;
+  }
+}
+
+/** Доливає частину відповіді у сховище і перебудовує модель */
+function ingestPart(r) {
+  ['sales', 'cost', 'terms', 'promo', 'promoDiag', 'profit', 'profitDiag'].forEach(k => {
+    if (r[k]) APP.raw[k] = r[k];
+  });
+  if (r.generated) APP.raw.generated = r.generated;
+  build();
+}
+
+/** Локальна копія — тільки якщо влазить у сховище браузера */
+function persist() {
+  try {
+    const s = JSON.stringify(APP.raw);
+    if (s.length > 4.5e6) { localStorage.removeItem(LS + '_data'); return; }
+    localStorage.setItem(LS + '_data', s);
+  } catch (e) {
+    try { localStorage.removeItem(LS + '_data'); } catch (e2) { }
   }
 }
 
@@ -242,16 +277,21 @@ function ingest(r) {
     profit: r.profit || null, profitDiag: r.profitDiag || null,
     generated: r.generated || ''
   };
-  try { localStorage.setItem(LS + '_data', JSON.stringify(APP.raw)); } catch (e) { }
+  persist();
   build();
 }
 
+/** Бекенд віддає текстові колонки як індекси у словнику — тут розгортаємо назад */
 function tableToObjects(t) {
   if (!t || !t.rows) return [];
-  const c = t.cols;
+  const c = t.cols, enc = t.enc || null;
+  const dicts = enc ? c.map(name => enc[name] || null) : null;
   return t.rows.map(row => {
     const o = {};
-    for (let i = 0; i < c.length; i++) o[c[i]] = row[i];
+    for (let i = 0; i < c.length; i++) {
+      const d = dicts && dicts[i];
+      o[c[i]] = d ? (d[row[i]] !== undefined ? d[row[i]] : '') : row[i];
+    }
     return o;
   });
 }
@@ -636,6 +676,19 @@ function chart(id, cfg) {
       '<div class="empty" style="padding:24px">Бібліотеку графіків не завантажено — перевірте доступ до cdnjs.cloudflare.com</div>';
     return;
   }
+  const ds = (cfg.data && cfg.data.datasets) || [];
+  let pts = 0;
+  ds.forEach(d => {
+    (d.data || []).forEach(v => {
+      const n = (v && typeof v === 'object') ? (v.y ?? v.x) : v;
+      if (n !== null && n !== undefined && isFinite(n) && n !== 0) pts++;
+    });
+  });
+  if (!pts) {
+    c.parentElement.innerHTML =
+      '<div class="empty" style="padding:28px">Для цього зрізу даних немає</div>';
+    return;
+  }
   if (APP.charts[id]) { APP.charts[id].destroy(); delete APP.charts[id]; }
   APP.charts[id] = new Chart(c.getContext('2d'), cfg);
   return APP.charts[id];
@@ -688,11 +741,11 @@ const VIEWS = [
   { id: 'brands', n: '03', t: 'Бренди / ТМ', grp: 'Результат' },
   { id: 'sku', n: '04', t: 'SKU', grp: 'Результат' },
   { id: 'econ', n: '05', t: 'Економіка SKU', grp: 'Гроші' },
-  { id: 'profit', n: '06', t: 'Рентабельність факт', grp: 'Гроші' },
+  { id: 'profit', n: '06', t: 'Рентабельність факт', grp: 'Гроші', nofilter: true },
   { id: 'chains', n: '07', t: 'Умови мереж', grp: 'Гроші' },
-  { id: 'promoplan', n: '08', t: 'Промо-календар', grp: 'Промо' },
+  { id: 'promoplan', n: '08', t: 'Промо-календар', grp: 'Промо', nofilter: true },
   { id: 'promoeff', n: '09', t: 'Ефективність промо', grp: 'Промо' },
-  { id: 'data', n: '10', t: 'Дані та якість', grp: 'Службове' }
+  { id: 'data', n: '10', t: 'Дані та якість', grp: 'Службове', nofilter: true }
 ];
 
 function renderRail() {
@@ -790,6 +843,10 @@ function render() {
     econ: viewEcon, profit: viewProfit, chains: viewChains, promoplan: viewPromoPlan,
     promoeff: viewPromoEff, data: viewData
   })[APP.view] || viewOverview;
+  const meta = VIEWS.find(v => v.id === APP.view);
+  const fb = el('filters');
+  if (fb) fb.style.display = (meta && meta.nofilter) ? 'none' : '';
+
   fn(host);
   updCount();
   countUp();
@@ -1780,13 +1837,46 @@ function viewPromoPlan(host) {
     return;
   }
 
-  const sheets = promoSheets();
-  const sel = sheets.includes(APP.promoSheet) ? APP.promoSheet : sheets[0];
-  const years = uniq(P.map(p => p.week && p.week.slice(0, 4)).filter(Boolean)).sort();
-  const yr = years.includes(APP.promoYear) ? APP.promoYear : years[years.length - 1];
+  // \b не спрацьовує на кирилиці, тому межу слова описуємо явно
+  const HEADERISH = /^(наименование|наименовани|назва|номенклатура|код товара|код товару|артикул|штрих|товар|итого|разом|всього|прогноз|план|ціна|цена|механ|мережа|бренд)(\s|$|[:.,()])/i;
 
-  const rowsP = P.filter(p => p.sheet === sel && p.week && p.week.slice(0, 4) === yr);
+  /* скільки рядків має кожен аркуш — щоб порожні не стояли першими */
+  const sheetStat = {};
+  P.forEach(p => {
+    if (!p.sheet) return;
+    const a = sheetStat[p.sheet] || (sheetStat[p.sheet] = { n: 0, years: {} });
+    a.n++;
+    if (p.week) { const y = p.week.slice(0, 4); a.years[y] = (a.years[y] || 0) + 1; }
+  });
+  const sheets = Object.keys(sheetStat).sort((a, b) => sheetStat[b].n - sheetStat[a].n);
+  const sel = sheets.includes(APP.promoSheet) ? APP.promoSheet : sheets[0];
+
+  /* роки — тільки ті, що реально є в цьому аркуші; за замовчуванням найнаповненіший */
+  const yStat = sheetStat[sel].years;
+  const years = Object.keys(yStat).sort();
+  const yr = years.includes(APP.promoYear) ? APP.promoYear
+    : years.slice().sort((a, b) => yStat[b] - yStat[a])[0];
+
+  const rowsP = P.filter(p => p.sheet === sel && p.week && p.week.slice(0, 4) === yr
+    && p.promoSku && !HEADERISH.test(p.promoSku));
   const weeks = uniq(rowsP.map(p => p.week)).sort();
+
+  if (!weeks.length) {
+    host.innerHTML = `
+      <div class="split" style="margin-bottom:12px">
+        <span class="pill">Мережа</span>
+        <select id="pSheet">${sheets.map(x =>
+      `<option ${x === sel ? 'selected' : ''}>${esc(x)} · ${n0(sheetStat[x].n)}</option>`).join('')}</select>
+      </div>` +
+      card('Промо-календар', `<div class="empty">
+        <b>У цьому аркуші немає тижнів</b>
+        Парсер не знайшов рядка з датами тижнів на аркуші «${esc(sel)}».
+        Подивіться діагностику в розділі «Дані та якість» — там видно, який рядок узято за шапку.</div>`);
+    el('pSheet').onchange = e => {
+      APP.promoSheet = e.target.value.split(' · ')[0]; APP.promoYear = null; render();
+    };
+    return;
+  }
 
   /* SKU у порядку виручки */
   const revBySku = {};
@@ -1929,9 +2019,11 @@ function viewPromoPlan(host) {
   host.innerHTML = `
     <div class="split" style="margin-bottom:12px">
       <span class="pill">Мережа</span>
-      <select id="pSheet">${sheets.map(s => `<option ${s === sel ? 'selected' : ''}>${esc(s)}</option>`).join('')}</select>
+      <select id="pSheet">${sheets.map(x =>
+    `<option ${x === sel ? 'selected' : ''}>${esc(x)} · ${n0(sheetStat[x].n)}</option>`).join('')}</select>
       <span class="pill">Рік</span>
-      <select id="pYear">${years.map(y => `<option ${y === yr ? 'selected' : ''}>${y}</option>`).join('')}</select>
+      <select id="pYear">${years.map(y =>
+    `<option ${y === yr ? 'selected' : ''}>${y} · ${n0(yStat[y])}</option>`).join('')}</select>
       <span class="pill">${skus.length} SKU · ${weeks.length} тижнів</span>
       <button class="btn sm ${ribbon ? 'primary' : ''}" id="pRibbon">Стрічка з назвами</button>
       <button class="btn sm ${ribbon ? '' : 'primary'}" id="pGrid">Щільна сітка</button>
@@ -1985,8 +2077,10 @@ function viewPromoPlan(host) {
       ], perSku, { sort: 'weeks' }))}
     </div>`;
 
-  el('pSheet').onchange = e => { APP.promoSheet = e.target.value; render(); };
-  el('pYear').onchange = e => { APP.promoYear = e.target.value; render(); };
+  el('pSheet').onchange = e => {
+    APP.promoSheet = e.target.value.split(' · ')[0]; APP.promoYear = null; render();
+  };
+  el('pYear').onchange = e => { APP.promoYear = e.target.value.split(' · ')[0]; render(); };
   el('pRibbon').onclick = () => { APP.promoMode = 'ribbon'; render(); };
   el('pGrid').onclick = () => { APP.promoMode = 'grid'; render(); };
 
@@ -2453,8 +2547,8 @@ function openSource() {
     APP.cfg.token = el('sTok').value.trim();
     saveCfg();
     msg('завантажую…', true);
-    const ok = await loadFromEndpoint(true);
-    if (ok) { close(); renderFilters(); render(); }
+    const ok = await loadFromEndpoint(true, () => { close(); renderFilters(); render(); });
+    if (ok) { renderFilters(); render(); }
     else msg(el('statusText').textContent, false);
   };
 
@@ -2501,8 +2595,19 @@ function setCalm(v) {
 /* --- амбієнтне тло: повільний дрейф частинок і горизонт --- */
 let starTimer = null, starParts = [];
 
-function startStars() {
+function placeStars() {
   const c = el('stars');
+  if (!c) return null;
+  // критичне позиціювання ставимо з коду, щоб застарілий кеш CSS не ламав верстку
+  const st = c.style;
+  st.position = 'fixed'; st.left = '0'; st.top = '0';
+  st.width = '100%'; st.height = '100%';
+  st.zIndex = '0'; st.pointerEvents = 'none'; st.display = 'block';
+  return c;
+}
+
+function startStars() {
+  const c = placeStars();
   if (!c || starTimer || calmOn()) return;
   if (window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
   let ctx = null;
@@ -2626,6 +2731,7 @@ function boot() {
     bc.onclick = () => setCalm(!document.body.classList.contains('calm'));
   }
   bindGlow();
+  placeStars();
   startStars();
   const bootEl = el('boot');
   if (bootEl) {
@@ -2634,17 +2740,15 @@ function boot() {
   }
 
   el('btnSource').onclick = openSource;
-  el('btnReload').onclick = async () => {
-    const ok = await loadFromEndpoint(true);
-    if (ok) { renderFilters(); render(); }
-  };
+  const refresh = () => { renderFilters(); render(); };
+  el('btnReload').onclick = () => loadFromEndpoint(true, refresh).then(ok => { if (ok) refresh(); });
 
   const hasCache = loadCached();
   if (hasCache) { renderFilters(); render(); }
   else { setStatus('', 'не підключено'); render(); }
 
   if (APP.cfg.endpoint) {
-    loadFromEndpoint(false).then(ok => { if (ok) { renderFilters(); render(); } });
+    loadFromEndpoint(false, refresh).then(ok => { if (ok) refresh(); });
   }
 }
 
