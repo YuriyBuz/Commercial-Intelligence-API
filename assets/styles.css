@@ -526,3 +526,130 @@ body.calm *,body.calm *::before,body.calm *::after{
   #stars{display:none}
   #boot{display:none}
 }
+
+/* =====================================================================
+   ORBITAL — неонові траси, кутові скоби, глибина
+   ===================================================================== */
+
+:root{
+  --cyan:#5CC8F5;
+  --violet:#9B7BE8;
+  --ion:#7FE3D0;
+  --trace:rgba(92,200,245,.5);
+}
+
+/* --- кутові скоби на картках --- */
+.card{position:relative}
+.card::before,.card::after{
+  content:"";position:absolute;width:11px;height:11px;pointer-events:none;opacity:.55;
+}
+.card::before{
+  left:-1px;top:-1px;
+  border-left:1px solid var(--cyan);border-top:1px solid var(--cyan);
+}
+.card::after{
+  right:-1px;bottom:-1px;
+  border-right:1px solid var(--amber);border-bottom:1px solid var(--amber);
+}
+.card:hover::before{opacity:1;box-shadow:-2px -2px 9px -3px var(--cyan)}
+.card:hover::after{opacity:1;box-shadow:2px 2px 9px -3px var(--amber)}
+
+/* --- KPI: неонова траса вздовж основи --- */
+.kpi{overflow:hidden}
+.kpi > .k::before{
+  content:"";position:absolute;right:10px;top:9px;
+  width:16px;height:1px;background:var(--trace);opacity:.65;
+}
+.kpi > .k::after{
+  content:"";position:absolute;right:10px;top:7px;
+  width:3px;height:3px;border-radius:50%;background:var(--cyan);
+  box-shadow:0 0 6px var(--cyan);opacity:.8;
+}
+.kpi.pos > .k::after{background:var(--wasabi);box-shadow:0 0 6px var(--wasabi)}
+.kpi.neg > .k::after{background:var(--chili);box-shadow:0 0 6px var(--chili)}
+
+/* --- шапка: тонка траса під панеллю --- */
+.topbar{
+  box-shadow:0 1px 0 rgba(92,200,245,.09), 0 6px 22px -18px rgba(92,200,245,.5);
+}
+.mark b{
+  background:linear-gradient(92deg,var(--ink) 30%,var(--cyan));
+  -webkit-background-clip:text;background-clip:text;color:transparent;
+}
+
+/* --- бічна панель: вертикальна шина --- */
+.rail{position:relative}
+.rail::after{
+  content:"";position:absolute;right:0;top:0;bottom:0;width:1px;
+  background:linear-gradient(180deg,transparent,rgba(92,200,245,.22) 18%,rgba(232,163,61,.18) 62%,transparent);
+}
+.rail a.on{
+  background:linear-gradient(90deg,rgba(92,200,245,.07),transparent 62%);
+}
+
+/* --- заголовок картки: індикатор ліворуч --- */
+.card > h3::before{
+  content:"";width:5px;height:5px;border-radius:1px;flex:0 0 5px;
+  background:var(--cyan);box-shadow:0 0 7px rgba(92,200,245,.75);opacity:.85;
+}
+
+/* --- мініатюрні чипи (місяці, тренд) --- */
+.chip.mini{
+  padding:2px 7px;font-size:10.5px;border-radius:3px;
+  font-family:var(--f-mono);letter-spacing:.02em;
+}
+.chip.mini.alt{
+  border-style:dashed;color:var(--dim);
+}
+.chip.mini.alt:hover{color:var(--cyan);border-color:rgba(92,200,245,.5)}
+.chip.mini.on{
+  background:rgba(92,200,245,.15);border-color:var(--cyan);color:var(--cyan);
+  box-shadow:0 0 10px -3px var(--cyan);font-weight:500;
+}
+.trendsw{display:inline-flex;gap:4px;align-items:center}
+
+/* --- групи ТМ у календарі --- */
+table.cal tr.grp{cursor:pointer}
+table.cal td.sku.grp{
+  position:sticky;left:0;z-index:3;
+  background:linear-gradient(90deg,#221D17,#1C1813 70%);
+  border-top:1px solid rgba(92,200,245,.2);
+  border-bottom:1px solid var(--line);
+  max-width:none;padding:5px 10px;white-space:nowrap;
+}
+table.cal td.sku.grp b{
+  font-family:var(--f-display);font-size:11.5px;letter-spacing:.1em;
+  text-transform:uppercase;color:var(--ink);
+}
+table.cal td.sku.grp .fold{
+  display:inline-block;width:12px;color:var(--cyan);font-size:10px;
+}
+table.cal td.sku.grp .gs{
+  margin-left:10px;font-family:var(--f-mono);font-size:10px;color:var(--dim);
+  text-transform:none;letter-spacing:0;
+}
+table.cal tr.grp:hover td.sku.grp{background:linear-gradient(90deg,#2A231B,#211C16 70%)}
+
+/* --- легка глибина під панелями --- */
+.card{box-shadow:0 10px 26px -24px rgba(0,0,0,.9)}
+.modal .box{box-shadow:0 24px 60px -30px rgba(0,0,0,1),0 0 0 1px rgba(92,200,245,.08)}
+
+/* --- екран запуску: орбітальні кільця --- */
+#boot .ring i:nth-child(2){border-right-color:var(--cyan)}
+#boot .ring i:nth-child(3){border-left-color:var(--violet)}
+#boot .bar i{background:linear-gradient(90deg,var(--cyan),var(--amber))}
+#boot .lines div span{color:var(--cyan)}
+#boot::before{
+  content:"";position:absolute;width:min(620px,86vw);height:min(620px,86vw);
+  border-radius:50%;pointer-events:none;
+  border:1px solid rgba(92,200,245,.07);
+  box-shadow:0 0 0 60px rgba(92,200,245,.025),0 0 0 130px rgba(155,123,232,.018);
+}
+
+/* --- статус --- */
+.status.ok{border-color:rgba(92,200,245,.25)}
+
+body.calm .card::before,body.calm .card::after{opacity:.35}
+@media (max-width:860px){
+  .card::before,.card::after{display:none}
+}
