@@ -23,7 +23,8 @@ const APP = {
     promoWeeks: [],          // відсортований список ISO-тижнів
     matchLog: [], anomalies: []
   },
-  f: { years: [], chains: [], brands: [], skus: [], search: '', chan: 'all' },
+  f: { years: [], months: [], chains: [], brands: [], skus: [], search: '', chan: 'all' },
+  trend: 'linear',
   view: 'overview',
   charts: {}
 };
@@ -114,6 +115,48 @@ function ymOf(y, m) { return y + '-' + String(m).padStart(2, '0'); }
 function ymLabel(ym) {
   const [y, m] = ym.split('-');
   return MONTH_SH[+m] + ' ' + y.slice(2);
+}
+
+/** Лінійна регресія: повертає значення тренду для кожної точки */
+function linreg(ys) {
+  const pts = ys.map((y, i) => [i, y]).filter(p => isFinite(p[1]));
+  if (pts.length < 3) return ys.map(() => null);
+  const mx = mean(pts.map(p => p[0])), my = mean(pts.map(p => p[1]));
+  let cov = 0, vx = 0;
+  pts.forEach(p => { cov += (p[0] - mx) * (p[1] - my); vx += (p[0] - mx) ** 2; });
+  if (!vx) return ys.map(() => null);
+  const k = cov / vx;
+  return ys.map((_, i) => my + k * (i - mx));
+}
+
+/** Нахил тренду за період, у відсотках від першого значення */
+function trendSlope(ys) {
+  const t = linreg(ys);
+  const a = t[0], b = t[t.length - 1];
+  if (a === null || !a) return null;
+  return (b / a - 1) * 100;
+}
+
+/** Ковзне середнє з вікном k */
+function sma(ys, k) {
+  return ys.map((_, i) => {
+    if (i < k - 1) return null;
+    const w = ys.slice(i - k + 1, i + 1).filter(v => isFinite(v));
+    return w.length ? mean(w) : null;
+  });
+}
+
+/** Готовий датасет лінії тренду для Chart.js */
+function trendDataset(label, ys, color, axis) {
+  if (APP.trend === 'off') return null;
+  const data = APP.trend === 'sma' ? sma(ys, 3) : linreg(ys);
+  if (data.every(v => v === null)) return null;
+  return {
+    type: 'line', label, data,
+    borderColor: color, borderWidth: 1.6, borderDash: APP.trend === 'sma' ? [] : [6, 4],
+    pointRadius: 0, tension: APP.trend === 'sma' ? .35 : 0, spanGaps: true,
+    fill: false, yAxisID: axis || 'y', order: 0
+  };
 }
 
 const PALETTE = ['#E8A33D', '#6F8FD0', '#86B860', '#D9563F', '#B07AB4', '#55A99B',
@@ -469,6 +512,18 @@ function buildPromo() {
   D.promoWeekCell = weekCell;
 }
 
+/** ТМ позиції: спершу з промо-плану, інакше — з номенклатури продажів, інакше — з назви */
+function brandOfPromo(p) {
+  if (p.brand && p.brand.length > 1) return p.brand;
+  if (p.sku) {
+    const r = APP.d.sales.find(x => x.sku === p.sku);
+    if (r && r.brand) return r.brand;
+  }
+  const n = String(p.promoSku || '');
+  const m = n.match(/^(Bonsai Premium|Bonsai Professional|Bonsai|Peri\s*Peri|Salateria Fresh|Salateria|YKI|Премія|Повна чаша|Special Edition)/i);
+  return m ? m[1] : 'Інше';
+}
+
 function chainOfSheet(sheet) {
   const over = APP.overrides.chain[sheet];
   if (over) return over;
@@ -618,6 +673,7 @@ function rows() {
   const f = APP.f;
   return APP.d.sales.filter(r => {
     if (f.years.length && !f.years.includes(r.y)) return false;
+    if (f.months.length && !f.months.includes(r.m)) return false;
     if (f.chains.length && !f.chains.includes(r.chain)) return false;
     if (f.brands.length && !f.brands.includes(r.brand)) return false;
     if (f.skus.length && !f.skus.includes(r.sku)) return false;
@@ -746,11 +802,12 @@ function loadCfg() {
     const s = JSON.parse(localStorage.getItem(LS) || '{}');
     Object.assign(APP.cfg, s.cfg || {});
     APP.overrides = Object.assign({ chain: {}, sku: {} }, s.overrides || {});
+    if (s.trend) APP.trend = s.trend;
   } catch (e) { }
 }
 function saveCfg() {
   try {
-    localStorage.setItem(LS, JSON.stringify({ cfg: APP.cfg, overrides: APP.overrides }));
+    localStorage.setItem(LS, JSON.stringify({ cfg: APP.cfg, overrides: APP.overrides, trend: APP.trend }));
   } catch (e) { }
 }
 function loadCached() {
@@ -808,8 +865,16 @@ function renderFilters() {
   const yChips = D.years.map(y =>
     `<span class="chip ${f.years.includes(y) ? 'on' : ''}" data-y="${y}">${y}</span>`).join('');
 
+  const mChips = MONTH_SH.slice(1).map((m, i) =>
+    `<span class="chip mini ${f.months.includes(i + 1) ? 'on' : ''}" data-m="${i + 1}">${m}</span>`).join('');
+
   el('filters').innerHTML = `
     <div class="f"><label>Роки</label><div class="chipbar" id="fYears">${yChips}</div></div>
+    <div class="f"><label>Місяці</label><div class="chipbar" id="fMonths">${mChips}
+      <span class="chip mini alt" id="fMonthAll" title="Показати всі місяці">усі</span>
+      <span class="chip mini alt" id="fMonthH1" title="Січень – червень">I пів</span>
+      <span class="chip mini alt" id="fMonthH2" title="Липень – грудень">II пів</span>
+    </div></div>
     <div class="f"><label>Мережа</label>
       <select id="fChain"><option value="">усі</option>
         ${D.chains.map(c => `<option ${f.chains[0] === c ? 'selected' : ''}>${esc(c)}</option>`).join('')}
@@ -838,6 +903,14 @@ function renderFilters() {
     if (!f.years.length) f.years = D.years.slice();
     renderFilters(); render();
   });
+  el('fMonths').querySelectorAll('.chip[data-m]').forEach(c => c.onclick = () => {
+    const m = +c.dataset.m, i = f.months.indexOf(m);
+    if (i >= 0) f.months.splice(i, 1); else f.months.push(m);
+    renderFilters(); render();
+  });
+  el('fMonthAll').onclick = () => { f.months = []; renderFilters(); render(); };
+  el('fMonthH1').onclick = () => { f.months = [1, 2, 3, 4, 5, 6]; renderFilters(); render(); };
+  el('fMonthH2').onclick = () => { f.months = [7, 8, 9, 10, 11, 12]; renderFilters(); render(); };
   el('fChain').onchange = e => { f.chains = e.target.value ? [e.target.value] : []; render(); updCount(); };
   el('fBrand').onchange = e => { f.brands = e.target.value ? [e.target.value] : []; render(); updCount(); };
   el('fChan').onchange = e => { f.chan = e.target.value; render(); updCount(); };
@@ -847,7 +920,7 @@ function renderFilters() {
     tmr = setTimeout(() => { f.search = e.target.value.trim(); render(); updCount(); }, 260);
   };
   el('fReset').onclick = () => {
-    APP.f = { years: D.years.slice(-2), chains: [], brands: [], skus: [], search: '', chan: 'all' };
+    APP.f = { years: D.years.slice(-2), months: [], chains: [], brands: [], skus: [], search: '', chan: 'all' };
     renderFilters(); render();
   };
   updCount();
@@ -857,7 +930,11 @@ function updCount() {
   const c = el('fCount');
   if (!c) return;
   const rs = rows();
-  c.textContent = `${n0(rs.length)} записів · ${n0(new Set(rs.map(r => r.sku)).size)} SKU · ${money(sum(rs, r => r.rev))} ₴`;
+  const f = APP.f;
+  const per = f.months.length && f.months.length < 12
+    ? ' · ' + f.months.slice().sort((a, b) => a - b).map(m => MONTH_SH[m]).join(', ')
+    : '';
+  c.textContent = `${n0(rs.length)} записів · ${n0(new Set(rs.map(r => r.sku)).size)} SKU · ${money(sum(rs, r => r.rev))} ₴${per}`;
 }
 
 function go(v) {
@@ -987,6 +1064,8 @@ function viewOverview(host) {
   const yy = yoyPair(rs);
   const Ta = yy ? totals(yy.a) : null, Tb = yy ? totals(yy.b) : null;
 
+  const byMPre = agg(rs, r => r.ym).sort((a, b) => a.key.localeCompare(b.key));
+
   const k = (lab, v, u, cur, prev, cls, inv) =>
     kpi(lab, v, u, yy && prev ? dEl(delta(cur, prev), inv) : '', cls);
 
@@ -999,10 +1078,16 @@ function viewOverview(host) {
     ${k('Чистий внесок', money(T.net), '₴', Ta && Ta.net, Tb && Tb.net, T.net > 0 ? 'pos' : 'neg')}
     ${kpi('Чиста маржинальність', n1(T.nm), '%', yy ? ppEl(Ta.nm - Tb.nm) : '')}
     ${kpi('Активних SKU', n0(T.nSku), '', `<span class="d">${n0(T.nPartners)} партнерів</span>`)}
+    ${(() => {
+    const sl = trendSlope(byMPre.map(x => x.rev));
+    return kpi('Тренд виручки', sl === null ? '—' : (sl > 0 ? '+' : '') + n0(sl), '%',
+      `<span class="d">за ${n0(byMPre.length)} міс. періоду</span>`,
+      sl === null ? '' : (sl > 0 ? 'pos' : 'neg'));
+  })()}
   </div>`;
 
   /* динаміка по місяцях */
-  const byM = agg(rs, r => r.ym).sort((a, b) => a.key.localeCompare(b.key));
+  const byM = byMPre;
 
   /* воронка P&L */
   const bridge = wfBridge(T);
@@ -1015,7 +1100,11 @@ function viewOverview(host) {
     ${kpis}
     <div class="grid g32" style="margin-top:12px">
       ${card('Виручка та чиста маржинальність по місяцях', canvas('cMonth', 'h300'),
-    yy ? `${yy.cur} проти ${yy.prev}` : '')}
+    `<span class="trendsw">
+       <span class="chip mini ${APP.trend === 'linear' ? 'on' : ''}" data-t="linear">тренд</span>
+       <span class="chip mini ${APP.trend === 'sma' ? 'on' : ''}" data-t="sma">ковзне 3</span>
+       <span class="chip mini ${APP.trend === 'off' ? 'on' : ''}" data-t="off">без</span>
+     </span>`)}
       ${card('Від виручки до чистого внеску', bridge, 'за обраний період')}
     </div>
     <div class="grid g3" style="margin-top:12px">
@@ -1029,17 +1118,26 @@ function viewOverview(host) {
     </div>`;
 
   /* --- місячна динаміка --- */
+  const revSeries = byM.map(x => x.rev);
+  const nmSeries = byM.map(x => x.nm);
+  const trendName = APP.trend === 'sma' ? 'ковзне 3 міс.' : 'тренд';
+  const mDatasets = [
+    { type: 'bar', label: 'Виручка', data: revSeries, backgroundColor: '#8A6224', borderRadius: 1, order: 3 },
+    { type: 'bar', label: 'Чистий внесок', data: byM.map(x => x.net), backgroundColor: '#E8A33D', borderRadius: 1, order: 2 },
+    {
+      type: 'line', label: 'Чиста маржа, %', data: nmSeries, yAxisID: 'y1',
+      borderColor: '#86B860', backgroundColor: '#86B860', tension: .3, pointRadius: 2, borderWidth: 2, order: 1
+    }
+  ];
+  const tRev = trendDataset('Виручка · ' + trendName, revSeries, '#5CC8F5');
+  const tNm = trendDataset('Маржа · ' + trendName, nmSeries, '#9B7BE8', 'y1');
+  if (tRev) mDatasets.push(tRev);
+  if (tNm) mDatasets.push(tNm);
+
   chart('cMonth', {
     data: {
       labels: byM.map(x => ymLabel(x.key)),
-      datasets: [
-        { type: 'bar', label: 'Виручка', data: byM.map(x => x.rev), backgroundColor: '#8A6224', borderRadius: 1, order: 3 },
-        { type: 'bar', label: 'Чистий внесок', data: byM.map(x => x.net), backgroundColor: '#E8A33D', borderRadius: 1, order: 2 },
-        {
-          type: 'line', label: 'Чиста маржа, %', data: byM.map(x => x.nm), yAxisID: 'y1',
-          borderColor: '#86B860', backgroundColor: '#86B860', tension: .3, pointRadius: 2, borderWidth: 2, order: 1
-        }
-      ]
+      datasets: mDatasets
     },
     options: {
       interaction: { mode: 'index', intersect: false },
@@ -1123,6 +1221,26 @@ function viewOverview(host) {
 
   const bySku = agg(rs, r => r.sku).filter(x => x.rev > 0 && x.cogs > 0);
   const maxRev = Math.max(...bySku.map(x => x.rev), 1);
+
+  /* тренд «більший обсяг → яка маржа» будуємо в логарифмі обсягу */
+  const sc = bySku.filter(x => x.qty > 0).map(x => ({ lx: Math.log10(x.qty), y: x.gm }))
+    .sort((a, b) => a.lx - b.lx);
+  let scTrend = null;
+  if (APP.trend !== 'off' && sc.length > 4) {
+    const mx = mean(sc.map(p => p.lx)), my = mean(sc.map(p => p.y));
+    let cov = 0, vx = 0;
+    sc.forEach(p => { cov += (p.lx - mx) * (p.y - my); vx += (p.lx - mx) ** 2; });
+    if (vx) {
+      const kk = cov / vx;
+      const x1 = sc[0].lx, x2 = sc[sc.length - 1].lx;
+      scTrend = {
+        type: 'line', label: 'тренд',
+        data: [{ x: 10 ** x1, y: my + kk * (x1 - mx) }, { x: 10 ** x2, y: my + kk * (x2 - mx) }],
+        borderColor: '#5CC8F5', borderWidth: 1.6, borderDash: [6, 4], pointRadius: 0, fill: false
+      };
+    }
+  }
+
   chart('cScatter', {
     type: 'bubble',
     data: {
@@ -1132,7 +1250,7 @@ function viewOverview(host) {
           x: x.qty, y: x.gm, r: 3 + Math.sqrt(x.rev / maxRev) * 18, sku: x.key, rev: x.rev
         })),
         backgroundColor: 'rgba(232,163,61,.35)', borderColor: '#E8A33D', borderWidth: 1
-      }]
+      }].concat(scTrend ? [scTrend] : [])
     },
     options: {
       scales: {
@@ -1143,12 +1261,22 @@ function viewOverview(host) {
         legend: { display: false },
         tooltip: {
           callbacks: {
-            label: c => [c.raw.sku, `обсяг: ${n0(c.raw.x)} од`,
-            `маржа: ${n1(c.raw.y)}%`, `виручка: ${n0(c.raw.rev)} ₴`]
+            label: c => c.raw.sku ? [c.raw.sku, `обсяг: ${n0(c.raw.x)} од`,
+            `маржа: ${n1(c.raw.y)}%`, `виручка: ${n0(c.raw.rev)} ₴`] : ''
           }
         }
       }
     }
+  });
+
+  bindTrendSwitch();
+}
+
+function bindTrendSwitch() {
+  document.querySelectorAll('.trendsw .chip').forEach(c => c.onclick = () => {
+    APP.trend = c.dataset.t;
+    saveCfg();
+    render();
   });
 }
 
@@ -1890,9 +2018,17 @@ function viewPromoPlan(host) {
   const yr = years.includes(APP.promoYear) ? APP.promoYear
     : years.slice().sort((a, b) => yStat[b] - yStat[a])[0];
 
-  const rowsP = P.filter(p => p.sheet === sel && p.week && p.week.slice(0, 4) === yr
+  const rowsAll = P.filter(p => p.sheet === sel && p.week && p.week.slice(0, 4) === yr
     && p.promoSku && !HEADERISH.test(p.promoSku));
-  const weeks = uniq(rowsP.map(p => p.week)).sort();
+
+  /* ТМ, наявні в цьому аркуші */
+  const brandOfSku = new Map();
+  rowsAll.forEach(p => { if (!brandOfSku.has(p.promoSku)) brandOfSku.set(p.promoSku, brandOfPromo(p)); });
+  const brandList = uniq(Array.from(brandOfSku.values())).sort((a, b) => a.localeCompare(b, 'uk'));
+  const selBrand = brandList.includes(APP.promoBrand) ? APP.promoBrand : '';
+
+  const rowsP = selBrand ? rowsAll.filter(p => brandOfSku.get(p.promoSku) === selBrand) : rowsAll;
+  const weeks = uniq(rowsAll.map(p => p.week)).sort();
 
   if (!weeks.length) {
     host.innerHTML = `
@@ -1917,8 +2053,21 @@ function viewPromoPlan(host) {
     .forEach(x => revBySku[x.key] = x.rev);
   const firstOf = new Map();
   rowsP.forEach(p => { if (!firstOf.has(p.promoSku)) firstOf.set(p.promoSku, p); });
-  const skus = Array.from(firstOf.keys()).sort((a, b) =>
-    (revBySku[firstOf.get(b).sku] || 0) - (revBySku[firstOf.get(a).sku] || 0));
+
+  /* сортуємо ТМ за виручкою, всередині ТМ — SKU за виручкою */
+  const revOfBrand = {};
+  Array.from(firstOf.keys()).forEach(k => {
+    const b = brandOfSku.get(k) || 'Інше';
+    revOfBrand[b] = (revOfBrand[b] || 0) + (revBySku[firstOf.get(k).sku] || 0);
+  });
+  const skus = Array.from(firstOf.keys()).sort((a, b) => {
+    const ba = brandOfSku.get(a) || 'Інше', bb = brandOfSku.get(b) || 'Інше';
+    if (ba !== bb) {
+      const d = (revOfBrand[bb] || 0) - (revOfBrand[ba] || 0);
+      return d || ba.localeCompare(bb, 'uk');
+    }
+    return (revBySku[firstOf.get(b).sku] || 0) - (revBySku[firstOf.get(a).sku] || 0);
+  });
 
   /* карта комірок: одна клітинка = SKU × тиждень, зібрана з усіх під-рядків */
   const cell = {};
@@ -2001,7 +2150,8 @@ function viewPromoPlan(host) {
       } else {
         if (run) events.push(run);
         run = on ? {
-          sku: s, matched: firstOf.get(s) && firstOf.get(s).sku,
+          sku: s, brand: brandOfSku.get(s) || 'Інше',
+          matched: firstOf.get(s) && firstOf.get(s).sku,
           label, depth: c.depth, derived: !!c.derived, start: !!c.start,
           terms: c.terms || '', promoPrice: c.promoPrice || null, basePrice: c.basePrice || 0,
           plan: c.plan || 0,
@@ -2016,8 +2166,27 @@ function viewPromoPlan(host) {
   const runIndex = {};
   events.forEach(e => { runIndex[e.sku + '|' + e.begin] = e; });
 
-  let body = '';
+  const closed = APP.promoClosed || (APP.promoClosed = new Set());
+  const colspanAll = weeks.length + 1;
+
+  let body = '', prevBrand = null;
   skus.forEach(s => {
+    const brand = brandOfSku.get(s) || 'Інше';
+    if (brand !== prevBrand) {
+      prevBrand = brand;
+      const inBrand = skus.filter(x => (brandOfSku.get(x) || 'Інше') === brand);
+      const ev = events.filter(e => (brandOfSku.get(e.sku) || 'Інше') === brand);
+      const ds = ev.map(e => e.depth).filter(d => d !== null);
+      const isClosed = closed.has(brand);
+      body += `<tr class="grp" data-b="${esc(brand)}" title="Клік — згорнути або розгорнути">
+        <td class="sku grp" colspan="${colspanAll}">
+          <span class="fold">${isClosed ? '▸' : '▾'}</span>
+          <b>${esc(brand)}</b>
+          <span class="gs">${inBrand.length} SKU · ${ev.length} акцій${ds.length ? ' · сер. глибина ' + n1(mean(ds)) + '%' : ''}</span>
+        </td></tr>`;
+    }
+    if (closed.has(brand)) return;
+
     const first = firstOf.get(s);
     const matched = first && first.sku;
     body += `<tr><td class="sku" title="${esc(s)}${matched ? '\n→ ' + esc(matched) : '\n(без пари у продажах)'}">${matched ? '' : '<span style="color:var(--chili)">◦ </span>'}${esc(s)}</td>`;
@@ -2073,7 +2242,8 @@ function viewPromoPlan(host) {
     const ds = cs.map(c => c.depth).filter(d => d !== null);
     const f = firstOf.get(s);
     return {
-      sku: s, matched: f && f.sku ? 'так' : 'ні',
+      sku: s, brand: brandOfSku.get(s) || 'Інше',
+      matched: f && f.sku ? 'так' : 'ні',
       weeks: cs.length, share: weeks.length ? cs.length / weeks.length * 100 : 0,
       avgDepth: ds.length ? mean(ds) : null, maxDepth: ds.length ? Math.max(...ds) : null,
       plan: sum(weeks.map(w => cell[s + '|' + w]).filter(Boolean), c => c.plan),
@@ -2096,9 +2266,15 @@ function viewPromoPlan(host) {
       <span class="pill">Рік</span>
       <select id="pYear">${years.map(y =>
     `<option ${y === yr ? 'selected' : ''}>${y} · ${n0(yStat[y])}</option>`).join('')}</select>
+      <span class="pill">ТМ</span>
+      <select id="pBrand">
+        <option value="">усі (${brandList.length})</option>
+        ${brandList.map(b => `<option value="${esc(b)}" ${b === selBrand ? 'selected' : ''}>${esc(b)}</option>`).join('')}
+      </select>
       <span class="pill">${skus.length} SKU · ${weeks.length} тижнів</span>
       <button class="btn sm ${ribbon ? 'primary' : ''}" id="pRibbon">Стрічка з назвами</button>
       <button class="btn sm ${ribbon ? '' : 'primary'}" id="pGrid">Щільна сітка</button>
+      <button class="btn sm ghost" id="pFold">${APP.promoFolded ? 'Розгорнути ТМ' : 'Згорнути ТМ'}</button>
     </div>
     <div class="kpis">
       ${kpi('Промо-тиск', n1(load), '%', `<span class="d">${n0(promoCells.length)} з ${n0(weeks.length * skus.length)} клітинок</span>`, load > 40 ? 'neg' : '')}
@@ -2123,6 +2299,37 @@ function viewPromoPlan(host) {
         · <i style="background:#1A1713;box-shadow:inset 2px 0 0 #86B860"></i>старт відвантажень
        </span>`)}
     </div>
+    <div style="margin-top:12px">
+      ${card('Зведення по торгових марках', (() => {
+      const g = brandList.map(b => {
+        const inB = skus.filter(x => (brandOfSku.get(x) || 'Інше') === b);
+        const ev = events.filter(e => e.brand === b);
+        const ds = ev.map(e => e.depth).filter(d => d !== null);
+        const wk = uniq(ev.flatMap(e => {
+          const out = [];
+          for (let i = e.begin; i <= e.end; i++) out.push(i);
+          return out;
+        })).length;
+        return {
+          brand: b, skus: inB.length, events: ev.length,
+          avgDepth: ds.length ? mean(ds) : null,
+          maxDepth: ds.length ? Math.max(...ds) : null,
+          weeks: wk, share: weeks.length ? wk / weeks.length * 100 : 0,
+          plan: sum(perSku.filter(x => x.brand === b), x => x.plan)
+        };
+      }).filter(x => x.skus);
+      return dataTable('tBrandSum', [
+        { k: 'brand', t: 'ТМ', txt: true },
+        { k: 'skus', t: 'SKU', f: v => n0(v) },
+        { k: 'events', t: 'Акцій', f: v => n0(v) },
+        { k: 'weeks', t: 'Тижнів з промо', f: v => n0(v) },
+        { k: 'share', t: 'Частка року', f: v => `${n1(v)}%<span class="bar" style="width:${Math.min(100, v)}%"></span>` },
+        { k: 'avgDepth', t: 'Сер. глибина', f: v => v === null ? '—' : n1(v) + '%' },
+        { k: 'maxDepth', t: 'Макс', f: v => v === null ? '—' : n0(v) + '%' },
+        { k: 'plan', t: 'План, од', f: v => v ? n0(v) : '—' }
+      ], g, { sort: 'events' });
+    })(), 'клік по рядку ТМ у календарі згортає групу')}
+    </div>
     <div class="grid g2" style="margin-top:12px">
       ${card('Промо-тиск по тижнях', canvas('cWeek', 'h260'), 'кількість SKU та середня глибина')}
       ${card('Найбільш «промотовані» позиції', canvas('cSkuLoad', 'h260'), 'частка тижнів у промо')}
@@ -2130,6 +2337,7 @@ function viewPromoPlan(host) {
     <div style="margin-top:12px">
       ${card('Перелік акцій', dataTable('tEvents', [
         { k: 'label', t: 'Механіка', txt: true },
+        { k: 'brand', t: 'ТМ', txt: true, f: v => `<span class="tag">${esc(v)}</span>` },
         { k: 'sku', t: 'Номенклатура', txt: true },
         {
           k: 'depth', t: 'Глибина', f: (v, r) => v === null ? '—'
@@ -2149,6 +2357,7 @@ function viewPromoPlan(host) {
     </div>
     <div style="margin-top:12px">
       ${card('Промо-план по SKU', dataTable('tPlan', [
+        { k: 'brand', t: 'ТМ', txt: true, f: v => `<span class="tag">${esc(v)}</span>` },
         { k: 'sku', t: 'Номенклатура промо-плану', txt: true },
         { k: 'matched', t: 'Пара', f: v => v === 'так' ? '<span class="tag a">є</span>' : '<span class="tag c">нема</span>' },
         { k: 'weeks', t: 'Тижнів', f: v => n0(v) },
@@ -2165,6 +2374,18 @@ function viewPromoPlan(host) {
     APP.promoSheet = e.target.value.split(' · ')[0]; APP.promoYear = null; render();
   };
   el('pYear').onchange = e => { APP.promoYear = e.target.value.split(' · ')[0]; render(); };
+  el('pBrand').onchange = e => { APP.promoBrand = e.target.value; render(); };
+  el('pFold').onclick = () => {
+    APP.promoFolded = !APP.promoFolded;
+    APP.promoClosed = APP.promoFolded ? new Set(brandList) : new Set();
+    render();
+  };
+  document.querySelectorAll('tr.grp[data-b]').forEach(tr => tr.onclick = () => {
+    const b = tr.dataset.b;
+    if (!APP.promoClosed) APP.promoClosed = new Set();
+    if (APP.promoClosed.has(b)) APP.promoClosed.delete(b); else APP.promoClosed.add(b);
+    render();
+  });
   el('pRibbon').onclick = () => { APP.promoMode = 'ribbon'; render(); };
   el('pGrid').onclick = () => { APP.promoMode = 'grid'; render(); };
 
@@ -2572,9 +2793,12 @@ function viewData(host) {
     a.click();
   };
   el('dClear').onclick = () => {
-    if (!confirm('Видалити локальну копію даних із цього браузера?')) return;
+    if (!confirm('Видалити локальну копію даних і кеш застосунку з цього браузера?')) return;
     try { localStorage.removeItem(LS + '_data'); } catch (e) { }
-    location.reload();
+    if (navigator.serviceWorker && navigator.serviceWorker.controller) {
+      navigator.serviceWorker.controller.postMessage('clearCache');
+    }
+    setTimeout(() => location.reload(), 300);
   };
   document.querySelectorAll('.mSel').forEach(s => s.onchange = e => {
     const p = e.target.dataset.p;
@@ -2732,11 +2956,34 @@ function startStars() {
   size();
   window.addEventListener('resize', size);
 
-  starParts = Array.from({ length: 80 }, () => ({
+  starParts = Array.from({ length: 70 }, () => ({
     x: Math.random(), y: Math.random(),
     z: 0.25 + Math.random() * 0.75,
     r: 0.4 + Math.random() * 1.1
   }));
+
+  /* неонові траси: ортогональні шляхи з рухомим імпульсом — як на схемі станції */
+  const TRACE_COLORS = ['92,200,245', '232,163,61', '155,123,232'];
+  const traces = Array.from({ length: 7 }, (_, i) => {
+    const y0 = 0.08 + Math.random() * 0.84;
+    const x1 = 0.18 + Math.random() * 0.3;
+    const y1 = y0 + (Math.random() - 0.5) * 0.34;
+    const x2 = x1 + 0.16 + Math.random() * 0.34;
+    return {
+      pts: [[0, y0], [x1, y0], [x1, y1], [x2, y1], [x2, y1 + (Math.random() - 0.5) * 0.2], [1.02, y1 + (Math.random() - 0.5) * 0.2]],
+      c: TRACE_COLORS[i % TRACE_COLORS.length],
+      speed: 0.035 + Math.random() * 0.05,
+      phase: Math.random()
+    };
+  });
+
+  function pathPoint(pts, t) {
+    const segs = pts.length - 1;
+    const f = Math.min(0.9999, Math.max(0, t)) * segs;
+    const i = Math.floor(f), k = f - i;
+    const a = pts[i], b = pts[i + 1];
+    return [a[0] + (b[0] - a[0]) * k, a[1] + (b[1] - a[1]) * k];
+  }
 
   let t = 0;
   function frame() {
@@ -2744,23 +2991,36 @@ function startStars() {
     t += 0.0016;
     ctx.clearRect(0, 0, w, h);
 
-    // горизонт: рідкі лінії, що дуже повільно пливуть угору
-    ctx.strokeStyle = 'rgba(232,163,61,.05)';
+    /* статичні траси */
     ctx.lineWidth = 1;
-    for (let i = 0; i < 7; i++) {
-      const p = ((t * 0.35 + i / 7) % 1);
-      const y = h - Math.pow(p, 2.4) * h * 0.55;
-      ctx.globalAlpha = 1 - p;
-      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
+    for (const tr of traces) {
+      ctx.strokeStyle = `rgba(${tr.c},.055)`;
+      ctx.beginPath();
+      tr.pts.forEach((p, i) => i ? ctx.lineTo(p[0] * w, p[1] * h) : ctx.moveTo(p[0] * w, p[1] * h));
+      ctx.stroke();
     }
-    ctx.globalAlpha = 1;
 
+    /* імпульс, що біжить трасою */
+    for (const tr of traces) {
+      const pos = (t * tr.speed * 10 + tr.phase) % 1;
+      for (let k = 0; k < 9; k++) {
+        const pt = pathPoint(tr.pts, pos - k * 0.012);
+        if (pt[0] < -0.02 || pt[0] > 1.04) continue;
+        const a = (1 - k / 9) * 0.5;
+        ctx.fillStyle = `rgba(${tr.c},${a.toFixed(3)})`;
+        ctx.beginPath();
+        ctx.arc(pt[0] * w, pt[1] * h, 1.5 - k * 0.12, 0, 6.283);
+        ctx.fill();
+      }
+    }
+
+    /* далекі частинки */
     for (const s of starParts) {
       s.y -= 0.00013 * s.z;
       if (s.y < -0.02) { s.y = 1.02; s.x = Math.random(); }
       const px = s.x * w, py = s.y * h;
-      const a = 0.1 + s.z * 0.3 + Math.sin(t * 9 + s.x * 40) * 0.06;
-      ctx.fillStyle = `rgba(232,196,141,${Math.max(0, a).toFixed(3)})`;
+      const a = 0.09 + s.z * 0.26 + Math.sin(t * 9 + s.x * 40) * 0.05;
+      ctx.fillStyle = `rgba(214,224,236,${Math.max(0, a).toFixed(3)})`;
       ctx.beginPath(); ctx.arc(px, py, s.r * s.z, 0, 6.283); ctx.fill();
     }
     starTimer = requestAnimationFrame(frame);
@@ -2825,6 +3085,57 @@ function dismissBoot() {
 }
 
 /* =====================================================================
+   ВСТАНОВЛЕННЯ ЯК ДОДАТКА
+   ===================================================================== */
+
+function initPWA() {
+  if (!('serviceWorker' in navigator)) return;
+  if (location.protocol !== 'https:' && location.hostname !== 'localhost') return;
+
+  navigator.serviceWorker.register('sw.js').then(reg => {
+    // якщо прилетіла нова версія — тихо підміняємо і повідомляємо
+    reg.addEventListener('updatefound', () => {
+      const nw = reg.installing;
+      if (!nw) return;
+      nw.addEventListener('statechange', () => {
+        if (nw.state === 'installed' && navigator.serviceWorker.controller) {
+          setStatus('ok', 'доступна нова версія — оновіть сторінку');
+        }
+      });
+    });
+  }).catch(() => { });
+
+  // кнопка встановлення з'являється лише коли браузер це дозволяє
+  window.addEventListener('beforeinstallprompt', e => {
+    e.preventDefault();
+    APP.installPrompt = e;
+    const b = el('btnInstall');
+    if (b) {
+      b.style.display = '';
+      b.onclick = async () => {
+        b.style.display = 'none';
+        APP.installPrompt.prompt();
+        await APP.installPrompt.userChoice;
+        APP.installPrompt = null;
+      };
+    }
+  });
+  window.addEventListener('appinstalled', () => {
+    const b = el('btnInstall');
+    if (b) b.style.display = 'none';
+  });
+}
+
+/** Відкриття розділу з ярлика маніфесту: ?view=promoplan */
+function viewFromUrl() {
+  try {
+    const v = new URLSearchParams(location.search).get('view');
+    if (v && VIEWS.some(x => x.id === v)) return v;
+  } catch (e) { }
+  return null;
+}
+
+/* =====================================================================
    СТАРТ
    ===================================================================== */
 
@@ -2842,6 +3153,9 @@ function boot() {
   bindGlow();
   placeStars();
   startStars();
+  initPWA();
+  const urlView = viewFromUrl();
+  if (urlView) APP.view = urlView;
   const bootEl = el('boot');
   if (bootEl) {
     bootEl.onclick = dismissBoot;
