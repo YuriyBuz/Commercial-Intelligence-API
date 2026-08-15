@@ -1,0 +1,42 @@
+{
+  "name": "Foodline · Комерційний пульт",
+  "short_name": "Foodline",
+  "description": "Аналітика продажів, юніт-економіки, промо-плану та рентабельності Foodline Production.",
+  "lang": "uk",
+  "dir": "ltr",
+  "id": "/Commercial-Intelligence-API/",
+  "start_url": ".",
+  "scope": ".",
+  "display": "standalone",
+  "display_override": ["window-controls-overlay", "standalone", "minimal-ui"],
+  "orientation": "any",
+  "background_color": "#12100E",
+  "theme_color": "#12100E",
+  "categories": ["business", "productivity", "finance"],
+  "icons": [
+    { "src": "assets/icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "assets/icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "assets/icons/maskable-192.png", "sizes": "192x192", "type": "image/png", "purpose": "maskable" },
+    { "src": "assets/icons/maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ],
+  "shortcuts": [
+    {
+      "name": "Промо-календар",
+      "short_name": "Промо",
+      "description": "Календар промо-активності по мережах і ТМ",
+      "url": "./?view=promoplan"
+    },
+    {
+      "name": "Рентабельність факт",
+      "short_name": "Рентабельність",
+      "description": "Фактичний маркетинг і дохід по клієнтах",
+      "url": "./?view=profit"
+    },
+    {
+      "name": "Економіка SKU",
+      "short_name": "Економіка",
+      "description": "Юніт-економіка та гранична глибина знижки",
+      "url": "./?view=econ"
+    }
+  ]
+}
