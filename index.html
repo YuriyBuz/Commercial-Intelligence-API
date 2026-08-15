@@ -8,7 +8,16 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans+Condensed:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap&subset=cyrillic,cyrillic-ext,latin" rel="stylesheet">
-<link rel="stylesheet" href="assets/styles.css?v=3">
+<meta name="description" content="Аналітика продажів, юніт-економіки, промо-плану та рентабельності Foodline Production.">
+<meta name="color-scheme" content="dark">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Foodline">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="assets/icons/favicon-32.png" sizes="32x32" type="image/png">
+<link rel="icon" href="assets/icons/icon-192.png" sizes="192x192" type="image/png">
+<link rel="apple-touch-icon" href="assets/icons/apple-touch-icon.png">
+<link rel="stylesheet" href="assets/styles.css?v=5">
 </head>
 <body>
 
@@ -30,6 +39,7 @@
   <div class="mark"><i></i><b>FOODLINE</b><span>Комерційний пульт</span></div>
   <div class="spacer"></div>
   <div class="status" id="status"><span class="dot"></span><span id="statusText">не підключено</span></div>
+  <button class="btn sm" id="btnInstall" style="display:none" title="Встановити як застосунок">Встановити</button>
   <button class="btn sm" id="btnCalm" title="Вимкнути рух інтерфейсу">Спокій</button>
   <button class="btn sm" id="btnReload" title="Перезавантажити з джерела">Оновити</button>
   <button class="btn sm" id="btnSource">Джерело даних</button>
@@ -45,6 +55,6 @@
 </div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
-<script src="assets/app.js?v=3"></script>
+<script src="assets/app.js?v=5"></script>
 </body>
 </html>
