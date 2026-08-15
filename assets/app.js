@@ -419,7 +419,8 @@ function buildPromo() {
     return {
       sheet: o.chain, chain: chainKey, brand: o.brand,
       promoSku: o.sku, sku: mm.sku, matchScore: mm.score,
-      barcode: o.barcode, article: o.article, planPrice: +o.price || 0,
+      barcode: o.barcode, article: o.article,
+      basePrice: +o.basePrice || 0, outletsPlan: +o.outletsPlan || 0,
       week: o.week, metric: o.metric, text: o.text,
       value: o.value === null || o.value === undefined ? null : +o.value,
       depth: o.depth === null || o.depth === undefined ? null : +o.depth
@@ -431,24 +432,41 @@ function buildPromo() {
   D.promoWeeks = Array.from(weeks).sort();
 
   /* агрегація промо до місяця */
-  const pm = {};
+  /* тиждень вважається промо-тижнем, якщо є назва механіки, умови або промо-ціна */
+  const weekCell = {};
   D.promo.forEach(p => {
     if (!p.week || !p.sku) return;
-    const ym = p.week.slice(0, 7);
-    const k = p.chain + '|' + p.sku + '|' + ym;
-    if (!pm[k]) pm[k] = { weeks: 0, depths: [], plan: 0, chain: p.chain, sku: p.sku, ym };
-    if (p.metric === 'промо') {
-      pm[k].weeks++;
-      if (p.depth !== null) pm[k].depths.push(p.depth);
-    } else if (p.value && /план|прогноз|кол-во|кількі/i.test(p.metric)) {
-      pm[k].plan += p.value;
+    const k = p.chain + '|' + p.sku + '|' + p.week;
+    const c = weekCell[k] || (weekCell[k] = {
+      chain: p.chain, sku: p.sku, week: p.week,
+      on: false, depth: null, plan: 0, promoPrice: null, basePrice: p.basePrice || 0
+    });
+    if (p.basePrice && !c.basePrice) c.basePrice = p.basePrice;
+    if (p.metric === 'name') { c.on = true; if (p.depth !== null) c.depth = Math.max(c.depth ?? 0, p.depth); }
+    else if (p.metric === 'terms') { c.on = true; if (p.depth !== null) c.depth = Math.max(c.depth ?? 0, p.depth); }
+    else if (p.metric === 'price') { c.on = true; if (p.value > 0) c.promoPrice = p.value; }
+    else if (p.metric === 'plan') { c.plan += p.value || 0; }
+  });
+
+  const pm = {};
+  Object.values(weekCell).forEach(c => {
+    /* якщо умови не заповнені — рахуємо глибину з базової та промо-ціни */
+    if (c.depth === null && c.basePrice > 0 && c.promoPrice > 0 && c.promoPrice < c.basePrice) {
+      c.depth = Math.round((1 - c.promoPrice / c.basePrice) * 1000) / 10;
+      c.depthDerived = true;
     }
+    const ym = c.week.slice(0, 7);
+    const k = c.chain + '|' + c.sku + '|' + ym;
+    const a = pm[k] || (pm[k] = { weeks: 0, depths: [], plan: 0, chain: c.chain, sku: c.sku, ym });
+    if (c.on) { a.weeks++; if (c.depth !== null) a.depths.push(c.depth); }
+    a.plan += c.plan;
   });
   Object.values(pm).forEach(v => {
     v.depthAvg = v.depths.length ? mean(v.depths) : null;
     v.depthMax = v.depths.length ? Math.max(...v.depths) : null;
   });
   D.promoMonth = pm;
+  D.promoWeekCell = weekCell;
 }
 
 function chainOfSheet(sheet) {
@@ -572,6 +590,21 @@ function detectAnomalies() {
         d: `Для ${diffs.length} клієнтів фактичний маркетинг зі звіту відрізняється від умов більш ніж на 8 п.п. Розрахунки граничної знижки спираються на довідник, тож там варто оновити цифри.`,
         items: diffs.sort((a, b) => Math.abs(b.fact - b.term) - Math.abs(a.fact - a.term))
           .slice(0, 25).map(d => `${d.p}: факт ${n1(d.fact)}% проти ${n1(d.term)}% в умовах`)
+      });
+    }
+  }
+
+  /* 8. промо-аркуші, де глибина знижки не читається */
+  if (APP.raw.promoDiag && APP.raw.promoDiag.length) {
+    const blind = APP.raw.promoDiag.filter(d =>
+      !d.skipped && !d.error && (d.cells || 0) > 20 && !(d.withDepth || 0));
+    if (blind.length) {
+      out.push({
+        lvl: 'warn', t: 'Аркуші промо-плану без глибини знижки',
+        d: 'У цих аркушах не вдалося прочитати відсоток знижки: немає під-рядка «условия», ' +
+          'або відсоток записаний у незвичному форматі. Промо там видно в календарі, ' +
+          'але вони не потрапляють у розрахунок граничної знижки та ROI.',
+        items: blind.map(d => `${d.sheet}: ${n0(d.cells)} клітинок, з них з глибиною 0`)
       });
     }
   }
@@ -1567,9 +1600,9 @@ function viewEcon(host) {
 
   /* найглибше заплановане промо по SKU в цій мережі */
   const planned = {};
-  APP.d.promo.forEach(p => {
-    if (p.chain !== selChain || !p.sku || p.depth === null) return;
-    if (!planned[p.sku] || p.depth > planned[p.sku]) planned[p.sku] = p.depth;
+  Object.values(APP.d.promoWeekCell || {}).forEach(c => {
+    if (c.chain !== selChain || !c.sku || c.depth === null) return;
+    if (!planned[c.sku] || c.depth > planned[c.sku]) planned[c.sku] = c.depth;
   });
 
   const data = byS.map(x => {
@@ -1887,21 +1920,45 @@ function viewPromoPlan(host) {
   const skus = Array.from(firstOf.keys()).sort((a, b) =>
     (revBySku[firstOf.get(b).sku] || 0) - (revBySku[firstOf.get(a).sku] || 0));
 
-  /* карта комірок */
+  /* карта комірок: одна клітинка = SKU × тиждень, зібрана з усіх під-рядків */
   const cell = {};
   rowsP.forEach(p => {
     const k = p.promoSku + '|' + p.week;
-    if (!cell[k]) cell[k] = { depth: null, plan: 0, start: false, notes: [], sku: p.sku };
-    if (p.metric === 'промо') {
-      cell[k].promo = true;
-      if (p.depth !== null && (cell[k].depth === null || p.depth > cell[k].depth)) cell[k].depth = p.depth;
-      if (p.text) { cell[k].notes.push(p.text); if (!cell[k].label) cell[k].label = p.text; }
-    } else if (p.metric === 'старт відвантажень') {
-      cell[k].start = true; cell[k].notes.push('старт: ' + p.text);
-    } else if (p.value) {
-      cell[k].plan += p.value;
-      cell[k].notes.push(p.metric + ': ' + n0(p.value));
+    const c = cell[k] || (cell[k] = {
+      depth: null, plan: 0, start: false, promo: false, sku: p.sku,
+      basePrice: 0, promoPrice: null, label: '', terms: '', notes: []
+    });
+    if (p.basePrice && !c.basePrice) c.basePrice = p.basePrice;
+
+    if (p.metric === 'name') {
+      c.promo = true;
+      if (p.text && !c.label) c.label = p.text;
+      if (p.depth !== null) c.depth = Math.max(c.depth ?? 0, p.depth);
+    } else if (p.metric === 'terms') {
+      c.promo = true;
+      if (p.text) c.terms = p.text;
+      if (p.depth !== null) c.depth = Math.max(c.depth ?? 0, p.depth);
+    } else if (p.metric === 'price') {
+      c.promo = true;
+      if (p.value > 0) c.promoPrice = p.value;
+    } else if (p.metric === 'plan') {
+      c.plan += p.value || 0;
+    } else if (p.metric === 'start') {
+      c.start = true;
+      if (p.text) c.notes.push('старт відвантажень: ' + p.text);
+    } else if (p.text) {
+      c.notes.push(p.text);
     }
+  });
+
+  /* глибина з цін, якщо умови порожні */
+  Object.values(cell).forEach(c => {
+    if (c.depth === null && c.basePrice > 0 && c.promoPrice > 0 && c.promoPrice < c.basePrice) {
+      c.depth = Math.round((1 - c.promoPrice / c.basePrice) * 1000) / 10;
+      c.derived = true;
+    }
+    if (!c.label && c.terms) c.label = c.terms;
+    if (!c.label && c.promo) c.label = 'промо';
   });
 
   /* заголовки з групуванням по місяцях */
@@ -1936,13 +1993,18 @@ function viewPromoPlan(host) {
       const label = on ? (c.label || 'СЦ') : null;
       if (on && run && run.label === label && run.end === i - 1) {
         run.end = i; run.weeks++;
-        if (c.depth !== null && (run.depth === null || c.depth > run.depth)) run.depth = c.depth;
+        if (c.depth !== null && (run.depth === null || c.depth > run.depth)) { run.depth = c.depth; run.derived = !!c.derived; }
         if (c.start) run.start = true;
+        if (c.terms && !run.terms) run.terms = c.terms;
+        if (c.promoPrice && !run.promoPrice) run.promoPrice = c.promoPrice;
+        run.plan += c.plan || 0;
       } else {
         if (run) events.push(run);
         run = on ? {
           sku: s, matched: firstOf.get(s) && firstOf.get(s).sku,
-          label, depth: c.depth, start: !!c.start,
+          label, depth: c.depth, derived: !!c.derived, start: !!c.start,
+          terms: c.terms || '', promoPrice: c.promoPrice || null, basePrice: c.basePrice || 0,
+          plan: c.plan || 0,
           from: w, toWeek: w, begin: i, end: i, weeks: 1
         } : null;
       }
@@ -1967,8 +2029,15 @@ function viewPromoPlan(host) {
       const run = runIndex[s + '|' + i];
 
       if (ribbon && run) {
-        const title = `${s}\n${run.label}\n${run.from} – ${run.toWeek} · ${run.weeks} тиж.`;
-        body += `<td class="run ${depthClass(run.depth)}${run.start ? ' start' : ''}" colspan="${run.weeks}" title="${esc(title)}">${esc(run.label)}</td>`;
+        const bits = [s, run.label];
+        if (run.depth !== null) bits.push('глибина: ' + n1(run.depth) + '%' + (run.derived ? ' (з цін)' : ''));
+        if (run.terms) bits.push('умови: ' + run.terms);
+        if (run.promoPrice) bits.push('промо-ціна: ' + n2(run.promoPrice) + ' ₴' +
+          (run.basePrice ? ' проти ' + n2(run.basePrice) : ''));
+        if (run.plan) bits.push('план: ' + n0(run.plan) + ' од');
+        bits.push(`${run.from} – ${run.toWeek} · ${run.weeks} тиж.`);
+        const cap = run.depth !== null ? `${run.label} · −${n0(run.depth)}%` : run.label;
+        body += `<td class="run ${depthClass(run.depth)}${run.start ? ' start' : ''}" colspan="${run.weeks}" title="${esc(bits.join('\n'))}">${esc(cap)}</td>`;
         for (let k = 1; k < run.weeks; k++) { prevM = weeks[i + k].slice(0, 7); }
         i += run.weeks - 1;
         continue;
@@ -1996,6 +2065,8 @@ function viewPromoPlan(host) {
   const promoCells = cells.filter(c => c.promo);
   const depths = promoCells.map(c => c.depth).filter(d => d !== null);
   const load = weeks.length && skus.length ? promoCells.length / (weeks.length * skus.length) * 100 : 0;
+  const noDepth = promoCells.length - depths.length;
+  const planTotal = sum(cells, c => c.plan);
 
   const perSku = skus.map(s => {
     const cs = weeks.map(w => cell[s + '|' + w]).filter(c => c && c.promo);
@@ -2006,6 +2077,7 @@ function viewPromoPlan(host) {
       weeks: cs.length, share: weeks.length ? cs.length / weeks.length * 100 : 0,
       avgDepth: ds.length ? mean(ds) : null, maxDepth: ds.length ? Math.max(...ds) : null,
       plan: sum(weeks.map(w => cell[s + '|' + w]).filter(Boolean), c => c.plan),
+      basePrice: (weeks.map(w => cell[s + '|' + w]).find(c => c && c.basePrice) || {}).basePrice || 0,
       rev: revBySku[f && f.sku] || 0
     };
   });
@@ -2030,8 +2102,11 @@ function viewPromoPlan(host) {
     </div>
     <div class="kpis">
       ${kpi('Промо-тиск', n1(load), '%', `<span class="d">${n0(promoCells.length)} з ${n0(weeks.length * skus.length)} клітинок</span>`, load > 40 ? 'neg' : '')}
-      ${kpi('Середня глибина', depths.length ? n1(mean(depths)) : '—', '%', `<span class="d">макс ${depths.length ? n0(Math.max(...depths)) : '—'}%</span>`)}
+      ${kpi('Середня глибина', depths.length ? n1(mean(depths)) : '—', '%',
+    `<span class="d">макс ${depths.length ? n0(Math.max(...depths)) : '—'}%${noDepth ? ' · без глибини ' + n0(noDepth) : ''}</span>`,
+    depths.length ? '' : 'neg')}
       ${kpi('SKU у промо', n0(perSku.filter(s => s.weeks).length), 'з ' + skus.length)}
+      ${kpi('Плановий обсяг', money(planTotal), 'од', `<span class="d">за промо-планом</span>`)}
       ${kpi('Акцій у плані', n0(events.length), '', `<span class="d">сер. ${n1(events.length ? mean(events.map(e => e.weeks)) : 0)} тиж.</span>`)}
       ${kpi('Пік тижня', n0(Math.max(...perWeek.map(w => w.n), 0)), 'SKU одночасно')}
       ${kpi('Тижнів без промо', n0(perWeek.filter(w => !w.n).length), 'з ' + weeks.length, '',
@@ -2056,7 +2131,15 @@ function viewPromoPlan(host) {
       ${card('Перелік акцій', dataTable('tEvents', [
         { k: 'label', t: 'Механіка', txt: true },
         { k: 'sku', t: 'Номенклатура', txt: true },
-        { k: 'depth', t: 'Глибина', f: v => v === null ? '—' : `<b>${n0(v)}%</b>` },
+        {
+          k: 'depth', t: 'Глибина', f: (v, r) => v === null ? '—'
+            : `<b>${n1(v)}%</b>${r.derived ? '<span class="tag x" style="margin-left:4px">з цін</span>' : ''}`,
+          title: 'З рядка «условия», або порахована з базової та промо-ціни'
+        },
+        { k: 'terms', t: 'Умови', txt: true, f: v => v ? esc(v) : '—' },
+        { k: 'basePrice', t: 'Базова ціна', f: v => v ? n2(v) : '—' },
+        { k: 'promoPrice', t: 'Промо-ціна', f: v => v ? n2(v) : '—' },
+        { k: 'plan', t: 'План, од', f: v => v ? n0(v) : '—' },
         { k: 'from', t: 'Старт', f: v => v.slice(8, 10) + '.' + v.slice(5, 7) },
         { k: 'toWeek', t: 'Фініш', f: v => v.slice(8, 10) + '.' + v.slice(5, 7) },
         { k: 'weeks', t: 'Тижнів', f: v => n0(v) },
@@ -2073,6 +2156,7 @@ function viewPromoPlan(host) {
         { k: 'avgDepth', t: 'Сер. глибина', f: v => v === null ? '—' : n1(v) + '%' },
         { k: 'maxDepth', t: 'Макс', f: v => v === null ? '—' : n0(v) + '%' },
         { k: 'plan', t: 'План, од', f: v => v ? n0(v) : '—' },
+        { k: 'basePrice', t: 'Базова ціна', f: v => v ? n2(v) : '—' },
         { k: 'rev', t: 'Факт виручка, ₴', f: v => v ? n0(v) : '—' }
       ], perSku, { sort: 'weeks' }))}
     </div>`;
@@ -2363,15 +2447,40 @@ function viewData(host) {
   /* діагностика парсера промо */
   let diag = '<div class="note" style="padding:12px">Бекенд не повернув діагностику.</div>';
   if (R.promoDiag && R.promoDiag.length) {
+    const m = (d, k) => (d.metrics && d.metrics[k]) || 0;
     diag = `<div class="tblwrap"><table class="dt"><thead><tr>
-      <th class="txt">Аркуш</th><th>Рядок з тижнями</th><th>Тижнів</th><th>Кол. назви</th>
-      <th>Кол. мітки</th><th>SKU</th><th>Заповнених клітинок</th></tr></thead><tbody>` +
-      R.promoDiag.map(d => `<tr>
-        <td class="txt">${esc(d.sheet)}${d.skipped ? ' <span class="tag c">пропущено</span>' : ''}</td>
-        <td>${d.weekHeaderRow ?? '—'}</td><td>${d.weeks ?? (d.reason ? esc(d.reason) : '—')}</td>
-        <td>${d.nameCol ?? '—'}</td><td>${d.labelCol ?? '—'}</td>
-        <td>${d.skus ?? '—'}</td><td>${d.cells != null ? n0(d.cells) : '—'}</td></tr>`).join('') +
-      '</tbody></table></div>';
+      <th class="txt">Аркуш</th><th>Секцій</th><th>Тижнів</th><th>SKU</th>
+      <th>Назви</th><th>Умови</th><th>З глибиною</th><th>Ціни</th><th>Плани</th><th>Старти</th>
+      </tr></thead><tbody>` +
+      R.promoDiag.map(d => {
+        if (d.skipped || d.error) {
+          return `<tr><td class="txt">${esc(d.sheet)} <span class="tag c">пропущено</span></td>
+            <td colspan="9" class="txt" style="color:var(--dim)">${esc(d.reason || d.error || (d.hidden ? 'прихований' : 'порожній'))}</td></tr>`;
+        }
+        const nm = m(d, 'name'), tr = m(d, 'terms'), wd = d.withDepth || 0;
+        return `<tr>
+          <td class="txt">${esc(d.sheet)}</td>
+          <td>${d.sections ? d.sections.length : 1}</td>
+          <td>${n0(d.weeks || 0)}</td>
+          <td>${n0(d.skus || 0)}</td>
+          <td>${n0(nm)}</td>
+          <td class="${tr ? '' : 'down'}">${n0(tr)}</td>
+          <td class="${wd ? 'up' : 'down'}">${n0(wd)}</td>
+          <td>${n0(m(d, 'price'))}</td>
+          <td>${n0(m(d, 'plan'))}</td>
+          <td>${n0(m(d, 'start'))}</td></tr>` +
+          (d.sections || []).map(x => `<tr>
+            <td class="txt" style="padding-left:22px;color:var(--dim)">секція, рядок ${x.headerRow} · ${x.year}</td>
+            <td colspan="9" class="txt" style="color:var(--dim);font-size:11px">
+              тижнів ${x.weeks} · назва — колонка ${x.nameCol}
+              · мітки під-рядків — ${x.labelCol ? 'колонка ' + x.labelCol : '<span style="color:var(--chili)">не знайдено</span>'}
+              · базова ціна — ${x.priceCol ? 'колонка ' + x.priceCol : 'немає'}
+              · клітинок ${n0(x.cells)}</td></tr>`).join('');
+      }).join('') +
+      '</tbody></table></div>' +
+      `<div class="note" style="padding:10px 12px">Колонка <b>«З глибиною»</b> — скільки клітинок дали відсоток знижки.
+       Якщо там нуль, а «Умови» не нульові — у тому аркуші відсоток записаний у форматі, який парсер не впізнав.
+       Якщо нуль і там, і там — у аркуші немає під-рядка «условия», і глибина рахується з базової та промо-ціни.</div>`;
   }
 
   /* зіставлення SKU */
