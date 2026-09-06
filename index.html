@@ -3,6 +3,26 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<!--
+  Скрипти дозволені лише з цього походження, cdnjs та вебдодатку Apps Script
+  (він віддає дані через JSONP і редіректить на googleusercontent).
+  'unsafe-inline' у style-src потрібен через inline-атрибути style у розмітці;
+  прибрати його можна, лише переписавши їх на класи.
+  frame-ancestors у <meta> браузери ігнорують — захист від фреймів потребує
+  HTTP-заголовка, якого GitHub Pages не дає.
+-->
+<meta http-equiv="Content-Security-Policy" content="
+  default-src 'none';
+  script-src 'self' https://cdnjs.cloudflare.com https://script.google.com https://script.googleusercontent.com;
+  style-src 'self' 'unsafe-inline' https://fonts.googleapis.com;
+  font-src 'self' https://fonts.gstatic.com;
+  img-src 'self' data:;
+  connect-src 'self';
+  manifest-src 'self';
+  worker-src 'self';
+  base-uri 'none';
+  form-action 'none';
+  object-src 'none'">
 <meta name="theme-color" content="#12100E">
 <title>Foodline · Комерційний пульт</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -14,10 +34,10 @@
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="Foodline">
 <link rel="manifest" href="manifest.webmanifest">
-<link rel="icon" href="assets/icons/favicon-32.png" sizes="32x32" type="image/png">
-<link rel="icon" href="assets/icons/icon-192.png" sizes="192x192" type="image/png">
-<link rel="apple-touch-icon" href="assets/icons/apple-touch-icon.png">
-<link rel="stylesheet" href="assets/styles.css?v=5">
+<!-- У репозиторії лежить лише 512×512; менші розміри браузер масштабує сам -->
+<link rel="icon" href="assets/icons/icon-512.png" sizes="512x512" type="image/png">
+<link rel="apple-touch-icon" href="assets/icons/icon-512.png">
+<link rel="stylesheet" href="assets/styles.css?v=6">
 </head>
 <body>
 
@@ -54,7 +74,13 @@
   </div>
 </div>
 
-<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
-<script src="assets/app.js?v=5"></script>
+<!--
+  TODO: додати integrity="sha384-…" (хеш є на сторінці Chart.js у cdnjs, кнопка «Copy SRI»,
+  або локально: curl -s https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js |
+                openssl dgst -sha384 -binary | openssl base64 -A
+  Поки хеша немає, джерело обмежене директивою script-src у CSP вище.
+-->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js" crossorigin="anonymous"></script>
+<script src="assets/app.js?v=6"></script>
 </body>
 </html>

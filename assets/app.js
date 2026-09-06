@@ -241,7 +241,24 @@ function matchSku(name, index) {
 
 /* ------------------------------ ЗАВАНТАЖЕННЯ ------------------------------ */
 
+/**
+ * JSONP виконує відповідь як код, тож джерелом може бути лише вебдодаток
+ * Apps Script. Інакше будь-яка вставлена сюди адреса отримала б повний
+ * доступ до сторінки — разом із токеном і кешем у localStorage.
+ */
+const ENDPOINT_HOSTS = ['script.google.com', 'script.googleusercontent.com'];
+
+function validEndpoint(u) {
+  try {
+    const p = new URL(u);
+    return p.protocol === 'https:' && ENDPOINT_HOSTS.includes(p.hostname);
+  } catch (e) { return false; }
+}
+
 function jsonp(url, timeout = 60000) {
+  if (!validEndpoint(url)) {
+    return Promise.reject(new Error('Дозволені лише адреси script.google.com'));
+  }
   return new Promise((resolve, reject) => {
     const cb = 'flcb_' + Math.random().toString(36).slice(2);
     const s = document.createElement('script');
@@ -267,6 +284,7 @@ function setStatus(mode, text) {
 async function loadFromEndpoint(fresh, onPartial) {
   const c = APP.cfg;
   if (!c.endpoint) { setStatus('err', 'джерело не задано'); return false; }
+  if (!validEndpoint(c.endpoint)) { setStatus('err', 'адреса джерела не з script.google.com'); return false; }
   const q = a => c.endpoint + '?action=' + a + '&token=' + encodeURIComponent(c.token) + (fresh ? '&fresh=1' : '');
   const t0 = Date.now();
   try {
@@ -1008,13 +1026,15 @@ function dataTable(id, cols, data, opts) {
   shown.forEach(r => {
     h += '<tr>';
     cols.forEach(c => {
-      h += `<td class="${c.txt ? 'txt' : ''}">${c.f ? c.f(r[c.k], r) : (r[c.k] ?? '—')}</td>`;
+      // Без форматера значення йде з таблиці як є — екрануємо, інакше назва
+      // SKU чи контрагента з розміткою виконається у браузері.
+      h += `<td class="${c.txt ? 'txt' : ''}">${c.f ? c.f(r[c.k], r) : esc(r[c.k] ?? '—')}</td>`;
     });
     h += '</tr>';
   });
   if (opts.total) {
     h += '<tr class="tot">';
-    cols.forEach(c => h += `<td class="${c.txt ? 'txt' : ''}">${opts.total[c.k] !== undefined ? opts.total[c.k] : ''}</td>`);
+    cols.forEach(c => h += `<td class="${c.txt ? 'txt' : ''}">${opts.total[c.k] !== undefined ? esc(opts.total[c.k]) : ''}</td>`);
     h += '</tr>';
   }
   h += `</tbody></table></div>`;

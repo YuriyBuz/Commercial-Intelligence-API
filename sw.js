@@ -7,7 +7,7 @@
  * Шрифти та бібліотеку графіків кешуємо надовго — вони версіоновані в URL.
  */
 
-const VERSION = 'v5';
+const VERSION = 'v6';
 const SHELL = 'fl-shell-' + VERSION;
 const VENDOR = 'fl-vendor-' + VERSION;
 
@@ -17,7 +17,6 @@ const SHELL_FILES = [
   './assets/styles.css',
   './assets/app.js',
   './manifest.webmanifest',
-  './assets/icons/icon-192.png',
   './assets/icons/icon-512.png'
 ];
 
@@ -40,6 +39,11 @@ self.addEventListener('activate', e => {
 });
 
 self.addEventListener('message', e => {
+  // На github.io походження спільне для всіх проєктів акаунта, тож приймаємо
+  // команди лише від сторінок цієї панелі, а не від будь-якої вкладки.
+  if (e.origin && e.origin !== self.location.origin) return;
+  if (!e.source || !e.source.url || e.source.url.indexOf(self.registration.scope) !== 0) return;
+
   if (e.data === 'skipWaiting') self.skipWaiting();
   if (e.data === 'clearCache') {
     caches.keys().then(keys => keys.forEach(k => caches.delete(k)));
