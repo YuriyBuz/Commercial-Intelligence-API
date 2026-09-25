@@ -9,35 +9,54 @@
    2. Розширення → Apps Script. У проєкті мають бути два файли:
         Core.gs   — вставте ПОВНИЙ вміст lines/assets/core.js;
         Server.gs — вставте цей файл.
+      Новий проєкт уже містить файл «Code.gs» (з function myFunction) — перейменуйте його на Core.gs
+      (⋮ біля назви → Перейменувати) і замініть весь його вміст, або видаліть і створіть Core.gs заново.
    3. Налаштування проєкту (⚙) → увімкніть «Показувати файл маніфесту appsscript.json у редакторі»,
       відкрийте appsscript.json і замініть його вміст на lines/apps-script/appsscript.json.
       (Якщо редактор не приймає пояс «Europe/Kyiv», вкажіть «Europe/Kiev».)
-   4. Оберіть функцію setup → «Виконати», надайте дозволи. Або оновіть таблицю й скористайтеся
-      меню «Облік ліній → Початкове налаштування». Буде створено аркуші, налаштування,
-      токен доступу, PIN керівника й тригери (щоденний звіт, щогодинна перевірка строків ТО).
+   4. Оберіть функцію setup → «Виконати» (або оновіть таблицю й скористайтеся меню
+      «Облік ліній → Початкове налаштування») і надайте дозволи:
+        «Перевірити дозволи» → оберіть свій обліковий запис. Google покаже попередження
+        «Google не перевірив цей застосунок» (Google hasn't verified this app) — це нормально для
+        власного скрипту: натисніть «Додатково» (Advanced) → «Перейти до <назва проєкту> (небезпечно)»
+        → «Дозволити». Буде створено аркуші, налаштування, токен доступу, PIN керівника й тригери
+        (щоденний звіт, щогодинна перевірка строків ТО).
    5. Розгорнути → Нове розгортання → тип «Веб-застосунок»:
         Виконувати від імені: «Я» (Me)   ·   Хто має доступ: «Будь-хто» (Anyone).
-      Скопіюйте URL веб-застосунку (…/exec).
-   6. Меню «Облік ліній → Показати токен і PIN» — введіть URL і токен на планшетах
+      Скопіюйте URL веб-застосунку — він закінчується на /exec — і вставте його в меню
+      «Облік ліній → Вказати адресу веб-застосунку (/exec)».
+      (Адреса з …/dev — тестова: працює лише для редакторів проєкту, на планшетах — ні.)
+   6. Аркуш «Налаштування» → параметр «manager_emails»: адреси керівників через кому (або
+      «Керівництво → Налаштування» в застосунку) — та/або «Email» працівників на аркуші «Персонал»:
+      керівникам надходять усі листи, механікам і електрикам — про ТО й ремонти, контролю якості —
+      про зауваження в чек-листах (якщо задано «Лінії» — лише про ці лінії). Без жодної адреси
+      листи-нагадування НЕ надсилаються. Перевірка — меню «Облік ліній → Надіслати звіт зараз».
+   7. Меню «Облік ліній → Показати токен і PIN» — введіть адресу (/exec) і токен на планшетах
       («Налаштування пристрою» → робота з Google-таблицею). PIN — для розділу «Керівництво».
-   7. (Необовʼязково) «Облік ліній → Заповнити демо-даними» — лише в порожню таблицю.
-   ОНОВЛЕННЯ КОДУ: замініть Core.gs / Server.gs → Розгорнути → Керування розгортаннями →
-   ✎ Редагувати → Версія: «Нова версія» → Розгорнути. URL лишається тим самим.
+   8. (Необовʼязково) «Облік ліній → Заповнити демо-даними» — лише в порожню таблицю.
+   ОНОВЛЕННЯ КОДУ: замініть Core.gs / Server.gs (і appsscript.json, якщо змінився) → знову
+   «Облік ліній → Початкове налаштування» (дані не зачіпає; підтвердить нові дозволи) → Розгорнути →
+   Керування розгортаннями → ✎ Редагувати → Версія: «Нова версія» → Розгорнути. URL лишається тим самим.
+   ЧАСОВИЙ ПОЯС: змінюйте лише параметр «tz» (Керівництво → Налаштування) — застосунок сам переведе
+   пояс таблиці, зберігши час записів. Не змінюйте пояс у «Файл → Налаштування таблиці»: Google
+   тлумачить уже записані дати в новому поясі, і час усіх записів зсувається.
+   МІСЦЕ: Google-таблиця вміщує до 10 млн клітинок (разом із порожніми). Щоденний звіт попередить
+   на 70 %; тоді «Облік ліній → Архівувати старі чек-листи» перенесе давні чек-листи в окрему таблицю.
 
-   ДОЗВОЛИ (oauthScopes в appsscript.json) — мінімально достатні:
-     spreadsheets.currentonly — лише ця таблиця: SpreadsheetApp.getActiveSpreadsheet() (скрипт
-                                привʼязаний до таблиці; openById не використовується), аркуші,
-                                діапазони, перевірка даних, flush, toast;
-     script.container.ui      — SpreadsheetApp.getUi(): меню та повідомлення (лише з меню);
-     script.scriptapp         — ScriptApp: тригери (newTrigger / getProjectTriggers / deleteTrigger),
-                                getService().getUrl();
-     script.send_mail         — MailApp.sendEmail / getRemainingDailyQuota.
+   ДОЗВОЛИ (oauthScopes в appsscript.json):
+     spreadsheets         — ця таблиця (SpreadsheetApp.getActiveSpreadsheet(): аркуші, діапазони,
+                            перевірка даних, flush) і створення таблиці-архіву (SpreadsheetApp.create,
+                            лише з меню «Архівувати старі чек-листи»); openById не використовується;
+     script.container.ui  — SpreadsheetApp.getUi(): меню, повідомлення й запити (лише з меню);
+     script.scriptapp     — ScriptApp: тригери (newTrigger / getProjectTriggers / deleteTrigger),
+                            getService().getUrl();
+     script.send_mail     — MailApp.sendEmail / getRemainingDailyQuota.
    Без окремих дозволів: LockService, CacheService, PropertiesService, ContentService, Utilities,
    Session.getScriptTimeZone, Logger / console.
 
-   Властивості скрипту (Script Properties): API_TOKEN, ADMIN_PIN (створює setup),
-   DAILY_TRIGGER (службова: година й пояс установленого тригера звіту). SPREADSHEET_ID не
-   використовується: скрипт працює лише з таблицею, до якої привʼязаний (дозвіл currentonly).
+   Властивості скрипту (Script Properties): API_TOKEN, ADMIN_PIN (створює setup), API_URL (адреса
+   …/exec — меню «Вказати адресу веб-застосунку»); службові: DAILY_TRIGGER (година й пояс
+   тригера звіту), LAST_DAILY (день останнього щоденного звіту — для надолуження пропущеного).
    Лише оголошення var / function на верхньому рівні (порядок завантаження файлів не важливий).
    ===================================================================== */
 
@@ -46,6 +65,7 @@ var LOCK_WAIT_MS = 25000;               // скільки чекати блок�
 var CHUNK_ROWS = 500;                   // since(): читання журналу знизу вгору порціями
 var UPDATE_GAP_ROWS = 50;               // update(): рядки ближче за це — одна група
 var UPDATE_MAX_RUNS = 8;                // update(): до стількох відрізків — запис без читання, інакше діапазоном
+var FIND_GAP_ROWS = 20;                 // findBy(): знайдені рядки ближче за це — одним читанням діапазону
 var ADMIN_FAILS_PER_DEVICE = 10;        // невдалих спроб PIN керівника з одного пристрою …
 var ADMIN_FAILS_GLOBAL = 60;            // … і з усіх пристроїв разом …
 var ADMIN_WINDOW_SEC = 600;             // … за 10 хвилин
@@ -56,7 +76,18 @@ var HEAD_BG = '#f3ead7';
 var SERVICE_BG = '#d9d9d9';
 var SERVICE_FG = '#5f5f5f';
 var NOTE_SERVICE = 'Службовий стовпець: його заповнює система. Не змінюйте вручну — значення буде перераховано.';
-var NOTE_SECRET = 'PIN працівника (4–8 цифр, необовʼязково). На планшети передається лише його хеш.';
+var NOTE_SECRET = 'PIN працівника (4–8 цифр, необовʼязково). Стовпець має формат «Звичайний текст» — PIN із нулем ' +
+  'на початку (0427) зберігається як є; не змінюйте формат. На планшети передається лише його хеш.';
+var CELL_LIMIT = 10000000;              // ліміт клітинок Google-таблиці (усі аркуші, і порожні клітинки теж)
+var CELL_WARN = 7000000;                // з цього обсягу — попередження в щоденному звіті
+var GROW_ROWS = 500;                    // запас рядків, що додається в кінець аркуша
+var ARCHIVE_TABLES = ['checks', 'answers'];   // що архівуємо (ядро не перераховує з них мотогодини й лічильники)
+var ARCHIVE_MONTHS = 12;                // типово — старші за рік
+var ARCHIVE_MIN_MONTHS = 6;
+var ARCHIVE_CHUNK = 5000;               // рядків за крок (кожен крок — окреме коротке блокування)
+var ARCHIVE_BUDGET_MS = 240000;         // не довше 4 хв за запуск (ліміт виконання Apps Script — 6 хв)
+// …/macros/s/<id>/exec; Google Workspace — …/a/macros/<домен>/s/<id>/exec (старий вигляд — …/a/<домен>/macros/s/…)
+var EXEC_URL_RE = /^https:\/\/script\.google\.com\/(macros|a\/macros\/[^\/\s]+|a\/[^\/\s]+\/macros)\/s\/[A-Za-z0-9_\-]+\/exec$/;
 var NOTE_LOG = 'Журнал заповнює застосунок, нові записи — внизу. Не сортуйте й не видаляйте рядки (для перегляду — фільтр). ' +
   'Помилковий запис анулюйте в застосунку (Керівництво → Журнал).';
 var NOTE_PLAN = 'Аркуш формується автоматично (щодня та з меню «Облік ліній»). Ручні зміни буде перезаписано.';
@@ -225,7 +256,35 @@ function afterWrite_(action, req, store, app) {
   if (!has_(v, 'digest_hour') && !has_(v, 'tz')) return;
   var S = app.settings();
   try { syncTriggers_(S, false); } catch (e) { console.warn('Тригер звіту не оновлено: ' + errText_(e)); }
-  try { if (store.ss.getSpreadsheetTimeZone() !== S.tz) store.ss.setSpreadsheetTimeZone(S.tz); } catch (e) { /* не критично */ }
+  try { retimeZone_(store, S.tz); } catch (e) { console.error('Пояс таблиці не змінено: ' + errText_(e)); }
+}
+
+/* пояс таблиці → tz, зберігши моменти часу. Sheets зберігає дату-час як «настінний» час у поясі
+   таблиці, тож проста зміна поясу зсунула б усі записані дати на різницю поясів. Тому: читаємо
+   стовпці дат (моменти за старим поясом) → змінюємо пояс → записуємо ті самі Date назад
+   (формули й текст у клітинках лишаються). Виклик — під блокуванням. */
+function retimeZone_(store, tz) {
+  var ss = store.ss;
+  if (!tz || ss.getSpreadsheetTimeZone() === tz) return 0;
+  var jobs = [];
+  LinesCore.TABLES.forEach(function (t) {
+    var sh = store.sheet_(t);
+    if (!sh) return;
+    var h = store.head_(t), last = sh.getLastRow();
+    if (last < 2) return;
+    h.known.forEach(function (kc) {
+      if (kc.c.base !== 'date') return;
+      var rng = sh.getRange(2, kc.col, last - 1, 1), vals = rng.getValues(), any = false;
+      for (var i = 0; i < vals.length && !any; i++) if (isDate_(vals[i][0])) any = true;
+      if (any) jobs.push({ rng: rng, vals: vals, fx: rng.getFormulas() });
+    });
+  });
+  ss.setSpreadsheetTimeZone(tz);
+  jobs.forEach(function (j) {
+    j.rng.setValues(j.vals.map(function (row, i) { return [j.fx[i][0] || keepCell_(row[0])]; }));
+  });
+  store.forget_();
+  return jobs.length;
 }
 
 /* =====================================================================
@@ -243,7 +302,7 @@ function deliver_(store, app, list, opt) {
     var status = 'sent', error = '';
     if (!to.length) {
       status = 'error';
-      error = 'Немає отримувачів: заповніть «manager_emails» на аркуші «Налаштування»';
+      error = 'Немає отримувачів: заповніть ' + mailWhere_();
     } else {
       if (quota === null) quota = mailQuota_();
       if (quota < to.length) {
@@ -270,6 +329,21 @@ function deliver_(store, app, list, opt) {
   });
   if (rows.length) app.logNotices(rows);
   return out;
+}
+/* де задати отримувачів листів (для повідомлень) */
+function mailWhere_() {
+  return '«manager_emails» на аркуші «' + LinesCore.SCHEMA.settings.sheet + '» або «Email» працівника з посадою «' +
+    LinesCore.LABELS.role.manager + '» на аркуші «' + LinesCore.SCHEMA.staff.sheet + '»';
+}
+/* отримувачі щоденного звіту без побудови самого звіту (як у ядрі: «manager_emails» + активні
+   працівники з посадою «Керівник» і email на аркуші «Персонал») */
+function digestTo_(store, S) {
+  var to = S.manager_emails.slice();
+  store.all('staff').forEach(function (r) {
+    var p = LinesCore.norm('staff', r);
+    if (p.active && p.role === 'manager') to = to.concat(LinesCore.util.toEmails(p.email));
+  });
+  return to.filter(LinesCore.util.isEmail);
 }
 function noticeIndex_(store) {
   var sent = {}, seen = {};
@@ -348,6 +422,9 @@ function SheetStore(ss) {
   this.rows_ = {};                       // t → сирі рядки довідника (кеш)
   this.rowAt_ = {};                      // t → {id: номер рядка} для кешованого довідника
   this.last_ = {};                       // t → getLastRow()
+  this.tail_ = {};                       // t → прочитаний низ журналу (since): {top, objs, tsv, full, g*}
+  this.seen_ = {};                       // t → {ключ: номер рядка} — рядки, знайдені findBy (для update)
+  this.cbPending_ = {};                  // t → {sh, from, to}: прапорці для рядків, доданих під блокуванням
   this.depth_ = 0;
   this.created_ = [];
   this.cbRule_ = null;
@@ -363,8 +440,8 @@ SheetStore.prototype.lastRow_ = function (t, sh) {
 };
 /* скинути кеш даних (після зміни схеми / на вході в блокування) */
 SheetStore.prototype.forget_ = function (t) {
-  if (t) { delete this.rows_[t]; delete this.rowAt_[t]; delete this.last_[t]; return; }
-  this.rows_ = {}; this.rowAt_ = {}; this.last_ = {};
+  if (t) { delete this.rows_[t]; delete this.rowAt_[t]; delete this.last_[t]; delete this.tail_[t]; delete this.seen_[t]; return; }
+  this.rows_ = {}; this.rowAt_ = {}; this.last_ = {}; this.tail_ = {}; this.seen_ = {};
 };
 
 /* заголовки: точний текст → текст без регістру/зайвих пробілів/різних апострофів → код стовпця (k) */
@@ -416,55 +493,135 @@ SheetStore.prototype.all = function (t) {
   if (this.rows_[t]) return this.rows_[t].map(copy_);
   var sh = this.sheet_(t);
   if (!sh) return [];
-  var h = this.head_(t), pk = this.S[t].pk, out = [], at = {};
-  var last = h.maxKnown ? this.lastRow_(t, sh) : 0;
+  var cfg = this.cacheable_(t), tl = this.tail_[t];
+  if (tl && tl.full && !cfg) return tl.objs.filter(Boolean).map(copy_);
+  var h = this.head_(t), pk = this.S[t].pk, out = [], at = {}, objs = [], tsv = [];
+  var last = h.maxKnown ? this.lastRow_(t, sh) : 0, tc = h.map.ts;
   if (last >= 2) {
     var vals = sh.getRange(2, 1, last - 1, h.maxKnown).getValues();
     for (var i = 0; i < vals.length; i++) {
       var o = this.rowObj_(h, vals[i]);
+      if (tc) { objs.push(o); tsv.push(vals[i][tc - 1]); }
       if (!o) continue;
       out.push(o);
       var id = pk ? keyStr_(o[pk]) : '';
       if (id && !has_(at, id)) at[id] = i + 2;
     }
   }
-  if (this.cacheable_(t) && h.maxKnown) {
+  if (cfg && h.maxKnown) {
     this.rows_[t] = out;
     this.rowAt_[t] = at;
+    return out.map(copy_);
+  }
+  if (tc && h.maxKnown) {
+    // журнал прочитано цілком — це й повний хвіст для since()
+    this.tail_[t] = { top: 2, objs: objs, tsv: tsv, full: true, gMax: -Infinity, gMin: Infinity, gDated: 0, gText: false, tMax: -Infinity };
     return out.map(copy_);
   }
   return out;
 };
 
-/* рядки з ts >= date: знизу вгору порціями по CHUNK_ROWS, доки ціла порція не стане старшою за межу
-   (можуть потрапити й старші рядки — ядро їх відфільтрує; текст у «Час» — теж віддаємо ядру) */
+/* рядки з ts >= date (у порядку аркуша); текст у «Час» — теж віддаємо ядру, рядки без часу — ні.
+   Читаємо лише низ журналу (tail_): можуть потрапити й старші рядки — ядро їх відфільтрує */
 SheetStore.prototype.since = function (t, date) {
   var b = isDate_(date) ? date.getTime() : (typeof date === 'number' ? date : NaN);
   if (!isFinite(b)) return this.all(t);
   var sh = this.sheet_(t);
   if (!sh) return [];
-  var h = this.head_(t), tc = h.map.ts;
-  if (!tc) return this.all(t);
-  var last = this.lastRow_(t, sh);
-  if (last < 2) return [];
-  var chunks = [], end = last;
-  while (end >= 2) {
-    var start = Math.max(2, end - CHUNK_ROWS + 1);
-    var vals = sh.getRange(start, 1, end - start + 1, h.maxKnown).getValues();
-    var part = [], older = true, dated = 0;
-    for (var i = 0; i < vals.length; i++) {
-      var ts = vals[i][tc - 1], keep;
-      if (isDate_(ts)) { dated++; keep = ts.getTime() >= b; if (keep) older = false; }
-      else if (ts === '' || ts === null || ts === undefined) keep = false;   // без часу ядро рядок не бере
-      else { keep = true; older = false; }
-      if (keep) { var o = this.rowObj_(h, vals[i]); if (o) part.push(o); }
-    }
-    chunks.push(part);
-    if (older && dated > 0) break;
-    end = start - 1;
+  var h = this.head_(t);
+  if (!h.map.ts) return this.all(t);
+  var tl = this.tailTo_(t, sh, h, b), out = [];
+  for (var i = 0; i < tl.objs.length; i++) {
+    var o = tl.objs[i], ts = tl.tsv[i];
+    if (!o) continue;
+    if (isDate_(ts)) { if (!(ts.getTime() >= b)) continue; }
+    else if (ts === '' || ts === null || ts === undefined) continue;
+    out.push(copy_(o));
   }
-  var out = [];
-  for (var j = chunks.length - 1; j >= 0; j--) out = out.concat(chunks[j]);
+  return out;
+};
+
+/* низ журналу, достатній для межі b: знизу вгору, доки верхні CHUNK_ROWS прочитаних рядків не стануть
+   цілком старшими за межу (є дати, усі < b, без тексту в «Час»). Перша порція — CHUNK_ROWS рядків; якщо
+   межа ще вище за неї — наступна одразу на стільки рядків, скільки до межі за щільністю вже прочитаного
+   (+20 % і CHUNK_ROWS), тож давня межа — кілька читань, а не порція на кожні CHUNK_ROWS рядків.
+   Кеш — на виконання (скидається на вході в блокування): пакет операцій не перечитує ті самі рядки,
+   менша межа — дочитує лише вище; insert / update оновлюють кеш */
+SheetStore.prototype.tailTo_ = function (t, sh, h, b) {
+  var tl = this.tail_[t], tc = h.map.ts;
+  if (!tl) {
+    var last = this.lastRow_(t, sh);
+    tl = this.tail_[t] = { top: Math.max(2, last + 1), objs: [], tsv: [], full: last < 2,
+      gMax: -Infinity, gMin: Infinity, gDated: 0, gText: false, tMax: -Infinity };
+  }
+  while (!tl.full && !(tl.gDated > 0 && !tl.gText && tl.gMax < b)) {
+    var end = tl.top - 1, n = CHUNK_ROWS;
+    if (tl.gDated > 0 && tl.gMin >= b && tl.tMax > tl.gMin) {
+      n = Math.max(n, Math.ceil((tl.gMin - b) * tl.objs.length / (tl.tMax - tl.gMin) * 1.2) + CHUNK_ROWS);
+    }
+    var start = Math.max(2, end - n + 1);
+    var vals = sh.getRange(start, 1, end - start + 1, h.maxKnown).getValues();
+    // g* — лише верхні CHUNK_ROWS рядків прочитаного (за ними — умова зупинки й оцінка відстані до межі)
+    var objs = new Array(vals.length), tsv = new Array(vals.length), guard = Math.min(vals.length, CHUNK_ROWS);
+    var gMax = -Infinity, gMin = Infinity, gDated = 0, gText = false;
+    for (var i = 0; i < vals.length; i++) {
+      var ts = vals[i][tc - 1];
+      tsv[i] = ts;
+      objs[i] = this.rowObj_(h, vals[i]);
+      if (isDate_(ts)) {
+        var ms = ts.getTime();
+        if (ms > tl.tMax) tl.tMax = ms;
+        if (i < guard) { gDated++; if (ms > gMax) gMax = ms; if (ms < gMin) gMin = ms; }
+      } else if (i < guard && ts !== '' && ts !== null && ts !== undefined) gText = true;
+    }
+    tl.objs = objs.concat(tl.objs);
+    tl.tsv = tsv.concat(tl.tsv);
+    tl.top = start;
+    tl.full = start <= 2;
+    tl.gMax = gMax; tl.gMin = gMin; tl.gDated = gDated; tl.gText = gText;
+  }
+  return tl;
+};
+
+/* необовʼязковий метод сховища для ядра (давній запис журналу за ID, відповіді чек-листа за ID чек-листа):
+   сирі рядки, де стовпець col дорівнює value (текст без пробілів по краях), у порядку аркуша.
+   Читаємо лише цей стовпець (над прочитаним низом журналу; сам низ — з кешу tail_), далі — лише знайдені
+   рядки: близькі — одним діапазоном. null — немає аркуша чи стовпця (ядро обійде читанням вікна / журналу).
+   Номери знайдених рядків за ключем запамʼятовуються: update() їх уже не шукає */
+SheetStore.prototype.findBy = function (t, col, value) {
+  var v = str_(value), sh = v ? this.sheet_(t) : null;
+  if (!sh) return null;
+  var h = this.head_(t), c = h.map[col];
+  if (!c) return null;
+  var tl = this.tail_[t], pk = this.S[t].pk, upto = tl ? tl.top - 1 : this.lastRow_(t, sh);
+  var seen = this.seen_[t] || (this.seen_[t] = {}), hits = [], out = [], i;
+  if (upto >= 2) {
+    var cv = sh.getRange(2, c, upto - 1, 1).getValues();
+    for (i = 0; i < cv.length; i++) if (keyStr_(cv[i][0]) === v) hits.push(i + 2);
+  }
+  // пошук за ключем переглянув увесь стовпець — перший знайдений рядок точно перший із цим ключем
+  var byPk = col === pk, first = true;
+  var keep = function (o, r) {
+    out.push(o);
+    var id = pk ? keyStr_(o[pk]) : '';
+    if (id && (byPk ? first : !has_(seen, id))) seen[id] = r;
+    first = false;
+  };
+  for (i = 0; i < hits.length;) {
+    var j = i;
+    while (j + 1 < hits.length && hits[j + 1] - hits[j] <= FIND_GAP_ROWS) j++;
+    var r0 = hits[i], vals = sh.getRange(r0, 1, hits[j] - r0 + 1, h.maxKnown).getValues();
+    for (; i <= j; i++) {
+      var o = this.rowObj_(h, vals[hits[i] - r0]);
+      if (o) keep(o, hits[i]);
+    }
+  }
+  if (tl) {
+    for (i = 0; i < tl.objs.length; i++) {
+      var x = tl.objs[i];
+      if (x && keyStr_(x[col]) === v) keep(copy_(x), tl.top + i);
+    }
+  }
   return out;
 };
 
@@ -484,14 +641,17 @@ SheetStore.prototype.insert = function (t, rows) {
   }
   var start = Math.max(2, this.lastRow_(t, sh) + 1);
   growRows_(sh, start + rows.length - 1, h);
+  this.textCols_(sh, h, start, rows.length);
   sh.getRange(start, 1, rows.length, width).setValues(data);
   this.last_[t] = start + rows.length - 1;
-  this.checkboxes_(sh, h, start, rows.length);
-  var cache = this.rows_[t], at = this.rowAt_[t], pk = this.S[t].pk;
-  if (cache && at) {
+  this.checkboxes_(sh, h, start, rows.length, t);
+  var cache = this.rows_[t], at = this.rowAt_[t], pk = this.S[t].pk, tl = this.tail_[t], tc = h.map.ts;
+  if ((cache && at) || tl) {
     data.forEach(function (a, n) {
       var o = {};
-      h.known.forEach(function (kc) { o[kc.k] = readBack_(a[kc.col - 1]); });
+      h.known.forEach(function (kc) { o[kc.k] = cellBack_(kc.c, a[kc.col - 1]); });
+      if (tl) { tl.objs.push(copy_(o)); tl.tsv.push(tc ? o.ts : ''); }
+      if (!cache || !at) return;
       cache.push(o);
       var id = pk ? keyStr_(o[pk]) : '';
       if (id && !has_(at, id)) at[id] = start + n;
@@ -509,17 +669,9 @@ SheetStore.prototype.update = function (t, patches) {
   var pk = this.S[t].pk || 'id';
   var sh = this.ensureTable_(t, false), h = this.head_(t), pcol = h.map[pk];
   if (!pcol) return 0;
-  var at = this.rowAt_[t];
-  if (!at) {
-    var last = this.lastRow_(t, sh);
-    if (last < 2) return 0;
-    var ids = sh.getRange(2, pcol, last - 1, 1).getValues();
-    at = {};
-    for (var i = 0; i < ids.length; i++) {
-      var id = keyStr_(ids[i][0]);
-      if (id && !has_(at, id)) at[id] = i + 2;
-    }
-  }
+  var at = this.rowAt_[t] || this.rowsOf_(t, sh, pcol, pk, patches);
+  var secret = {};
+  h.known.forEach(function (kc) { if (kc.c.secret) secret[kc.col] = 1; });
   var byRow = {}, rowList = [], n = 0;
   patches.forEach(function (p) {
     var row = at[keyStr_(p && p[pk])];
@@ -540,6 +692,7 @@ SheetStore.prototype.update = function (t, patches) {
   groups.forEach(function (gr) {
     if (gr.runs <= UPDATE_MAX_RUNS) {
       gr.rows.forEach(function (r) {
+        for (var c in byRow[r]) if (secret[c]) sh.getRange(r, +c).setNumberFormat('@');
         cellRuns_(byRow[r]).forEach(function (run) { sh.getRange(r, run.col, 1, run.vals.length).setValues([run.vals]); });
       });
       return;
@@ -550,23 +703,62 @@ SheetStore.prototype.update = function (t, patches) {
     var rng = sh.getRange(gr.from, c1, gr.to - gr.from + 1, c2 - c1 + 1);
     var vals = rng.getValues(), fx = rng.getFormulas();
     var out = vals.map(function (row, ri) {
-      return row.map(function (v, ci) { return fx[ri][ci] ? fx[ri][ci] : keepCell_(v); });
+      // текст сусідніх клітинок знову захищаємо; PIN (формат '@') — як є, без апострофа
+      return row.map(function (v, ci) { return fx[ri][ci] ? fx[ri][ci] : secret[c1 + ci] ? v : keepCell_(v); });
     });
     gr.rows.forEach(function (r) { var cells = byRow[r]; for (var c in cells) out[r - gr.from][+c - c1] = cells[c]; });
+    for (var sc in secret) if (+sc >= c1 && +sc <= c2) sh.getRange(gr.from, +sc, gr.to - gr.from + 1, 1).setNumberFormat('@');
     rng.setValues(out);
   });
-  var cache = this.rows_[t];
+  var cache = this.rows_[t], tl = this.tail_[t];
+  var put = function (o, p) {
+    for (var k in p) if (has_(p, k) && k !== pk && h.map[k]) o[k] = cellBack_(h.cols[k], cellOut_(h.cols[k], p[k]));
+  };
   if (cache) {
     patches.forEach(function (p) {
       var id = keyStr_(p && p[pk]);
       for (var ci = 0; ci < cache.length; ci++) {
         if (keyStr_(cache[ci][pk]) !== id) continue;
-        for (var k in p) if (has_(p, k) && k !== pk && h.map[k]) cache[ci][k] = readBack_(cellOut_(h.cols[k], p[k]));
+        put(cache[ci], p);
         break;
       }
     });
   }
+  if (tl) {
+    patches.forEach(function (p) {
+      var i = (at[keyStr_(p && p[pk])] || 0) - tl.top;
+      if (i < 0 || i >= tl.objs.length || !tl.objs[i]) return;
+      put(tl.objs[i], p);
+      if (h.map.ts && has_(p, 'ts')) tl.tsv[i] = tl.objs[i].ts;
+    });
+  }
   return n;
+};
+
+/* номери рядків за ключем (перший рядок із ключем): з прочитаного низу журналу (tail_) і знайдених
+   findBy (seen_), а чого там немає — одним читанням стовпця ключа вище низу (без tail_ — усього стовпця) */
+SheetStore.prototype.rowsOf_ = function (t, sh, pcol, pk, patches) {
+  var tl = this.tail_[t], seen = this.seen_[t], at = {}, i, id;
+  if (seen) for (id in seen) if (has_(seen, id)) at[id] = seen[id];
+  if (tl) {
+    for (i = 0; i < tl.objs.length; i++) {
+      id = tl.objs[i] ? keyStr_(tl.objs[i][pk]) : '';
+      if (id && !has_(at, id)) at[id] = tl.top + i;
+    }
+  }
+  if (tl || seen) {
+    var miss = patches.some(function (p) { return !has_(at, keyStr_(p && p[pk])); });
+    if (!miss) return at;
+  }
+  var upto = tl ? tl.top - 1 : this.lastRow_(t, sh);
+  if (upto < 2) return at;
+  var ids = sh.getRange(2, pcol, upto - 1, 1).getValues(), above = {};
+  for (i = 0; i < ids.length; i++) {
+    id = keyStr_(ids[i][0]);
+    if (id && !has_(above, id)) above[id] = i + 2;
+  }
+  for (id in above) if (has_(above, id)) at[id] = above[id];
+  return at;
 };
 /* клітинки рядка {стовпець: значення} → суцільні відрізки [{col, vals}] */
 function cellRuns_(cells) {
@@ -585,6 +777,7 @@ SheetStore.prototype.replace = function (t, rows) {
   var last = this.lastRow_(t, sh), w = Math.max(width, sh.getLastColumn());
   if (last >= 2 && w > 0) sh.getRange(2, 1, last - 1, w).clearContent();
   this.forget_(t);
+  delete this.cbPending_[t];
   this.last_[t] = 1;
   if (!rows.length) return 0;
   var data = rows.map(function (r) {
@@ -594,6 +787,7 @@ SheetStore.prototype.replace = function (t, rows) {
     return a;
   });
   growRows_(sh, rows.length + 1, h);
+  this.textCols_(sh, h, 2, rows.length);
   sh.getRange(2, 1, rows.length, width).setValues(data);
   this.last_[t] = rows.length + 1;
   this.checkboxes_(sh, h, 2, rows.length);
@@ -614,6 +808,7 @@ SheetStore.prototype.lock = function (fn) {
     return fn();
   } finally {
     this.depth_ = 0;
+    try { this.flushCheckboxes_(); } catch (e) { console.warn('Прапорці не додано: ' + errText_(e)); }
     try { SpreadsheetApp.flush(); } catch (e) { /* далі все одно звільняємо */ }
     lk.releaseLock();
   }
@@ -647,6 +842,7 @@ SheetStore.prototype.ensureTable_ = function (t, full) {
     this.forget_(t);
     h = this.head_(t);
   }
+  if (created || full) trimCols_(sh, h);
   if (created || full || add.length) this.format_(t, sh, h, created || full ? null : add, created);
   return sh;
 };
@@ -672,7 +868,9 @@ SheetStore.prototype.format_ = function (t, sh, h, onlyCols, created) {
     }
     if (maxR < 2) return;
     var body = sh.getRange(2, col, maxR - 1, 1);
-    if (c.base === 'date') body.setNumberFormat(t === 'plan' && c.k === 'date' ? 'dd.MM.yyyy' : 'dd.MM.yyyy HH:mm');
+    // PIN — «Звичайний текст»: інакше введений у таблиці «0427» Sheets збереже числом 427
+    if (c.secret) body.setNumberFormat('@');
+    else if (c.base === 'date') body.setNumberFormat(t === 'plan' && c.k === 'date' ? 'dd.MM.yyyy' : 'dd.MM.yyyy HH:mm');
     else if (c.base === 'enum') {
       var labels = [], set = LinesCore.LABELS[c.set];
       for (var code in set) if (has_(set, code)) labels.push(set[code]);
@@ -693,12 +891,32 @@ SheetStore.prototype.format_ = function (t, sh, h, onlyCols, created) {
 SheetStore.prototype.checkbox_ = function () {
   return this.cbRule_ || (this.cbRule_ = SpreadsheetApp.newDataValidation().requireCheckbox().build());
 };
-/* прапорці для щойно записаних рядків */
-SheetStore.prototype.checkboxes_ = function (sh, h, start, n) {
+/* прапорці для щойно записаних рядків. Під блокуванням — один раз на таблицю при виході з нього
+   (рядки пакета додаються підряд — одна перевірка даних на весь діапазон, а не на кожну операцію) */
+SheetStore.prototype.checkboxes_ = function (sh, h, start, n, t) {
+  var end = start + n - 1, p = t ? this.cbPending_[t] : null;
+  if (t && this.depth_ > 0) {
+    if (p && p.sh === sh && start <= p.to + 1 && end >= p.from - 1) { p.from = Math.min(p.from, start); p.to = Math.max(p.to, end); return; }
+    if (p) this.applyCheckboxes_(t, p);
+    this.cbPending_[t] = { sh: sh, from: start, to: end };
+    return;
+  }
+  this.applyCheckboxes_(t, { sh: sh, from: start, to: end }, h);
+};
+SheetStore.prototype.applyCheckboxes_ = function (t, p, h) {
   var self = this;
-  h.known.forEach(function (kc) {
-    if (kc.c.base === 'bool' && !kc.c.nullable) sh.getRange(start, kc.col, n, 1).setDataValidation(self.checkbox_());
+  (h || this.head_(t)).known.forEach(function (kc) {
+    if (kc.c.base === 'bool' && !kc.c.nullable) p.sh.getRange(p.from, kc.col, p.to - p.from + 1, 1).setDataValidation(self.checkbox_());
   });
+};
+SheetStore.prototype.flushCheckboxes_ = function () {
+  var p = this.cbPending_;
+  this.cbPending_ = {};
+  for (var t in p) if (has_(p, t)) this.applyCheckboxes_(t, p[t]);
+};
+/* стовпці «Звичайний текст» (PIN): формат '@' перед записом — навіть якщо його прибрали в таблиці */
+SheetStore.prototype.textCols_ = function (sh, h, start, n) {
+  h.known.forEach(function (kc) { if (kc.c.secret) sh.getRange(start, kc.col, n, 1).setNumberFormat('@'); });
 };
 
 /* ------------------------------ значення клітинок ------------------------------ */
@@ -707,6 +925,8 @@ SheetStore.prototype.checkboxes_ = function (sh, h, start, n) {
    від формул і автоперетворення Sheets (див. textCell_) */
 function cellOut_(c, v) {
   if (v === null || v === undefined) return '';
+  // PIN: клітинка у форматі '@' (textCols_) — рядок як є; апостроф там зберігся б буквально
+  if (c && c.secret) return isDate_(v) ? '' : String(v).slice(0, 49999);
   if (isDate_(v)) return isNaN(v.getTime()) ? '' : v;
   if (typeof v === 'number') return isFinite(v) ? v : '';
   if (typeof v === 'boolean') return v;
@@ -734,10 +954,16 @@ function textCell_(s) {
 }
 /* незмінна клітинка при перезаписі діапазону: текст знову захищаємо */
 function keepCell_(v) { return typeof v === 'string' ? textCell_(v) : v; }
-/* що поверне getValues після запису значення cellOut_ (для кешу довідників) */
+/* що поверне getValues після запису значення cellOut_ (для кешів) */
 function readBack_(v) {
   if (isDate_(v)) return new Date(v.getTime());
   return typeof v === 'string' && v.charAt(0) === '\'' ? v.slice(1) : v;
+}
+/* … у стовпець c: порожня клітинка з прапорцем читається як FALSE */
+function cellBack_(c, v) {
+  if (c && c.secret) return v;
+  var x = readBack_(v);
+  return x === '' && c && c.base === 'bool' && !c.nullable ? false : x;
 }
 
 /* додати рядки в кінець аркуша (із запасом); успадковані прапорці (порожні = FALSE, що зсунуло б
@@ -745,8 +971,15 @@ function readBack_(v) {
 function growRows_(sh, need, h) {
   var max = sh.getMaxRows();
   if (max >= need) return;
-  var add = Math.max(need - max, 500);
-  sh.insertRowsAfter(max, add);
+  var add = Math.max(need - max, GROW_ROWS);
+  try {
+    sh.insertRowsAfter(max, add);
+  } catch (e) {
+    if (!isCellLimit_(e)) throw e;
+    // запас не вміщається в ліміт клітинок — лише потрібні рядки
+    add = need - max;
+    try { sh.insertRowsAfter(max, add); } catch (e2) { if (isCellLimit_(e2)) throw fullError_(); throw e2; }
+  }
   (h ? h.known : []).forEach(function (kc) {
     if (kc.c.base === 'bool' && !kc.c.nullable) sh.getRange(max + 1, kc.col, add, 1).clearDataValidations().clearContent();
   });
@@ -755,6 +988,29 @@ function growCols_(sh, need) {
   var max = sh.getMaxColumns();
   if (max < need) sh.insertColumnsAfter(max, need - max);
 }
+/* порожні стовпці праворуч від даних (нова вкладка — 26 стовпців) теж займають місце в ліміті клітинок */
+function trimCols_(sh, h) {
+  var keep = Math.max(1, h.width, sh.getLastColumn()), max = sh.getMaxColumns();
+  if (max > keep) sh.deleteColumns(keep + 1, max - keep);
+}
+function isCellLimit_(e) { return /above the limit of [\d,.\s]+ cells/i.test(errText_(e)); }
+function fullError_() {
+  return LinesCore.util.AppError('SERVER_ERROR', 'Google-таблиця заповнена (ліміт — 10 млн клітинок), запис неможливий. ' +
+    'Керівнику: меню таблиці «' + MENU_TITLE + ' → Архівувати старі чек-листи». Записи планшетів чекають у черзі.');
+}
+/* клітинок у сітці всіх аркушів (разом із порожніми) — саме їх рахує ліміт Google */
+function gridCells_(ss) {
+  var n = 0;
+  ss.getSheets().forEach(function (sh) { n += sh.getMaxRows() * sh.getMaxColumns(); });
+  return n;
+}
+function capacityNote_(cells) {
+  if (cells < CELL_WARN) return '';
+  return 'Google-таблиця заповнена на ' + Math.floor(cells / CELL_LIMIT * 100) + '% (' + fmtInt_(cells) + ' з ' + fmtInt_(CELL_LIMIT) +
+    ' клітинок). Після досягнення ліміту записи з планшетів перестануть зберігатися. Перенесіть давні чек-листи ' +
+    'в архів: меню таблиці «' + MENU_TITLE + ' → Архівувати старі чек-листи».';
+}
+function fmtInt_(n) { return String(Math.round(n)).replace(/\B(?=(\d{3})+(?!\d))/g, ' '); }
 
 /* =====================================================================
    Задачі за розкладом і пункти меню
@@ -766,7 +1022,7 @@ function withApp_(fn) {
   var app = LinesCore.createApp(store, gasEnv_());
   return store.lock(function () { return fn(store, app); });
 }
-/* задача тригера: LOCKED — у журнал (наступний запуск надолужить), інші помилки — далі (лист від Google) */
+/* задача тригера: LOCKED — у журнал (щоденну задачу надолужить щогодинна), інші помилки — далі (лист від Google) */
 function runJob_(name, fn) {
   try {
     var r = withApp_(fn);
@@ -782,27 +1038,55 @@ function runJob_(name, fn) {
 
 /* щодня о digest_hour: звіт керівництву + оновлення аркуша «План ППР» */
 function dailyJob() {
-  return runJob_('dailyJob', function (store, app) {
-    var now = new Date(), S = app.settings(), res = { ok: true, digest: 'none', plan: 0 };
-    var d = app.buildDigest(now);
-    res.has_content = d.has_content;
-    if (d.has_content || S.digest_mode === 'always') {
-      var r = deliver_(store, app, [{ key: 'digest:' + app.timeKit().key(now), kind: 'digest', to: d.to,
-        subject: d.subject, html: d.html, text: d.text }])[0];
-      res.digest = r.status;
-      res.to = r.to;
-      if (r.error) res.error = r.error;
-    }
-    res.plan = app.refreshPlan().count;
-    return res;
-  });
+  return runJob_('dailyJob', function (store, app) { return dailyWork_(store, app, new Date()); });
+}
+/* тіло щоденної задачі; успіх позначається днем у LAST_DAILY (ключ 'digest:<день>' не дасть другого листа) */
+function dailyWork_(store, app, now) {
+  var S = app.settings(), res = { ok: true, digest: 'none', plan: 0 };
+  var d = app.buildDigest(now);
+  var cells = gridCells_(store.ss), note = capacityNote_(cells);
+  res.has_content = d.has_content;
+  res.cells = cells;
+  if (note) { res.warning = note; console.warn(note); }
+  if (d.has_content || S.digest_mode === 'always' || note) {
+    var r = deliver_(store, app, [{ key: 'digest:' + app.timeKit().key(now), kind: 'digest', to: d.to, subject: d.subject,
+      html: note ? noteHtml_(d.html, note) : d.html, text: note ? 'УВАГА. ' + note + '\n\n' + d.text : d.text }])[0];
+    res.digest = r.status;
+    res.to = r.to;
+    if (r.error) res.error = r.error;
+  }
+  res.plan = app.refreshPlan().count;
+  PropertiesService.getScriptProperties().setProperty('LAST_DAILY', app.timeKit().key(now));
+  return res;
+}
+function digestHour_(S) { return Math.max(0, Math.min(23, Math.round(+S.digest_hour || 0))); }
+/* сьогоднішній щоденний запуск пропущено (LOCKED, збій Sheets, тригер видалено чи створено вже після
+   години звіту — напр. у день setup): година звіту настала, а LAST_DAILY — не сьогодні. Лише за
+   сьогодні: звіт будується на «зараз» і має ключ 'digest:<сьогодні>' — надолуження вночі за вчора
+   надіслало б сьогоднішній звіт завчасно й «з'їло» вчасний. Дублікат листа не дасть той самий ключ. */
+function dailyMissed_(app, now) {
+  var K = app.timeKit();
+  if (K.parts(now).H < digestHour_(app.settings())) return false;
+  return (PropertiesService.getScriptProperties().getProperty('LAST_DAILY') || '') < K.key(now);
+}
+/* попередження на початку листа (після <body>) */
+function noteHtml_(html, note) {
+  var box = '<div style="max-width:720px;margin:16px auto 0;padding:10px 14px;border:1px solid #d9a441;border-radius:8px;' +
+    'background:#fff4dc;color:#5a3b00;font-family:Arial,Helvetica,sans-serif;font-size:14px;line-height:1.45;"><b>Увага.</b> ' +
+    escHtml_(note) + '</div>';
+  var m = /<body[^>]*>/i.exec(html || '');
+  return m ? html.slice(0, m.index + m[0].length) + box + html.slice(m.index + m[0].length) : box + (html || '');
 }
 
-/* щогодини: сповіщення про роботи, строк яких настав (кожен ключ — один раз) */
+/* щогодини: сповіщення про роботи, строк яких настав (кожен ключ — один раз); пропущений щоденний звіт */
 function hourlyJob() {
   return runJob_('hourlyJob', function (store, app) {
-    var r = dueCheck_(store, app);
+    var r = dueCheck_(store, app), now = new Date();
     try { syncTriggers_(app.settings(), false); } catch (e) { console.warn('Тригер звіту: ' + errText_(e)); }
+    if (dailyMissed_(app, now)) {
+      // збій звіту не зриває сповіщень про строки (вони вже надіслані); наступна година спробує знову
+      try { r.daily = dailyWork_(store, app, now); } catch (e) { r.daily = { ok: false, error: errText_(e) }; console.error('Надолуження звіту: ' + errText_(e)); }
+    }
     return r;
   });
 }
@@ -845,7 +1129,8 @@ function setup() {
       store.update('settings', upd);
       var S = app.settings();
       var tzNote = '';
-      try { if (ss.getSpreadsheetTimeZone() !== S.tz) ss.setSpreadsheetTimeZone(S.tz); } catch (e) { tzNote = errText_(e); }
+      // пояс таблиці = пояс заводу; уже записані дати зберігають свій момент часу
+      try { retimeZone_(store, S.tz); } catch (e) { tzNote = errText_(e); }
       var scriptTz = Session.getScriptTimeZone();
       // секрети — лише якщо їх ще немає
       var props = PropertiesService.getScriptProperties(), gen = [];
@@ -853,6 +1138,18 @@ function setup() {
       if (!props.getProperty('ADMIN_PIN')) { props.setProperty('ADMIN_PIN', newPin_()); gen.push('PIN керівника'); }
       var trig = syncTriggers_(S, true);
       var removed = dropDefaultSheet_(ss, store);
+      var cells = gridCells_(ss), full = capacityNote_(cells);
+      var steps = [];
+      if (!apiUrl_(props)) {
+        steps.push('Розгорнути → Нове розгортання → тип «Веб-застосунок» (виконувати від імені: «Я»; доступ: «Будь-хто») → ' +
+          'скопіюйте URL, що закінчується на /exec, і вставте його в меню «' + MENU_TITLE + ' → Вказати адресу веб-застосунку (/exec)».');
+      }
+      if (!digestTo_(store, S).length) {
+        steps.push('Аркуш «' + LinesCore.SCHEMA.settings.sheet + '» → параметр «manager_emails»: адреси керівників через кому ' +
+          '(або «Email» працівника з посадою «' + LinesCore.LABELS.role.manager + '» на аркуші «' + LinesCore.SCHEMA.staff.sheet + '»). ' +
+          'Без них листи-нагадування не надсилаються керівництву. Перевірка — «' + MENU_TITLE + ' → Надіслати звіт зараз».');
+      }
+      steps.push('«' + MENU_TITLE + ' → Показати токен і PIN» — адреса й токен для планшетів.');
       var msg = 'Готово. ' + (created.length ? 'Створено аркуші: ' + created.join(', ') + '.' : 'Усі аркуші вже були.') +
         '\nНалаштувань додано: ' + add.length + '.' +
         (gen.length ? '\nЗгенеровано: ' + gen.join(' і ') + '.' : '') +
@@ -860,10 +1157,10 @@ function setup() {
         (scriptTz && scriptTz !== S.tz ? '\nУвага: пояс скрипту (' + scriptTz + ') відрізняється від поясу заводу (' + S.tz +
           '). Змініть timeZone в appsscript.json.' : '') +
         (tzNote ? '\nПояс таблиці не змінено: ' + tzNote : '') +
-        '\n\nДалі: Розгорнути → Нове розгортання → Веб-застосунок (від імені: Я; доступ: Будь-хто), ' +
-        'потім «' + MENU_TITLE + ' → Показати токен і PIN».';
+        (full ? '\nУвага: ' + full : '') +
+        '\n\nДалі:\n' + steps.map(function (s, i) { return (i + 1) + '. ' + s; }).join('\n');
       return { ok: true, message: msg, created: created, settings_added: add.length, generated: gen,
-        triggers: trig, tz: S.tz, removed_sheet: removed };
+        triggers: trig, tz: S.tz, removed_sheet: removed, cells: cells };
     });
   });
 }
@@ -894,7 +1191,7 @@ function sendDigestNow() {
   return menu_('Щоденний звіт', function () {
     return withApp_(function (store, app) {
       var now = new Date(), d = app.buildDigest(now);
-      if (!d.to.length) return { ok: false, message: 'Не задано отримувачів: заповніть «manager_emails» на аркуші «Налаштування».' };
+      if (!d.to.length) return { ok: false, message: 'Не задано отримувачів: заповніть ' + mailWhere_() + '.' };
       var r = deliver_(store, app, [{ key: 'digest:manual:' + now.getTime(), kind: 'digest', to: d.to,
         subject: d.subject, html: d.html, text: d.text }], { force: true })[0];
       return r.status === 'sent' ? { ok: true, to: r.to, message: 'Звіт надіслано: ' + r.to.join(', ') + '.' }
@@ -936,18 +1233,169 @@ function recomputeAll() {
   });
 }
 
-/* меню: Показати токен і PIN */
+/* меню: Показати токен і PIN. Адреса — лише …/exec: збережена власником (API_URL) або getUrl(), якщо
+   він повернув саме …/exec. З меню getUrl() зазвичай дає …/dev (тестова адреса розгортання HEAD: лише
+   для редакторів, анонімний планшет отримає сторінку входу Google замість JSON) — її не показуємо. */
 function showSecrets() {
   var p = PropertiesService.getScriptProperties();
-  var token = p.getProperty('API_TOKEN') || '', pin = p.getProperty('ADMIN_PIN') || '', url = '';
-  try { url = ScriptApp.getService().getUrl() || ''; } catch (e) { url = ''; }
+  var token = p.getProperty('API_TOKEN') || '', pin = p.getProperty('ADMIN_PIN') || '', url = apiUrl_(p), svc = '';
+  if (!url) { try { svc = String(ScriptApp.getService().getUrl() || ''); } catch (e) { svc = ''; } }
+  var how = 'Розгорнути → Керування розгортаннями → ваш веб-застосунок → скопіюйте URL, що закінчується на /exec, ' +
+    'і вставте його в меню «' + MENU_TITLE + ' → Вказати адресу веб-застосунку (/exec)».';
+  var addr = url ? url
+    : (/\/dev$/.test(svc) ? 'ще не вказано. Увага: адреса, що закінчується на /dev, — тестова, на планшетах вона НЕ працює. '
+      : 'ще не вказано (якщо веб-застосунок не розгорнуто: Розгорнути → Нове розгортання → Веб-застосунок, від імені «Я», доступ «Будь-хто»). ') + how;
   var msg = !token ? 'Спершу виконайте «' + MENU_TITLE + ' → Початкове налаштування».'
-    : 'Адреса API (URL веб-застосунку):\n' + (url || 'ще не розгорнуто — Розгорнути → Нове розгортання → Веб-застосунок') +
+    : 'Адреса API (URL веб-застосунку, …/exec):\n' + addr +
       '\n\nТокен доступу: ' + token + '\nPIN керівника: ' + pin +
       '\n\nНа планшеті: «Налаштування пристрою» → робота з Google-таблицею → вставте адресу й токен. ' +
       'PIN — для розділу «Керівництво». Не передавайте токен і PIN стороннім.';
   say_('Токен і PIN', msg);
   return { ok: !!token, token: token, pin: pin, url: url, message: msg };
+}
+/* адреса API для планшетів: збережена власником або getUrl(), якщо це …/exec */
+function apiUrl_(props) {
+  var u = str_(props.getProperty('API_URL'));
+  if (EXEC_URL_RE.test(u)) return u;
+  try { u = str_(ScriptApp.getService().getUrl()); } catch (e) { u = ''; }
+  return EXEC_URL_RE.test(u) ? u : '';
+}
+
+/* меню: Вказати адресу веб-застосунку (/exec) — один раз після розгортання */
+function setApiUrl(url) {
+  return menu_('Адреса веб-застосунку', function () {
+    var ui = uiOrNull_(), given = url;
+    if (given === undefined || given === null || typeof given === 'object') {
+      if (!ui) return { ok: false, message: 'Запустіть з меню таблиці «' + MENU_TITLE + '».' };
+      var r = ui.prompt('Адреса веб-застосунку', 'Вставте URL веб-застосунку, що закінчується на /exec\n' +
+        '(Розгорнути → Керування розгортаннями → ваш веб-застосунок → URL):', ui.ButtonSet.OK_CANCEL);
+      if (r.getSelectedButton() !== ui.Button.OK) return { ok: false, cancelled: true };
+      given = r.getResponseText();
+    }
+    var u = str_(given).replace(/[?#].*$/, '');
+    if (/\/dev$/.test(u)) {
+      return { ok: false, message: 'Це тестова адреса (/dev) — вона працює лише для редакторів проєкту. Потрібна адреса, що закінчується на /exec: ' +
+        'Розгорнути → Керування розгортаннями.' };
+    }
+    if (!EXEC_URL_RE.test(u)) {
+      return { ok: false, message: 'Це не адреса веб-застосунку Apps Script. Очікується https://script.google.com/macros/s/…/exec' };
+    }
+    PropertiesService.getScriptProperties().setProperty('API_URL', u);
+    return { ok: true, url: u, message: 'Адресу збережено: ' + u + '\nДалі — «' + MENU_TITLE + ' → Показати токен і PIN».' };
+  });
+}
+
+/* меню: Архівувати старі чек-листи. Чек-листи й відповіді, старші за N місяців, переносяться в нову
+   таблицю «… — архів …» на Диску власника й видаляються з робочої (звільняє місце в ліміті 10 млн
+   клітинок). Події, роботи й показники не архівуються: з них ядро перераховує мотогодини, лічильники
+   й строки ТО. Кроками по ARCHIVE_CHUNK рядків, кожен — під коротким блокуванням: спершу копія,
+   потім видалення (збій між ними дає хіба що повтор рядків в архіві, а не втрату). */
+function archiveLogs(months) {
+  return menu_('Архівування', function () {
+    var ui = uiOrNull_(), m = months;
+    if (m === undefined || m === null || typeof m === 'object') {
+      // без вікна підтвердження (редактор, тригер) — лише з явною кількістю місяців: archiveLogs(12)
+      if (!ui) return { ok: false, message: 'Запустіть з меню таблиці «' + MENU_TITLE + ' → Архівувати старі чек-листи».' };
+      var r = ui.prompt('Архівувати старі чек-листи', 'Чек-листи й відповіді, старші за вказану кількість місяців (щонайменше ' +
+        ARCHIVE_MIN_MONTHS + '), буде перенесено в окрему нову Google-таблицю на вашому Диску й видалено з цієї. ' +
+        'Журнали стану, робіт і показників лишаються.\n\nСтарші за скільки місяців? (порожньо — ' + ARCHIVE_MONTHS + ')', ui.ButtonSet.OK_CANCEL);
+      if (r.getSelectedButton() !== ui.Button.OK) return { ok: false, cancelled: true };
+      m = str_(r.getResponseText()) || ARCHIVE_MONTHS;
+    }
+    m = Math.floor(Number(m));
+    if (!isFinite(m) || m < ARCHIVE_MIN_MONTHS) {
+      return { ok: false, message: 'Вкажіть ціле число місяців, не менше ' + ARCHIVE_MIN_MONTHS + '.' };
+    }
+    return archiveOld_(m);
+  });
+}
+function archiveOld_(months) {
+  var t0 = Date.now(), env = gasEnv_(), ss = SpreadsheetApp.getActiveSpreadsheet();
+  var app0 = LinesCore.createApp(new SheetStore(ss), env), K = app0.timeKit(), tz = app0.settings().tz;
+  var cutoff = K.start(monthsBack_(K.key(new Date()), months)), until = K.fmtD(cutoff);
+  var dest = null, moved = {}, left = false;
+  ARCHIVE_TABLES.forEach(function (t) {
+    moved[t] = 0;
+    while (!left) {
+      if (Date.now() - t0 > ARCHIVE_BUDGET_MS) { left = true; break; }
+      var store = new SheetStore(ss);
+      var n = store.lock(function () {
+        var sh = store.sheet_(t);
+        if (!sh) return 0;
+        var h = store.head_(t), tc = h.map.ts, last = store.lastRow_(t, sh);
+        if (!tc || last < 2) return 0;
+        // лише суцільний початок журналу, старший за межу (журнал дописується в кінець майже за часом)
+        var n0 = Math.min(ARCHIVE_CHUNK, last - 1), ts = sh.getRange(2, tc, n0, 1).getValues(), k = 0;
+        while (k < n0 && isDate_(ts[k][0]) && ts[k][0].getTime() < cutoff.getTime()) k++;
+        if (!k) return 0;
+        var w = sh.getLastColumn(), rng = sh.getRange(2, 1, k, w);
+        var head = sh.getRange(1, 1, 1, w).getValues()[0], vals = rng.getValues();
+        if (!dest) {
+          dest = SpreadsheetApp.create(MAIL_NAME + ' — архів чек-листів до ' + until);
+          try { dest.setSpreadsheetTimeZone(tz); } catch (e) { /* пояс за замовчуванням */ }
+        }
+        archiveAppend_(dest, sh.getName(), head, vals);
+        SpreadsheetApp.flush();
+        if (k + 1 < sh.getMaxRows()) sh.deleteRows(2, k);
+        else {
+          // під заголовком не лишилося б жодного рядка (нові успадкували б його оформлення) —
+          // останній рядок лише очищаємо: формат дат і списки лишаються, прапорці — прибираємо
+          if (k > 1) sh.deleteRows(2, k - 1);
+          sh.getRange(2, 1, 1, sh.getMaxColumns()).clearContent();
+          h.known.forEach(function (kc) {
+            if (kc.c.base === 'bool' && !kc.c.nullable) sh.getRange(2, kc.col).clearDataValidations().clearContent();
+          });
+        }
+        store.forget_(t);
+        return k;
+      });
+      if (!n) break;
+      moved[t] += n;
+    }
+  });
+  if (dest) archiveFinish_(dest);
+  var total = 0;
+  for (var t in moved) if (has_(moved, t)) total += moved[t];
+  var cells = gridCells_(ss);
+  var msg = !total ? 'Немає чек-листів, старших за ' + until + '. Зайнято клітинок: ' + fmtInt_(cells) + ' з ' + fmtInt_(CELL_LIMIT) + '.'
+    : 'Перенесено в архів (записи до ' + until + '): чек-листів — ' + moved.checks + ', відповідей — ' + moved.answers + '.' +
+      '\nАрхів: «' + dest.getName() + '» — ' + dest.getUrl() +
+      '\nЗайнято клітинок: ' + fmtInt_(cells) + ' з ' + fmtInt_(CELL_LIMIT) + '.' +
+      (left ? '\nНе все встигнуто за один запуск — запустіть «Архівувати старі чек-листи» ще раз (буде створено ще одну таблицю-архів).' : '');
+  return { ok: true, moved: moved, until: until, cells: cells, partial: left, url: dest ? dest.getUrl() : '', message: msg };
+}
+/* дописати рядки в аркуш таблиці-архіву (створюється з заголовком; сітка — точно під дані) */
+function archiveAppend_(dest, name, head, vals) {
+  var w = head.length, sh = dest.getSheetByName(name), start;
+  if (!sh) {
+    sh = dest.insertSheet(name);
+    if (sh.getMaxColumns() > w) sh.deleteColumns(w + 1, sh.getMaxColumns() - w);
+    else if (sh.getMaxColumns() < w) sh.insertColumnsAfter(sh.getMaxColumns(), w - sh.getMaxColumns());
+    sh.getRange(1, 1, 1, w).setValues([head.map(keepCell_)]).setFontWeight('bold');
+    sh.setFrozenRows(1);
+  }
+  start = Math.max(2, sh.getLastRow() + 1);
+  if (sh.getMaxRows() < start + vals.length - 1) sh.insertRowsAfter(sh.getMaxRows(), start + vals.length - 1 - sh.getMaxRows());
+  // значення (не формули); текст — буквально, дати — у форматі журналу
+  sh.getRange(start, 1, vals.length, w).setValues(vals.map(function (row) { return row.map(keepCell_); }));
+  head.forEach(function (x, j) {
+    if (vals.some(function (row) { return isDate_(row[j]); })) sh.getRange(start, j + 1, vals.length, 1).setNumberFormat('dd.MM.yyyy HH:mm');
+  });
+}
+/* архів: без порожнього першого аркуша і зайвих рядків */
+function archiveFinish_(dest) {
+  dest.getSheets().forEach(function (sh) {
+    if (dest.getSheets().length > 1 && sh.getLastRow() === 0 && sh.getLastColumn() === 0) { dest.deleteSheet(sh); return; }
+    var last = Math.max(2, sh.getLastRow() + 1);
+    if (sh.getMaxRows() > last) sh.deleteRows(last + 1, sh.getMaxRows() - last);
+  });
+}
+/* 'YYYY-MM-DD' мінус m місяців (день — не більший за останній день місяця) */
+function monthsBack_(key, m) {
+  var y = +key.slice(0, 4), mo = +key.slice(5, 7) - m, d = +key.slice(8, 10);
+  while (mo < 1) { mo += 12; y--; }
+  var dim = new Date(Date.UTC(y, mo, 0)).getUTCDate();
+  return y + '-' + (mo < 10 ? '0' : '') + mo + '-' + (Math.min(d, dim) < 10 ? '0' : '') + Math.min(d, dim);
 }
 
 /* меню в таблиці */
@@ -961,7 +1409,9 @@ function onOpen(e) {
       .addItem('Перевірити строки ТО зараз', 'checkDueNow')
       .addItem('Оновити «План ППР»', 'refreshPlan')
       .addItem('Перерахувати мотогодини', 'recomputeAll')
+      .addItem('Архівувати старі чек-листи', 'archiveLogs')
       .addSeparator()
+      .addItem('Вказати адресу веб-застосунку (/exec)', 'setApiUrl')
       .addItem('Показати токен і PIN', 'showSecrets')
       .addToUi();
   } catch (err) {
@@ -975,7 +1425,7 @@ function onOpen(e) {
    force — видалити наявні для цих функцій і створити заново */
 function syncTriggers_(S, force) {
   var props = PropertiesService.getScriptProperties();
-  var hour = Math.max(0, Math.min(23, Math.round(+S.digest_hour || 0)));
+  var hour = digestHour_(S);
   var want = hour + '@' + S.tz, daily = [], hourly = [], changed = [];
   ScriptApp.getProjectTriggers().forEach(function (t) {
     var f = t.getHandlerFunction();
@@ -1046,9 +1496,11 @@ function menu_(title, fn) {
   if (r && r.message) say_(title, r.message);
   return r;
 }
+function uiOrNull_() {
+  try { return SpreadsheetApp.getUi(); } catch (e) { return null; }   // тригер / веб-застосунок: UI немає
+}
 function say_(title, text) {
-  var ui = null;
-  try { ui = SpreadsheetApp.getUi(); } catch (e) { ui = null; }  // тригер / веб-застосунок: UI немає
+  var ui = uiOrNull_();
   if (ui) {
     try { ui.alert(title, text, ui.ButtonSet.OK); return; } catch (e2) { /* далі — у журнал */ }
   }
@@ -1064,3 +1516,6 @@ function keyStr_(v) { return isDate_(v) ? '' : str_(v); }
 function copy_(o) { var r = {}; for (var k in o) if (has_(o, k)) r[k] = o[k]; return r; }
 function headNorm_(s) { return String(s).toLowerCase().replace(/[ʼ’‘`']/g, '\'').replace(/\s+/g, ' ').trim(); }
 function errText_(e) { return String((e && e.message) || e); }
+function escHtml_(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}

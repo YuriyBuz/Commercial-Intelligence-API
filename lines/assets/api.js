@@ -2,7 +2,7 @@
    FOODLINE · Лінії — клієнтський API (api.js)
    • налаштування пристрою (localStorage 'fl_lines_v1');
    • транспорт: демо (LocalBackend) або Apps Script — POST text/plain JSON,
-     резерв — JSONP GET (автоперемикання на весь сеанс, якщо POST блокується);
+     резерв — JSONP GET (автоперемикання, якщо POST блокується; POST перевіряється знову у фоні);
    • постійна черга записів ('fl_lines_queue') з пакетною відправкою, повторами
      та списком відхилених ('fl_lines_rejected');
    • поправка годинника, кеш bootstrap ('fl_lines_boot'), оптимістичний стан ліній.
@@ -15,7 +15,8 @@ var Api = (function () {
     skew: 'fl_lines_skew', admin: 'fl_lines_admin', transport: 'fl_lines_transport' };
   /* параметри (можна змінювати в тестах) */
   var opts = { timeout: 30000, writeWait: 4000, batchMax: 20, backoff: [5, 15, 30, 60, 120], jsonpMaxUrl: 7500,
-    skewMaxRtt: 3000, probeTimeout: 10000, ackKeepMs: 5 * 60000 };
+    skewMaxRtt: 30000, skewStaleMs: 6 * 3600000, restampMs: 60000, probeTimeout: 10000, ackKeepMs: 5 * 60000,
+    postReprobeMs: 5 * 60000, postReprobeForceMs: 20000 };
   var ACT = LinesCore.ACTIONS;
   var QUEUEABLE = { event: 1, checklist: 1, work: 1, reading: 1 };
   var PERMANENT = { BAD_REQUEST: 1, NOT_FOUND: 1, UNKNOWN_ACTION: 1, ADMIN_REQUIRED: 1 };
@@ -24,9 +25,13 @@ var Api = (function () {
     TIMEOUT: 'Сервер не відповів вчасно',
     BAD_RESPONSE: 'Сервер повернув незрозумілу відповідь',
     NOT_CONFIGURED: 'Пристрій ще не налаштовано',
-    TOO_LARGE: 'Запис завеликий для резервного каналу зв’язку',
-    HTML: 'Сервер повернув сторінку замість даних — перевірте адресу і доступ до веб-застосунку («Усі, навіть анонімні»)'
+    TOO_LARGE: 'Запис завеликий для резервного каналу зв’язку — надішлеться, щойно запрацює основний канал',
+    STORAGE_FULL: 'Пам’ять браузера на пристрої заповнена — запис не збережено на планшеті. Він надішлеться, лише поки застосунок відкритий',
+    HTML: 'Сервер повернув сторінку замість даних — перевірте адресу і доступ до веб-застосунку («Усі, навіть анонімні»)',
+    DEV_URL: 'Це тестова адреса (/dev) — вона працює лише для редакторів проєкту. Потрібна адреса, що закінчується на /exec: Розгорнути → Керування розгортаннями.'
   };
+  /* тестове розгортання Apps Script (…/dev): анонімний планшет отримує сторінку входу Google замість JSON */
+  function isDevUrl(u) { return /^https:\/\/script\.google\.com\/.*\/dev\/?([?#].*)?$/i.test(String(u || '').trim()); }
 
   function has(o, k) { return o !== null && o !== undefined && Object.prototype.hasOwnProperty.call(o, k); }
   function assign(t) { for (var i = 1; i < arguments.length; i++) { var s = arguments[i]; if (s) for (var k in s) if (has(s, k)) t[k] = s[k]; } return t; }
@@ -66,7 +71,8 @@ var Api = (function () {
       net.online = null;
       backoffIdx = 0;
       nextAt = 0;
-      if (changed) { bootMem = null; recentAcks = []; skew = cfg.mode === 'local' ? 0 : skew; }
+      // поправка годинника — властивість самого пристрою (сервери Google точні): при зміні адреси лишається
+      if (changed) { bootMem = null; recentAcks = []; }
       emit('net', netInfo());
       emit('queue', netInfo());
       setTimeout(function () { flush(true); }, 0);
@@ -78,9 +84,57 @@ var Api = (function () {
   /* ------------------------------ стан мережі ------------------------------ */
   var net = { online: null, last_ok_at: 0, last_error: null };
   var paused = null;        // {code:'BAD_TOKEN', message} — черга зупинена
-  var skew = +(lsGet(K.skew, 0)) || 0;
-  var skewSavedAt = 0;
+  /* поправка годинника: найкращий замір {skew, rtt, at} або null — ще не визначено */
+  var skewS = loadSkew();
+  var skew = skewS ? skewS.skew : 0;
+  var skewSavedAt = 0, lastSkewPing = 0;
   function now() { return new Date(Date.now() + (cfg.mode === 'remote' ? skew : 0)); }
+  function loadSkew() {
+    var v = lsGet(K.skew, null);
+    if (typeof v === 'number' && isFinite(v)) return { skew: v, rtt: opts.skewMaxRtt, at: 0 };      // старий формат — число
+    return v && typeof v.skew === 'number' && isFinite(v.skew) ? { skew: v.skew, rtt: +v.rtt || opts.skewMaxRtt, at: +v.at || 0 } : null;
+  }
+  /* замір: server.now відповідає моменту (t0+t1)/2 з точністю ±rtt/2. Повільні відповіді (Apps Script — секунди)
+     теж годяться; лишаємо точніший замір, а новий беремо, якщо старий застарів або з ним не узгоджується
+     (годинник пристрою перевели). Змінилася поправка — виправляємо автоматичний час записів у черзі */
+  function skewSample(serverNow, t0, t1) {
+    var sv = Date.parse(serverNow), rtt = t1 - t0;
+    if (!serverNow || isNaN(sv) || rtt < 0 || rtt > opts.skewMaxRtt) return;
+    var v = sv - (t0 + t1) / 2, b = skewS, n = Date.now();
+    if (b && rtt > b.rtt && n - b.at < opts.skewStaleMs && Math.abs(v - b.skew) <= (rtt + b.rtt) / 2 + 1000) return;
+    var old = skew;
+    skewS = { skew: Math.round(v), rtt: rtt, at: n };
+    skew = v;
+    if (!b || Math.abs(v - old) > 1000 || n - skewSavedAt > 60000) { skewSavedAt = n; lsSet(K.skew, skewS); }
+    if (cfg.mode === 'remote') restamp();
+  }
+  /* записи з автоматичним часом, поставленим з іншою поправкою (напр., планшет з неточним годинником
+     записував офлайн ще до першого зв’язку), — зсунути їхній час на різницю поправок */
+  function restamp() {
+    var cur = Math.round(skew);
+    var off = function (op) { return op.auto_ts && Math.abs(cur - (op.skew || 0)) >= opts.restampMs; };
+    if (!loadQueue().some(off)) return;
+    mutateQueue(function (q) {
+      q.forEach(function (op) {
+        if (!off(op)) return;
+        var p = op.params || {}, t = Date.parse(p.ts), was = p.ts;
+        if (!isNaN(t)) {
+          p.ts = new Date(t + cur - (op.skew || 0)).toISOString();
+          if (p.then_event && p.then_event.ts === was) p.then_event.ts = p.ts;
+        }
+        op.skew = cur;
+      });
+    });
+    emit('queue', netInfo());
+  }
+  /* перед надсиланням записів з автоматичним часом, коли поправка ще невідома (або давня), — пінг, щоб її дізнатися */
+  function learnSkew() {
+    if (cfg.mode !== 'remote' || (skewS && Date.now() - skewS.at < opts.skewStaleMs) || Date.now() - lastSkewPing < 5 * 60000) return Promise.resolve();
+    if (!targetQueue().some(function (op) { return op.auto_ts; })) return Promise.resolve();
+    lastSkewPing = Date.now();
+    // after() уже взяв замір; без зв’язку — спробувати знову з наступним надсиланням
+    return call('ping', {}, { timeout: opts.probeTimeout }).then(function (r) { if (!r || r.client) lastSkewPing = 0; });
+  }
   function setOnline(v, e) {
     var was = net.online;
     net.online = v;
@@ -95,7 +149,9 @@ var Api = (function () {
       paused: paused ? assign({}, paused) : null, pending: q.length, pending_other: loadQueue().length - q.length,
       rejected: loadRejected().length, flushing: !!flushing, next_retry_at: nextAt > Date.now() ? nextAt : 0,
       last_ok_at: net.last_ok_at || 0, last_error: net.last_error ? assign({}, net.last_error) : null,
-      boot_at: bootMem && bootMem.target === target() ? bootMem.at : 0, skew_ms: cfg.mode === 'remote' ? Math.round(skew) : 0
+      boot_at: bootMem && bootMem.target === target() ? bootMem.at : 0, skew_ms: cfg.mode === 'remote' ? Math.round(skew) : 0,
+      skew_known: cfg.mode === 'remote' ? !!skewS : true, skew_rtt: cfg.mode === 'remote' && skewS ? skewS.rtt : 0,
+      storage_full: !!(memQ || memRj)
     };
   }
 
@@ -188,10 +244,36 @@ var Api = (function () {
     // решта ADMIN-записів ідемпотентні; лише save без id вставив би рядок удруге
     return a !== 'save' || !!(req.row && req.row.id);
   }
+  /* резервний JSONP — не назавжди: у фоні (не частіше ніж раз на gap мс, після перезавантаження — одразу)
+     перевіряємо POST пінгом; відповів сервер — повертаємося на POST і надсилаємо чергу */
+  var lastPostProbe = 0, postProbing = null;
+  function reprobePost(endpoint, token, gap) {
+    if (postProbing || transportFor(endpoint) !== 'jsonp') return postProbing || Promise.resolve(false);
+    if (lastPostProbe && Date.now() - lastPostProbe < gap) return Promise.resolve(false);
+    lastPostProbe = Date.now();
+    postProbing = post(endpoint, { action: 'ping', token: token, device: cfg.device }, opts.probeTimeout)
+      .then(function (r) { return !!(r && !r.client); }, function () { return false; })
+      .then(function (ok) {
+        postProbing = null;
+        if (ok && transportFor(endpoint) === 'jsonp') { setTransport(endpoint, 'post'); setTimeout(function () { flush(true); }, 0); }
+        return ok;
+      });
+    return postProbing;
+  }
   function remote(endpoint, token, req, o) {
     var body = assign({}, req, { token: token, device: req.device || cfg.device });
     if (typeof navigator !== 'undefined' && navigator.onLine === false) return Promise.resolve(err('NETWORK'));
-    if (transportFor(endpoint) === 'jsonp') return jsonp(endpoint, body, o.timeout);
+    if (transportFor(endpoint) === 'jsonp') {
+      reprobePost(endpoint, token, opts.postReprobeMs);
+      return jsonp(endpoint, body, o.timeout).then(function (r) {
+        if (!r || r.error !== 'TOO_LARGE') return r;
+        // запит задовгий для адреси JSONP — пробуємо основний канал (можливо, POST уже працює)
+        return post(endpoint, body, o.timeout).then(function (x) {
+          if (x && !x.client) setTransport(endpoint, 'post');
+          return x;
+        }, function () { return r; });
+      });
+    }
     return post(endpoint, body, o.timeout).catch(function (e) {
       if (e && e.name === 'AbortError') return err('TIMEOUT');
       // TypeError: мережа або CORS (POST міг і виконатися) — пробуємо резервний JSONP-канал
@@ -211,7 +293,13 @@ var Api = (function () {
         function (e) { return err('SERVER_ERROR', String(e && e.message || e)); });
     }
     if (cfg.mode !== 'remote' || !cfg.endpoint) return Promise.resolve(err('NOT_CONFIGURED'));
-    return remote(cfg.endpoint, cfg.token, req, o || {});
+    var p = remote(cfg.endpoint, cfg.token, req, o || {});
+    if (!isDevUrl(cfg.endpoint)) return p;
+    // адреса /dev (налаштовано раніше): помилку зв’язку пояснюємо причиною — анонімному пристрою вона не відповість
+    return p.then(function (r) {
+      var online = typeof navigator === 'undefined' || navigator.onLine !== false;
+      return r && r.client && online && (r.error === 'NETWORK' || r.error === 'BAD_RESPONSE') ? assign({}, r, { message: MSG.DEV_URL }) : r;
+    });
   }
 
   /* ------------------------------ виклик дії ------------------------------ */
@@ -234,13 +322,7 @@ var Api = (function () {
     if (cfg.mode === 'remote') {
       var down = r.ok === false && (r.error === 'NETWORK' || r.error === 'TIMEOUT' || r.error === 'BAD_RESPONSE');
       setOnline(!down, r.ok === false ? r : null);
-      if (r.now && t1 - t0 < opts.skewMaxRtt) {
-        var sv = Date.parse(r.now);
-        if (!isNaN(sv)) {
-          skew = sv - (t0 + t1) / 2;
-          if (Date.now() - skewSavedAt > 60000) { skewSavedAt = Date.now(); lsSet(K.skew, Math.round(skew)); }
-        }
-      }
+      if (r.now) skewSample(r.now, t0, t1);
     } else if (cfg.mode === 'local') setOnline(true);
     if (r.error === 'BAD_TOKEN') {
       if (!paused) { paused = { code: 'BAD_TOKEN', message: 'Невірний токен доступу — синхронізацію зупинено' }; emit('net', netInfo()); emit('queue', netInfo()); }
@@ -268,18 +350,22 @@ var Api = (function () {
     endpoint = String(endpoint || '').trim();
     token = String(token || '').trim();
     if (!/^https?:\/\//i.test(endpoint)) return Promise.resolve(err('BAD_REQUEST', 'Вкажіть повну адресу, що починається з https://'));
+    if (isDevUrl(endpoint)) return Promise.resolve(err('BAD_REQUEST', MSG.DEV_URL));
     var body = { action: 'ping', token: token, device: cfg.device };
-    var tr = 'post';
+    var tr = 'post', t0 = Date.now();
     var ping = post(endpoint, body, 20000).catch(function (e) {
       if (e && e.name === 'AbortError') return err('TIMEOUT');
       tr = 'jsonp';
+      t0 = Date.now();
       return jsonp(endpoint, body, 20000);
     });
     return ping.then(function (p) {
+      if (p && p.now) skewSample(p.now, t0, Date.now());
       if (!p.ok) return p;
-      var b2 = { action: 'bootstrap', token: token, device: cfg.device };
+      var b2 = { action: 'bootstrap', token: token, device: cfg.device }, t1 = Date.now();
       var bs = tr === 'post' ? post(endpoint, b2, 30000).catch(function () { return err('NETWORK'); }) : jsonp(endpoint, b2, 30000);
       return bs.then(function (b) {
+        if (b && b.now) skewSample(b.now, t1, Date.now());
         if (!b.ok) return b;
         if (tr === 'jsonp') probeCache[endpoint] = { ok: true, at: Date.now() };
         return { ok: true, transport: tr, version: p.version || b.version, company: (b.settings && b.settings.company) || p.company || '', boot: b };
@@ -291,38 +377,76 @@ var Api = (function () {
   }
 
   /* ------------------------------ черга записів ------------------------------ */
-  function loadQueue() { var q = lsGet(K.queue, []); return Array.isArray(q) ? q : []; }
+  /* Черга й відхилені — у localStorage. Сховище переповнене (напр., інший застосунок того ж сайту) → звільняємо
+     місце (кеш bootstrap, залишки демо-даних не в демо-режимі) і пробуємо ще раз; не вдалося — тримаємо список
+     у пам’яті вкладки (memQ / memRj), попереджаємо (net.storage_full, подія error STORAGE_FULL) і надсилаємо як завжди */
+  var memQ = null, memRj = null;
+  function freeSpace() {
+    var freed = false;
+    try {
+      var ls = window.localStorage;
+      if (ls.getItem(K.boot) !== null) { ls.removeItem(K.boot); freed = true; }          // кеш: завантажиться знову
+      var dk = (typeof LocalStore !== 'undefined' && LocalStore.KEY) || 'fl_lines_demo_v1';
+      if (cfg.mode !== 'local' && ls.getItem(dk) !== null) { ls.removeItem(dk); freed = true; }
+    } catch (e) { /* пропуск */ }
+    return freed;
+  }
+  function persist(k, v) { return lsSet(k, v) || (freeSpace() && lsSet(k, v)); }
+  function loadQueue() { if (memQ) return clone(memQ); var q = lsGet(K.queue, []); return Array.isArray(q) ? q : []; }
+  /* → true, якщо чергу збережено на пристрої */
   function saveQueue(q) {
-    if (!lsSet(K.queue, q)) console.warn('Api: не вдалося зберегти чергу записів');
+    var was = !!memQ;
+    if (persist(K.queue, q)) { memQ = null; if (was) emit('net', netInfo()); return true; }
+    memQ = clone(q);
+    console.warn('Api: не вдалося зберегти чергу записів — вона лише в пам’яті вкладки');
+    if (!was) emit('net', netInfo());
+    return false;
   }
   function mutateQueue(fn) { var q = loadQueue(); var r = fn(q); saveQueue(q); return r; }
-  function loadRejected() { var q = lsGet(K.rejected, []); return Array.isArray(q) ? q : []; }
+  function loadRejected() { if (memRj) return clone(memRj); var q = lsGet(K.rejected, []); return Array.isArray(q) ? q : []; }
+  function saveRejected(list) {
+    if (persist(K.rejected, list)) { memRj = null; return true; }
+    memRj = clone(list);
+    return false;
+  }
   function targetQueue() { var t = target(); return loadQueue().filter(function (op) { return op.target === t; }); }
 
   var waiters = {};
   var flushing = null, backoffIdx = 0, nextAt = 0, retryTimer = null;
+  var again = 0;            // запит на надсилання під час активного: 1 — звичайний, 2 — негайний (force)
   var recentAcks = [];
 
   /* Api.write(action, params, {wait}) — дія оператора (event | checklist | work | reading) через чергу.
      Задає id та ts (з поправкою годинника), якщо їх немає. → Promise:
        {ok:true, queued:false, op, data}  — сервер підтвердив (data — відповідь дії; data.duplicate — повтор);
        {ok:true, queued:true, op}         — збережено в черзі, надішлеться пізніше;
-       {ok:false, rejected:true, op, error, message} — сервер відхилив (запис у списку відхилених). */
+       {ok:false, rejected:true, op, error, message} — сервер відхилив (запис у списку відхилених);
+       {ok:false, queued:true, error:'STORAGE_FULL', op, message} — сховище пристрою переповнене: запис лише
+         в пам’яті вкладки (надішлеться, поки застосунок відкритий). */
   function write(action, params, o) {
     o = o || {};
     if (!QUEUEABLE[action]) return Promise.resolve(err('BAD_REQUEST', 'Дію «' + action + '» не можна ставити в чергу — використайте Api.call'));
     if (!target()) return Promise.resolve(err('NOT_CONFIGURED'));
     var p = clone(params || {});
     if (!p.id) p.id = newId();
-    if (!p.ts) p.ts = now().toISOString();
+    var autoTs = !p.ts;
+    if (autoTs) p.ts = now().toISOString();
     if (action === 'checklist' && p.then_event && typeof p.then_event === 'object' && !p.then_event.id) p.then_event.id = p.id + '-e';
     var op = { op_id: newId(), action: action, params: p, target: target(), queued_at: Date.now(), tries: 0, last_error: null, line_id: p.line_id || '' };
-    mutateQueue(function (q) { q.push(op); });
+    // час поставлено автоматично (не введено людиною) — його можна виправити, коли поправка годинника зміниться
+    if (autoTs) { op.auto_ts = true; op.skew = cfg.mode === 'remote' ? Math.round(skew) : 0; }
+    var q = loadQueue();
+    q.push(op);
+    var stored = saveQueue(q);
     emit('queue', netInfo());
+    if (!stored) emit('error', { op: clone(op), error: 'STORAGE_FULL', message: MSG.STORAGE_FULL });
     return new Promise(function (resolve) {
       var w = waiters[op.op_id] = { resolve: resolve, timer: null };
       var wait = o.wait !== undefined ? o.wait : opts.writeWait;
-      w.timer = setTimeout(function () { settle(op.op_id, { ok: true, queued: true, op: clone(op) }); }, wait);
+      w.timer = setTimeout(function () {
+        settle(op.op_id, stored ? { ok: true, queued: true, op: clone(op) }
+          : { ok: false, queued: true, error: 'STORAGE_FULL', message: MSG.STORAGE_FULL, op: clone(op) });
+      }, wait);
       flush(true);
     });
   }
@@ -345,36 +469,46 @@ var Api = (function () {
     var e = r && r.error;
     if (e === 'BAD_TOKEN') return 'pause';
     if (PERMANENT[e]) return 'reject';
+    if (e === 'TOO_LARGE') return 'defer';       // не блокує чергу: чекає на основний канал
     return 'retry';
   }
+  /* операція, завелика для JSONP: поки канал JSONP, її пропускаємо (решта черги йде далі) */
+  function isDeferred(op) { return !!(op.last_error && op.last_error.error === 'TOO_LARGE'); }
   function opReq(op) { return assign({ op_id: op.op_id, action: op.action }, op.params); }
   /* пакети: до batchMax операцій; для JSONP — ще й з обмеженням довжини адреси */
   function nextBatch(ops) {
     var out = [];
     var jp = cfg.mode === 'remote' && transportFor(cfg.endpoint) === 'jsonp';
     for (var i = 0; i < ops.length && out.length < opts.batchMax; i++) {
+      if (jp && isDeferred(ops[i])) continue;
       if (jp && out.length) {
         var probe = jsonpUrl(cfg.endpoint, { action: 'batch', token: cfg.token, device: cfg.device, ops: out.concat([ops[i]]).map(opReq) }, '__flj0000000000');
-        if (probe.length > opts.jsonpMaxUrl) break;
+        if (probe.length > opts.jsonpMaxUrl - 64) break;
       }
       out.push(ops[i]);
     }
     return out;
   }
-  /* надсилання черги (FIFO): Api.flush() — негайно, ігноруючи паузу між повторами */
+  /* надсилання черги (FIFO): Api.flush() — негайно, ігноруючи паузу між повторами.
+     Виклик під час активного надсилання запамʼятовується: одразу після нього — ще один прохід
+     (запис, доданий «на хвості» попереднього, не чекає страховочного таймера); проміс
+     активного надсилання тоді завершується разом із повторним проходом. */
   function flush(force) {
-    if (flushing) return flushing;
+    if (flushing) { again = Math.max(again, force ? 2 : 1); return flushing; }
     if (paused || !target()) return Promise.resolve(netInfo());
     if (!force && Date.now() < nextAt) return Promise.resolve(netInfo());
     if (!targetQueue().length) { backoffIdx = 0; nextAt = 0; return Promise.resolve(netInfo()); }
-    var acked = [], bootTouched = false;
-    flushing = (function loop() {
+    // є операції, завеликі для JSONP, — перевірити, чи не запрацював POST (на «Надіслати зараз» — частіше)
+    if (cfg.mode === 'remote' && targetQueue().some(isDeferred)) reprobePost(cfg.endpoint, cfg.token, force ? opts.postReprobeForceMs : opts.postReprobeMs);
+    var acked = [], bootTouched = false, regroup = 0;
+    flushing = learnSkew().then(function loop() {
       var ops = targetQueue();
       if (!ops.length || paused) return Promise.resolve('done');
       var batch = nextBatch(ops);
+      if (!batch.length) return Promise.resolve('done');     // лишилися тільки відкладені (завеликі для JSONP)
       emit('queue', netInfo());
       return sendOps(batch).then(function (res) {
-        var retry = false, stop = false;
+        var retry = false, stop = false, again2 = false;
         var byOp = {};
         batch.forEach(function (op) { byOp[op.op_id] = op; });
         var drop = {}, rejected = [], updates = {};
@@ -392,11 +526,16 @@ var Api = (function () {
           } else if (k === 'pause') {
             stop = true;
             updates[op.op_id] = { error: x.error, message: x.message };
+          } else if (k === 'defer') {
+            updates[op.op_id] = { error: x.error, message: x.message };     // лишається в черзі, решта йде далі
+          } else if (k === 'again' && regroup < 3) {
+            again2 = true;                                                // пакет переформується (канал став JSONP)
           } else {
             retry = true;
             updates[op.op_id] = { error: x.error, message: x.message };
           }
         });
+        if (again2) regroup++;
         mutateQueue(function (q) {
           for (var i = q.length - 1; i >= 0; i--) {
             var op = q[i];
@@ -404,10 +543,7 @@ var Api = (function () {
             else if (updates[op.op_id]) { op.tries = (op.tries || 0) + 1; op.last_error = updates[op.op_id]; op.last_try_at = Date.now(); }
           }
         });
-        if (rejected.length) {
-          var rj = loadRejected().concat(rejected);
-          lsSet(K.rejected, rj.slice(-200));
-        }
+        if (rejected.length) saveRejected(loadRejected().concat(rejected).slice(-200));
         acked.splice(0).forEach(function (a) {
           settle(a.op.op_id, { ok: true, queued: false, op: clone(a.op), data: a.data });
           emit('ack', { op: clone(a.op), data: a.data });
@@ -423,21 +559,27 @@ var Api = (function () {
         nextAt = 0;
         return loop();
       });
-    })().then(function () {
+    }).then(function () {
       flushing = null;
       if (bootTouched) persistBoot(true);
       emit('queue', netInfo());
-      return netInfo();
+      return rerun();
     }, function (e) {
       flushing = null;
       console.error('Api.flush', e);
       scheduleRetry();
       emit('queue', netInfo());
-      return netInfo();
+      return rerun();
     });
     return flushing;
   }
-  /* надсилає пакет; → [{op_id, kind:'ok'|'reject'|'retry'|'pause', data, error, message}] */
+  /* повторний прохід, якщо flush() викликали під час надсилання */
+  function rerun() {
+    var a = again;
+    again = 0;
+    return a ? flush(a === 2) : netInfo();
+  }
+  /* надсилає пакет; → [{op_id, kind:'ok'|'reject'|'retry'|'pause'|'defer'|'again', data, error, message}] */
   function sendOps(batch) {
     return call('batch', { ops: batch.map(opReq) }).then(function (r) {
       if (r && r.ok && Array.isArray(r.results)) {
@@ -465,7 +607,10 @@ var Api = (function () {
         }, Promise.resolve({ list: [], stop: null })).then(function (acc) { return acc.list; });
       }
       var kind = classify(r);
-      return batch.map(function (op) { return { op_id: op.op_id, kind: kind === 'reject' ? 'retry' : kind, error: r.error, message: r.message }; });
+      if (kind === 'reject') kind = 'retry';
+      // пакет складено для POST, а канал тим часом став JSONP — переформувати за довжиною адреси
+      if (kind === 'defer' && batch.length > 1) kind = 'again';
+      return batch.map(function (op) { return { op_id: op.op_id, kind: kind, error: r.error, message: r.message }; });
     });
   }
   function queue() { return targetQueue().map(clone); }
@@ -478,8 +623,9 @@ var Api = (function () {
       moved.push({ op_id: r.op_id, action: r.action, params: r.params, target: r.target || target(), queued_at: Date.now(), tries: 0, last_error: null, line_id: r.line_id || '' });
       return false;
     });
-    lsSet(K.rejected, list);
+    // спершу в чергу (щоб запис не загубився, якщо місця не вистачить), потім — зі списку відхилених
     if (moved.length) mutateQueue(function (q) { moved.forEach(function (m) { q.push(m); }); });
+    saveRejected(list);
     emit('queue', netInfo());
     flush(true);
     return moved.length;
@@ -487,7 +633,7 @@ var Api = (function () {
   function discardRejected(opId) {
     var list = loadRejected();
     var keep = opId === 'all' ? [] : list.filter(function (r) { return r.op_id !== opId; });
-    lsSet(K.rejected, keep);
+    saveRejected(keep);
     emit('queue', netInfo());
     return list.length - keep.length;
   }
@@ -505,7 +651,7 @@ var Api = (function () {
   function resume() { paused = null; backoffIdx = 0; nextAt = 0; emit('net', netInfo()); return flush(true); }
 
   /* ------------------------------ bootstrap і кеш ------------------------------ */
-  var bootMem = null, bootInflight = null;
+  var bootMem = null, bootInflight = null, bootReqAt = 0, bootNext = null, lastAckAt = 0;
   function cachedBoot() {
     var t = target();
     if (!t) return null;
@@ -522,8 +668,13 @@ var Api = (function () {
   }
   /* свіжий bootstrap → Promise<відповідь>; успіх оновлює кеш і генерує 'boot' */
   function boot() {
-    if (bootInflight) return bootInflight;
-    var reqAt = Date.now(), t = target();
+    if (bootInflight) {
+      if (lastAckAt <= bootReqAt) return bootInflight;
+      // після початку цього запиту прийшло підтвердження запису — відповідь може бути застарілою: ще один запит слідом
+      if (!bootNext) bootNext = bootInflight.then(function () { bootNext = null; return boot(); });
+      return bootNext;
+    }
+    var reqAt = bootReqAt = Date.now(), t = target();
     bootInflight = call('bootstrap', {}).then(function (r) {
       bootInflight = null;
       if (r && r.ok && target() === t) {
@@ -543,18 +694,15 @@ var Api = (function () {
     lsSet(K.boot, bootMem);
     emit('boot', data, { source: 'prime', at: bootMem.at });
   }
-  /* підтверджений запис одразу оновлює кешований стан лінії / строк ТО / лічильник */
-  function applyAck(op, data) {
-    if (!data || typeof data !== 'object') return false;
-    var b = cachedBoot(), touched = false;
-    if (data.status && data.status.line_id) {
-      recentAcks.push({ line_id: data.status.line_id, status: data.status, at: Date.now() });
-      if (b && b.status) { b.status[data.status.line_id] = data.status; touched = true; }
+  /* стан лінії / строк ТО / лічильник із підтвердження → у дані bootstrap b; → чи щось змінилося */
+  function mergeAck(b, data) {
+    var touched = false;
+    if (!b) return false;
+    if (data.status && data.status.line_id && b.status && typeof b.status === 'object') { b.status[data.status.line_id] = clone(data.status); touched = true; }
+    if (data.due && data.due.rule_id && Array.isArray(b.due)) {
+      for (var i = 0; i < b.due.length; i++) if (b.due[i].rule_id === data.due.rule_id) { b.due[i] = clone(data.due); touched = true; }
     }
-    if (b && data.due && data.due.rule_id && Array.isArray(b.due)) {
-      for (var i = 0; i < b.due.length; i++) if (b.due[i].rule_id === data.due.rule_id) { b.due[i] = data.due; touched = true; }
-    }
-    if (b && data.meter && data.meter.id && Array.isArray(b.meters)) {
+    if (data.meter && data.meter.id && Array.isArray(b.meters)) {
       b.meters.forEach(function (m) {
         if (m.id !== data.meter.id) return;
         ['value', 'value_ts', 'cur_value', 'cur_ts'].forEach(function (k) { if (has(data.meter, k)) m[k] = data.meter[k]; });
@@ -563,15 +711,30 @@ var Api = (function () {
     }
     return touched;
   }
-  /* bootstrap, запитаний ДО отримання підтвердження, може не містити запису — зберігаємо стан із підтвердження */
+  /* підтверджений запис одразу оновлює кешований стан лінії / строк ТО / лічильник */
+  function applyAck(op, data) {
+    if (!data || typeof data !== 'object') return false;
+    lastAckAt = Date.now();
+    if (data.status || data.due || data.meter) {
+      recentAcks.push({ status: data.status || null, due: data.due || null, meter: data.meter || null, at: lastAckAt });
+    }
+    return mergeAck(cachedBoot(), data);
+  }
+  /* bootstrap, запитаний ДО отримання підтвердження, може не містити запису — повертаємо в нього стан лінії,
+     строк ТО й лічильник із таких підтверджень (інакше щойно виконане ТО знову показалося б простроченим) */
   function keepAcks(r, reqAt) {
     var lim = Date.now() - opts.ackKeepMs;
     recentAcks = recentAcks.filter(function (a) { return a.at >= lim; });
-    recentAcks.forEach(function (a) { if (a.at > reqAt && r.status && has(r.status, a.line_id)) r.status[a.line_id] = a.status; });
+    recentAcks.forEach(function (a) {
+      if (a.at <= reqAt) return;
+      mergeAck(r, { status: a.status && r.status && has(r.status, a.status.line_id) ? a.status : null, due: a.due, meter: a.meter });
+    });
   }
 
   /* ------------------------------ оптимістичний стан лінії ------------------------------ */
-  function applyEvent(s, e) {
+  /* подія черги поверх стану. Позначка — як у ядрі: «без чек-листа» лише для ЗАПУСКУ (перше «Працює» після
+     «Не працює»; ctx.ran — чи працювала лінія відтоді), а не для повернення в роботу після налаштування / ремонту */
+  function applyEvent(s, e, ctx) {
     var prev = s.state;
     s.state = e.state;
     s.since = e.ts;
@@ -581,10 +744,25 @@ var Api = (function () {
     s.reason = e.reason || '';
     s.note = e.note || '';
     s.event_id = e.id || s.event_id;
-    if (e.state === 'run' && prev !== 'run' && prev !== 'stop' && !s.start_check_valid) s.flag = 'no_checklist';
+    var isStart = e.state === 'run' && !ctx.ran;
+    if (isStart && ctx.requireStart && !s.start_check_valid) s.flag = 'no_checklist';
     else s.flag = e.forced ? 'forced' : '';
-    if (e.state === 'off') s.work_since = null;
-    else if (prev === 'off' || !s.work_since) s.work_since = e.ts;
+    if (e.state === 'off') {
+      s.work_since = null;
+      ctx.ran = false;
+      if (prev !== 'off') s.start_check_valid = false;     // чек-лист запуску чинний до завершення роботи
+    } else {
+      if (prev === 'off' || !s.work_since) s.work_since = e.ts;
+      if (e.state === 'run' || e.state === 'stop') ctx.ran = true;
+    }
+  }
+  /* чи працювала лінія після останнього «Не працює» (за статусом bootstrap). Для налаштування / миття / ТО /
+     ремонту точно не відомо: якщо цей стан сам почав роботу (since = work_since) — ні, інакше вважаємо, що так */
+  function ranSinceOff(s) {
+    if (has(s, 'ran_since_off')) return !!s.ran_since_off;
+    if (s.state === 'run' || s.state === 'stop') return true;
+    if (!s.state || s.state === 'off' || !s.work_since) return false;
+    return Date.parse(s.work_since) < Date.parse(s.since);
   }
   /* стан лінії з кешу + незавершені операції черги (FIFO); s.pending = кількість таких операцій */
   function lineStatus(lineId, bootData) {
@@ -594,12 +772,13 @@ var Api = (function () {
       cum_h: 0, starts: 0, today_h: 0, last_check: null, start_check_valid: false, long_run: false, work_since: null };
     s.as_of = b ? b.now : null;
     s.pending = 0;
+    var ctx = { ran: ranSinceOff(s), requireStart: !(b && b.settings && b.settings.require_start_checklist === false) };
     targetQueue().forEach(function (op) {
       var p = op.params || {};
       if (p.line_id !== lineId) return;
       if (op.action === 'event') {
         s.pending++;
-        applyEvent(s, p);
+        applyEvent(s, p, ctx);
       } else if (op.action === 'checklist') {
         s.pending++;
         s.last_check = { id: p.id, ts: p.ts, occasion: p.occasion, result: null, pending: true };
@@ -607,7 +786,7 @@ var Api = (function () {
         var te = p.then_event;
         if (te && te.state) {
           applyEvent(s, { id: te.id, ts: te.ts || p.ts, state: te.state, product: te.product || p.product, operator: p.operator,
-            staff_id: p.staff_id, reason: te.reason, note: te.note, forced: !!p.forced });
+            staff_id: p.staff_id, reason: te.reason, note: te.note, forced: !!p.forced }, ctx);
         }
       }
     });
@@ -644,7 +823,7 @@ var Api = (function () {
     lineStatus: lineStatus, dueFor: dueFor,
     net: netInfo, now: now, skew: function () { return cfg.mode === 'remote' ? skew : 0; }, newId: newId,
     adminLogin: adminLogin, adminLogout: adminLogout, isAdmin: isAdmin,
-    testConnection: testConnection,
+    testConnection: testConnection, isDevUrl: isDevUrl,
     isRead: function (a) { return !!ACT[a] && !ACT[a].write; },
     QUEUEABLE: QUEUEABLE
   };

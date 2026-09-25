@@ -124,11 +124,17 @@ var LinesCore = (function () {
     }
     return s;
   }
-  /* 12 символів base36: 7 — час (секунди), 5 — випадкові */
+  /* 12 символів base36: 7 — час (секунди), 5 — випадкові; у межах секунди на цьому пристрої
+     не повторюються (інакше записи однієї дії в черзі сервер прийняв би за повтор) */
+  var uuidSec = '', uuidSeen = {};
   function uuid() {
-    var t = Math.floor(Date.now() / 1000).toString(36);
+    var t = Math.floor(Date.now() / 1000).toString(36), id;
     while (t.length < 7) t = '0' + t;
-    return t.slice(-7) + rand36(5);
+    t = t.slice(-7);
+    if (t !== uuidSec) { uuidSec = t; uuidSeen = {}; }
+    do { id = t + rand36(5); } while (uuidSeen[id] === 1);
+    uuidSeen[id] = 1;
+    return id;
   }
 
   /* глибока копія відповіді з перетворенням Date → ISO-рядок */
@@ -441,7 +447,7 @@ var LinesCore = (function () {
       col('sort', 'Порядок', 'num'), col('active', 'Активний', 'bool', { def: true }), col('created', 'Створено', 'date')] },
     staff: { sheet: 'Персонал', pk: 'id', kind: 'config', cols: [
       col('id', 'ID', 'id'), col('name', 'ПІБ'), col('role', 'Посада', 'enum:role', { def: 'operator' }),
-      col('line_ids', 'Лінії', 'ids'), col('email', 'Email'), col('pin', 'PIN', 'str', { secret: true }),
+      col('line_ids', 'Лінії', 'ids'), col('email', 'Email'), col('pin', 'PIN', 'str', { secret: true, pin: true }),
       col('sort', 'Порядок', 'num'), col('active', 'Активний', 'bool', { def: true })] },
     events: { sheet: 'Журнал стану', pk: 'id', kind: 'log', cols: [
       col('id', 'ID', 'id'), col('ts', 'Час', 'date'), col('line_id', 'ID лінії', 'id'), col('state', 'Стан', 'enum:state'),
@@ -454,7 +460,7 @@ var LinesCore = (function () {
       col('line_id', 'ID лінії', 'id'), col('occasion', 'Коли', 'enum:occasion'), col('operator', 'Оператор'),
       col('staff_id', 'ID працівника', 'id'), col('product', 'Продукт / формат'),
       col('result', 'Результат', 'enum:check_result'), col('total', 'Пунктів', 'num'), col('failed', 'Зауважень', 'num'),
-      col('out_of_range', 'Поза нормою', 'num'), col('missing', 'Не заповнено', 'num'),
+      col('out_of_range', 'Поза нормою', 'num'), col('missing', 'Не заповнено', 'num'), col('na', 'Н/З', 'num'),
       col('comment', 'Коментар')].concat(logTail()) },
     answers: { sheet: 'Чек-листи — відповіді', pk: 'id', kind: 'log', cols: [
       col('id', 'ID', 'id'), col('check_id', 'ID чек-листа', 'id'), col('ts', 'Час', 'date'),
@@ -511,7 +517,7 @@ var LinesCore = (function () {
     { key: 'instant_repair', type: 'bool', def: true, note: 'Одразу надсилати лист про ремонт / аварійну зупинку' },
     { key: 'warn_days', type: 'num', def: 7, min: 0, max: 365, note: 'Попереджати про ТО за стільки днів' },
     { key: 'warn_pct', type: 'num', def: 90, min: 1, max: 100, pct: true, note: 'Попереджати про ТО з такого % інтервалу' },
-    { key: 'checklist_valid_hours', type: 'num', def: 12, min: 1, max: 72, note: 'Скільки годин чинний чек-лист запуску' },
+    { key: 'checklist_valid_hours', type: 'num', def: 12, min: 1, max: 72, note: 'Скільки годин чинний чек-лист запуску (після завершення роботи лінії потрібен новий)' },
     { key: 'require_start_checklist', type: 'bool', def: true, note: 'Вимагати чек-лист перед запуском лінії' },
     { key: 'require_end_checklist', type: 'bool', def: true, note: 'Вимагати чек-лист при завершенні роботи' },
     { key: 'avg_window_days', type: 'num', def: 28, min: 1, max: 365, int: true, note: 'За скільки днів рахувати середнє напрацювання' },
@@ -570,7 +576,8 @@ var LinesCore = (function () {
   function normVal(c, v, kit) {
     if (isBlank(v) && c.def !== undefined) return cloneVal(c.def);
     switch (c.base) {
-      case 'id': case 'str': return toStr(v);
+      // PIN: апостроф, яким у таблиці зберігають провідні нулі («'0427»), — не частина PIN
+      case 'id': case 'str': return c.pin ? toStr(v).replace(/^'\s*/, '') : toStr(v);
       case 'num': return toNum(v);
       case 'bool':
         if (c.nullable && isBlank(v)) return null;
@@ -672,6 +679,17 @@ var LinesCore = (function () {
     }
     return n;
   };
+  /* необовʼязковий метод сховища: сирі рядки, де стовпець col дорівнює value (можна й із зайвими — ядро фільтрує).
+     Сховище без нього (або що повертає null) ядро обходить читанням вікна / усього журналу */
+  MemoryStore.prototype.findBy = function (t, col, value) {
+    var c = COLS[t] && COLS[t][col], v = toStr(value), rows = this._rows(t), out = [];
+    for (var i = 0; i < rows.length; i++) {
+      var x = rows[i][col];
+      if (x === undefined && c) x = rows[i][c.t];
+      if (toStr(x) === v) out.push(rows[i]);
+    }
+    return out;
+  };
   MemoryStore.prototype.replace = function (t, rows) { this.data[t] = (rows || []).map(copy); return this.data[t].length; };
   MemoryStore.prototype.lock = function (fn) { return fn(); };
   MemoryStore.prototype.toJSON = function () { return this.data; };
@@ -739,6 +757,7 @@ var LinesCore = (function () {
     for (i = 0; i < 8; i++) { var s = (H[i] >>> 0).toString(16); while (s.length < 8) s = '0' + s; hex += s; }
     return hex;
   }
+  var PIN_RE = /^\d{4,8}$/;
   function pinHash(id, pin) { return pin ? sha256(String(id) + ':' + String(pin)) : null; }
 
   /* ------------------------------ помилки ------------------------------ */
@@ -846,6 +865,8 @@ var LinesCore = (function () {
             if (has(seen, n.id)) { issues.push({ table: t, sheet: sc.sheet, id: n.id, name: n.name || n.title || n.text || '', problem: 'duplicate' }); return; }
             seen[n.id] = 1;
           }
+          // PIN не з 4–8 цифр (напр. 427 — клітинка втратила текстовий формат і провідний нуль): увійти з ним не вийде
+          if (t === 'staff' && n.pin && !PIN_RE.test(n.pin)) issues.push({ table: t, sheet: sc.sheet, id: n.id, name: n.name, problem: 'bad_pin' });
           out.push(n);
         });
         c[t] = out;
@@ -912,6 +933,35 @@ var LinesCore = (function () {
       var rows = store.since(t, new Date(ts.getTime() - DAY)) || [];
       for (var i = rows.length - 1; i >= 0; i--) if (toStr(rows[i].id) === id) return norm(t, rows[i], kit());
       return null;
+    }
+    /* записи журналу, де col = value, — через store.findBy (сховище шукає без читання всього аркуша);
+       null — сховище так не вміє (тоді викликач читає вікно або весь журнал) */
+    function logBy(t, col, value) {
+      if (typeof store.findBy !== 'function') return null;
+      var v = toStr(value), raw = store.findBy(t, col, v);
+      if (!raw) return null;
+      var k = kit();
+      return raw.map(function (r) { return norm(t, r, k); }).filter(function (r) { return !!r.ts && toStr(r[col]) === v; });
+    }
+    /* свіжий запис (ts з клієнта / запису) дешевше знайти вікном від ts — аркуш читається знизу;
+       давній — через findBy сховища (інакше вікно від ts читало б майже весь журнал) */
+    var RECENT = 14 * DAY;
+    function isRecent(ts) { return !!ts && ts.getTime() >= nowD().getTime() - RECENT; }
+    /* запис журналу за id (анулювання / перегляд): вікно від ts ↔ findBy сховища, в останню чергу — увесь журнал */
+    function locateLog(t, id, ts) {
+      var row = null, rows = null;
+      var near = function () { return ts ? findLog(t, id, new Date(ts.getTime() + DAY / 2)) : null; };
+      if (isRecent(ts) && (row = near())) return row;
+      rows = logBy(t, 'id', id);
+      if (!rows && !isRecent(ts) && (row = near())) return row;
+      if (!rows) rows = logAll(t);
+      for (var i = 0; i < rows.length; i++) if (rows[i].id === id) row = rows[i];
+      return row;
+    }
+    /* відповіді чек-листа (вставлені разом із ним, ts той самий) */
+    function answersOf(chk) {
+      var rows = isRecent(chk.ts) ? null : logBy('answers', 'check_id', chk.id);
+      return (rows || logSince('answers', new Date(chk.ts.getTime() - DAY))).filter(function (a) { return a.check_id === chk.id; });
     }
     function byTs(a, b) {
       var d = a.ts.getTime() - b.ts.getTime();
@@ -1042,6 +1092,8 @@ var LinesCore = (function () {
       }
       return null;
     }
+    /* перехід лінії в «Не працює» (завершення роботи) — після нього потрібен новий чек-лист запуску */
+    function isOffTr(e) { return e.state === 'off' && e.prev_state !== 'off'; }
     /* відрізки стану лінії у вікні [from, to); evs — непогашені події лінії за зростанням ts */
     function segments(line, evs, from, to) {
       var f = toMs(from), t = toMs(to), out = [];
@@ -1111,14 +1163,28 @@ var LinesCore = (function () {
       for (i = evs.length - 1; i >= 0; i--) if (evs[i].id === line.cur_event) { last = evs[i]; break; }
       var today = 0, segs = segments(line, evs, K.start(K.key(now)), now);
       for (i = 0; i < segs.length; i++) if (segs[i].state === 'run') today += segs[i].hours;
-      var lastCheck = null, valid = false, vFrom = t - S.checklist_valid_hours * HOUR;
+      var lastCheck = null, newest = -Infinity, vFrom = t - S.checklist_valid_hours * HOUR;
       for (i = 0; i < checks.length; i++) {
-        var c = checks[i];
+        var c = checks[i], x = c.ts.getTime();
         if (c.void || c.line_id !== line.id) continue;
         if (!lastCheck || c.ts >= lastCheck.ts) lastCheck = c;
-        if (c.occasion === 'start' && c.ts.getTime() >= vFrom && c.ts.getTime() <= t + FUTURE_SLACK) valid = true;
+        if (c.occasion === 'start' && x >= vFrom && x <= t + FUTURE_SLACK && x > newest) newest = x;
+      }
+      // чек-лист запуску чинний до першого переходу лінії в «Не працює» після нього (нова зміна — новий чек-лист)
+      var valid = false;
+      if (newest > -Infinity) {
+        var f0 = from ? toMs(from) : (evs.length ? evs[0].ts.getTime() : t);
+        var offs = f0 > newest ? lineEvents(line.id, new Date(newest)) : evs;
+        valid = !offs.some(function (e) { var y = e.ts.getTime(); return isOffTr(e) && y >= newest && y <= t + FUTURE_SLACK; });
       }
       var workSince = st !== 'off' ? workStart(line, evs, from, now) : null;
+      // чи була лінія в «Працює» / «Простій» після останнього «Не працює» (як ran у addEvent: наступне «Працює» — не запуск)
+      var ran = st === 'off' ? false : (st === 'run' || st === 'stop') ? true : ranBefore(evs, evs.length - 1);
+      if (ran === null) {
+        var fr = from ? toMs(from) : (evs.length ? evs[0].ts.getTime() : t);
+        if (fr > t - ORDER_WINDOW) { var deep = lineEvents(line.id, new Date(t - ORDER_WINDOW)); ran = ranBefore(deep, deep.length - 1); }
+        ran = !!ran;
+      }
       return {
         line_id: line.id, state: st, since: line.cur_since || null, product: line.cur_product || '',
         operator: line.cur_operator || '', staff_id: last ? last.staff_id : '', event_id: line.cur_event || '',
@@ -1127,13 +1193,14 @@ var LinesCore = (function () {
         last_check: lastCheck ? { id: lastCheck.id, ts: lastCheck.ts, occasion: lastCheck.occasion, result: lastCheck.result } : null,
         start_check_valid: valid,
         long_run: !!(st !== 'off' && workSince && (t - workSince.getTime()) / HOUR >= S.long_run_hours),
-        work_since: workSince
+        work_since: workSince, ran_since_off: ran
       };
     }
     function statusFor(lineId, now) {
       var S = settings(), K = kit(), line = find('lines', lineId);
       if (!line) return null;
-      var from = Math.min(K.start(K.key(now)).getTime(), now.getTime() - (S.long_run_hours + 1) * HOUR);
+      var from = Math.min(K.start(K.key(now)).getTime(), now.getTime() - (S.long_run_hours + 1) * HOUR,
+        now.getTime() - S.checklist_valid_hours * HOUR - FUTURE_SLACK);
       var evs = lineEvents(line.id, new Date(from));
       var cf = now.getTime() - Math.max(7 * DAY, S.checklist_valid_hours * HOUR);
       var checks = logSince('checks', new Date(cf)).filter(function (c) { return c.line_id === line.id && !c.void; }).sort(byTs);
@@ -1168,6 +1235,20 @@ var LinesCore = (function () {
       if (k < 0) rs = logAll('readings').filter(mine).sort(byTs);   // опори у вікні немає — уся історія
       else rs = rs.slice(k);
       return r4(walkMeter(rs, m.mode));
+    }
+    /* значення лічильника на T як відлік регламенту. До першого показника значення невідоме: для накопичувального
+       обліку відлік — перший показник (інакше весь показник табло став би «напрацюванням»), для приросту — 0 */
+    function meterRefAt(m, T) {
+      if (!m) return 0;
+      var t = toMs(T);
+      if (m.cur_ts && t < m.cur_ts.getTime()) {
+        var first = null;
+        logAll('readings').forEach(function (r) {
+          if (r.meter_id === m.id && !r.void && (!first || byTs(r, first) < 0)) first = r;
+        });
+        if (first && first.ts.getTime() > t) return (first.mode || m.mode || 'abs') === 'inc' ? 0 : r4(first.value || 0);
+      }
+      return r4(meterValueAt(m, T));
     }
     /* середній приріст лічильника за добу у вікні */
     function meterAvg(m, rs, from, now) {
@@ -1347,16 +1428,34 @@ var LinesCore = (function () {
         var p = { id: r.id }, n = 0, ref = r.base_date || r.created;
         if (!ref) { p.created = at; p.base_date = at; ref = at; n++; }
         if (r.base_hours === null && line) { p.base_hours = cumAt(line, ref); n++; }
-        if (r.base_meter === null && meter) { p.base_meter = r4(meterValueAt(meter, ref)); n++; }
+        if (r.base_meter === null && meter) { p.base_meter = meterRefAt(meter, ref); n++; }
         if (n) patches.push(p);
       });
       if (!patches.length) return;
       if (readOnly) patchCached('rules', patches);
       else patchRows('rules', patches);
     }
+    /* агрегати, додані прямо в таблиці (без «Мотогодини лінії при додаванні»): напрацювання — від «Створено»
+       (порожньо — від першого розрахунку), а не вся історія лінії. Як і для регламентів: READ — лише в пам'яті */
+    function initSheetUnits() {
+      var at = nowD(), patches = [];
+      tbl('units').forEach(function (u) {
+        if (!u.id || u.base_cum !== null) return;
+        var line = find('lines', u.line_id);
+        if (!line) return;
+        var p = { id: u.id }, ref = u.created;
+        if (!ref) { p.created = at; ref = at; }
+        p.base_cum = cumAt(line, ref);
+        patches.push(p);
+      });
+      if (!patches.length) return;
+      if (readOnly) patchCached('units', patches);
+      else patchRows('units', patches);
+    }
+    function initSheetRows() { initSheetRules(); initSheetUnits(); }
     function dueList(now) {
       now = now ? (isDate(now) ? now : parseDate(now, kit()) || nowD()) : nowD();
-      initSheetRules();
+      initSheetRows();
       var dc = dueCtx(now);
       return activeRules().map(function (r) { return computeDue(r, dc); }).sort(dueSort);
     }
@@ -1464,7 +1563,7 @@ var LinesCore = (function () {
           chs.forEach(function (c) {
             var x = c.ts.getTime();
             if (x < bd.a || x >= bd.b) return;
-            dayChecks.push({ id: c.id, ts: c.ts, occasion: c.occasion, result: c.result });
+            dayChecks.push({ id: c.id, ts: c.ts, occasion: c.occasion, result: c.result, na: c.na || 0 });
             if ((c.occasion === 'start' || c.occasion === 'changeover') && (c.result === 'remarks' || c.result === 'fail')) badCheck = true;
           });
           var runH = clipHours(segs, bd.a, Math.min(bd.b, last)).run;
@@ -1515,19 +1614,20 @@ var LinesCore = (function () {
           if (x < A || x >= Bw) return;
           wbt[w.work_type] = (wbt[w.work_type] || 0) + 1;
         });
-        var ch = { n: 0, ok: 0, remarks: 0, fail: 0, oor: 0 };
+        var ch = { n: 0, ok: 0, remarks: 0, fail: 0, oor: 0, na: 0 };
         (data.checkBy[l.id] || []).forEach(function (c) {
           var x = c.ts.getTime();
           if (x < A || x >= Bw) return;
           ch.n++;
           if (c.result === 'ok') ch.ok++; else if (c.result === 'remarks') ch.remarks++; else if (c.result === 'fail') ch.fail++;
           ch.oor += c.out_of_range || 0;
+          ch.na += c.na || 0;
         });
         var total = 0;
         for (var k in hours) if (has(hours, k)) total += hours[k];
         res[l.id] = { hours: hours, total_h: r4(total), starts: starts, stops_by_reason: roundMap(stops), repairs: repairs,
           repair_h: hours.repair, works_by_type: wbt, checks: ch.n, checks_ok: ch.ok, checks_remarks: ch.remarks,
-          checks_fail: ch.fail, out_of_range: ch.oor };
+          checks_fail: ch.fail, out_of_range: ch.oor, checks_na: ch.na };
       });
       return res;
     }
@@ -1607,6 +1707,7 @@ var LinesCore = (function () {
     }
     function bootstrap(ctx) {
       ctx = ctx || {};
+      initSheetRows();
       var admin = !!ctx.admin, now = nowD(), S = settings(), dc = dueCtx(now);
       var lineOk = {};
       var lines = tbl('lines').filter(function (l) { if (admin || l.active) { lineOk[l.id] = 1; return true; } return false; }).sort(bySort);
@@ -1668,11 +1769,9 @@ var LinesCore = (function () {
     function checkDetail(p) {
       var id = toStr(p.id);
       if (!id) throw bad('Не вказано ID чек-листа');
-      var chk = null, ts = asDate(p.ts);
-      if (ts) chk = findLog('checks', id, new Date(ts.getTime() + DAY / 2));
-      if (!chk) { var all = logAll('checks'); for (var i = 0; i < all.length; i++) if (all[i].id === id) chk = all[i]; }
+      var chk = locateLog('checks', id, asDate(p.ts));
       if (!chk) throw notFound('Чек-лист не знайдено: ' + id);
-      var answers = logSince('answers', new Date(chk.ts.getTime() - DAY)).filter(function (a) { return a.check_id === id; });
+      var answers = answersOf(chk);
       var idx = function (a) { var m = /-(\d+)$/.exec(a.id); return m ? +m[1] : 0; };
       answers.sort(function (a, b) { return idx(a) - idx(b); });
       return { ok: true, check: chk, answers: answers };
@@ -1718,20 +1817,35 @@ var LinesCore = (function () {
       });
       return res;
     }
+    /* день заводу YYYY-MM-DD з параметра — лише справжня дата (не 2026-02-30), інакше '' */
+    function dayParam(v) {
+      if (!isKey(v)) return '';
+      v = v.trim();
+      return keyAdd(v, 0) === v ? v : '';
+    }
     function dashboard(p) {
-      var now = nowD(), K = kit(), days = daysParam(p && p.days, 14);
-      var todayKey = K.key(now), fromKey = keyAdd(todayKey, -(days - 1)), from = K.start(fromKey), keys = [];
-      for (var k = fromKey; k <= todayKey; k = keyAdd(k, 1)) keys.push(k);
+      p = p || {};
+      var now = nowD(), K = kit(), todayKey = K.key(now), days = daysParam(p.days, 14);
+      // необов'язковий період {from, to} (дні заводу, не довше 62 днів, не пізніше сьогодні); інакше — останні days днів
+      var pf = dayParam(p.from), pt = dayParam(p.to);
+      var toKey = pt && pt < todayKey ? pt : todayKey;
+      var fromKey = pf && pf <= toKey ? pf : keyAdd(toKey, -(days - 1));
+      if (keyDiff(fromKey, toKey) >= 62) fromKey = keyAdd(toKey, -61);
+      var live = toKey === todayKey;
+      var from = K.start(fromKey), end = live ? now : K.start(keyAdd(toKey, 1)), keys = [];
+      for (var k = fromKey; k <= toKey; k = keyAdd(k, 1)) keys.push(k);
       var lines = activeLines(), data = loadWindow(from, lines), ids = lines.map(function (l) { return l.id; });
       var comp = complianceData(keys, lines, data, now);
       var status = {};
+      // стан ліній і план ТО — завжди «зараз», незалежно від періоду
       lines.forEach(function (l) { status[l.id] = statusOf(l, data.evBy[l.id] || [], data.checkBy[l.id] || [], now, from); });
       return {
-        ok: true, from: from, to: now, days: keys,
+        ok: true, from: from, to: end, days: keys,
         compliance: comp, compliance_pct: compliancePct(comp),
-        stats: statsData(from, now, lines, data, now),
+        stats: statsData(from, end, lines, data, now),
         daily: dailyData(keys, lines, data, now),
-        issues: issuesData(from, now, ids, data, 30),
+        // межа минулого періоду виключна (issuesData бере ts ≤ to)
+        issues: issuesData(from, live ? end : new Date(end.getTime() - 1), ids, data, 30),
         due: dueList(now),
         status: status
       };
@@ -1748,15 +1862,31 @@ var LinesCore = (function () {
         return c.line_id === lineId && !c.void && c.occasion === 'start' && c.ts.getTime() <= b;
       });
     }
-    function hasStartCheck(checks, ts) {
-      var S = settings(), t = ts.getTime(), a = t - S.checklist_valid_hours * HOUR, b = t + FUTURE_SLACK;
-      return checks.some(function (c) { var x = c.ts.getTime(); return x >= a && x <= b; });
+    /* чинний чек-лист запуску для запуску о ts: у вікні [ts − checklist_valid_hours, ts + 2 хв] і пізніший
+       за останній перехід лінії в «Не працює» до запуску (offFn → мс, ліниво; -Infinity — не було) */
+    function hasStartCheck(checks, ts, offFn) {
+      var S = settings(), t = ts.getTime(), a = t - S.checklist_valid_hours * HOUR, b = t + FUTURE_SLACK, nb = -Infinity;
+      checks.forEach(function (c) { var x = c.ts.getTime(); if (x >= a && x <= b && x > nb) nb = x; });
+      if (nb === -Infinity) return false;
+      return !offFn || offFn() < nb;
+    }
+    /* останній перехід лінії в «Не працює» не пізніше ref (подія — з урахуванням порядку byTs, або момент часу).
+       Читаємо лише вікно чинності чек-листа: давніші переходи на чинність уже не впливають */
+    function lastOffUpTo(lineId, ref) {
+      var isEv = !!(ref && ref.ts), t = isEv ? ref.ts.getTime() : toMs(ref);
+      var evs = lineEvents(lineId, new Date(t - settings().checklist_valid_hours * HOUR - FUTURE_SLACK));
+      for (var i = evs.length - 1; i >= 0; i--) {
+        var e = evs[i];
+        if (isEv ? byTs(e, ref) > 0 : e.ts.getTime() > t) continue;
+        if (isOffTr(e)) return e.ts.getTime();
+      }
+      return -Infinity;
     }
     /* позначка події: запуск без чинного чек-листа запуску → no_checklist (навіть коли клієнт просить 'forced');
        'forced' — запуск попри зауваження; завершення без чек-листа → no_end_checklist */
-    function flagFor(e, prevState, isStart, wantForced, getChecks) {
+    function flagFor(e, prevState, isStart, wantForced, getChecks, offFn) {
       var S = settings();
-      if (isStart && S.require_start_checklist && !hasStartCheck(getChecks(), e.ts)) return 'no_checklist';
+      if (isStart && S.require_start_checklist && !hasStartCheck(getChecks(), e.ts, offFn)) return 'no_checklist';
       if (wantForced) return 'forced';
       if (e.state === 'off' && prevState !== 'off' && S.require_end_checklist && !e.ref_id) return 'no_end_checklist';
       return '';
@@ -1784,12 +1914,20 @@ var LinesCore = (function () {
       var prev = anchor ? { state: anchor.state, ts: anchor.ts, cum_h: anchor.cum_h || 0, starts: anchor.starts || 0 } : null;
       var ran = anchor ? !!ranAtAnchor : false;
       var patches = [], from = Infinity;
+      // останній перехід в «Не працює»: серед перерахованих подій, інакше — до опорної події включно (ліниво)
+      var lastOff = null, offPrev = null;
+      var offAt = function () {
+        if (lastOff !== null) return lastOff;
+        if (offPrev === null) offPrev = anchor ? lastOffUpTo(line.id, anchor) : -Infinity;
+        return offPrev;
+      };
       list.forEach(function (e, i) {
         var ps = prev ? prev.state : 'off';
         var cum = prev ? r4(prev.cum_h + (prev.state === 'run' ? (e.ts.getTime() - prev.ts.getTime()) / HOUR : 0)) : 0;
         var start = e.state === 'run' && !ran;
         var st = (prev ? prev.starts : 0) + (start ? 1 : 0);
-        var fl = flagFor(e, ps, start, e.flag === 'forced', getChecks);
+        var fl = flagFor(e, ps, start, e.flag === 'forced', getChecks, offAt);
+        if (e.state === 'off' && ps !== 'off') lastOff = e.ts.getTime();
         var cumChanged = e.prev_state !== ps || e.cum_h === null || Math.abs(e.cum_h - cum) > 1e-4;
         if (cumChanged || e.starts !== st || e.flag !== fl) {
           patches.push({ id: e.id, prev_state: ps, cum_h: cum, starts: st, flag: fl });
@@ -1863,6 +2001,19 @@ var LinesCore = (function () {
       var res = recomputeSeq(line, null, list, false);
       var from = Math.min(res.from, opt.from === undefined ? Infinity : opt.from);
       refreshSnaps(line.id, from, opt.oldFn || null, opt.works || null, list);
+      return { ok: true, line_id: line.id, events: list.length, changed: res.changed };
+    }
+    /* перерахунок подій лінії від моменту T (анулювання): опорна подія — остання раніше T у вікні ORDER_WINDOW,
+       як для подій «із минулого»; без опори у вікні — уся історія. win — уже прочитані події лінії від T − ORDER_WINDOW */
+    function recomputeFromI(line, T, oldFn, win) {
+      var t = toMs(T);
+      var list = (win || lineEvents(line.id, new Date(t - ORDER_WINDOW))).filter(function (e) { return !e.void; }).sort(byTs);
+      var idx = -1;
+      for (var i = 0; i < list.length; i++) if (list[i].ts.getTime() < t) idx = i;
+      var ran = idx >= 0 ? ranBefore(list, idx) : null;
+      if (ran === null) return recomputeLineI(line.id, null, { from: t, oldFn: oldFn || null });
+      var res = recomputeSeq(line, list[idx], list.slice(idx + 1), ran);
+      refreshSnaps(line.id, Math.min(t, res.from), oldFn || null, null, list);
       return { ok: true, line_id: line.id, events: list.length, changed: res.changed };
     }
     /* чи працювала лінія після останнього «Не працює» до моменту ts (для переходу в «Працює» не з off/run/stop) */
@@ -1940,7 +2091,8 @@ var LinesCore = (function () {
       ev.starts = (prev ? prev.starts : 0) + (isStart ? 1 : 0);
       if (!ev.product && state !== 'off' && prev) ev.product = prev.product || '';
       if (!ev.operator && prev) ev.operator = prev.operator || '';
-      ev.flag = flagFor(ev, ev.prev_state, isStart, isTrue(p.forced), function () { return startChecks(line.id, ts, ts); });
+      ev.flag = flagFor(ev, ev.prev_state, isStart, isTrue(p.forced), function () { return startChecks(line.id, ts, ts); },
+        function () { return lastOffUpTo(line.id, ts); });
       insertRows('events', [ev]);
       if (fast) {
         setLineCur(line.id, ev, line.cur_product);
@@ -2010,16 +2162,23 @@ var LinesCore = (function () {
       }).sort(bySort);
     }
     /* чек-лист запуску, що надійшов ПІСЛЯ події запуску (інший пристрій / черга): знімаємо «Запуск без чек-листа»
-       з запусків, які він покриває (ts у [чек-лист − 2 хв, чек-лист + checklist_valid_hours]) */
+       з запусків, які він покриває (ts у [чек-лист − 2 хв, чек-лист + checklist_valid_hours] і до першого
+       переходу лінії в «Не працює» після чек-листа) */
     function clearNoChecklist(line, cts) {
       var S = settings();
       if (!S.require_start_checklist || !line) return;
-      var a = cts.getTime() - FUTURE_SLACK, b = cts.getTime() + S.checklist_valid_hours * HOUR;
+      var c = cts.getTime(), a = c - FUTURE_SLACK, b = c + S.checklist_valid_hours * HOUR;
       if (!line.cur_since || line.cur_since.getTime() < a) return;          // подій після чек-листа немає
-      var ps = logSince('events', new Date(a)).filter(function (e) {
-        return e.line_id === line.id && !e.void && e.flag === 'no_checklist' && e.ts.getTime() <= b;
-      });
-      patchRows('events', ps.map(function (e) { return { id: e.id, flag: '' }; }));
+      var evs = logSince('events', new Date(a)).filter(function (e) {
+        return e.line_id === line.id && !e.void && e.ts.getTime() <= b;
+      }).sort(byTs);
+      var ps = [];
+      for (var i = 0; i < evs.length; i++) {
+        var e = evs[i];
+        if (e.flag === 'no_checklist') ps.push({ id: e.id, flag: '' });
+        if (isOffTr(e) && e.ts.getTime() >= c) break;                      // робота завершилася — далі чек-лист не чинний
+      }
+      patchRows('events', ps);
     }
     function addChecklist(p, ctx) {
       p = p || {}; ctx = ctx || {};
@@ -2056,11 +2215,14 @@ var LinesCore = (function () {
       } else {
         var items = checklistItems(line.id, occ), given = {};
         (Array.isArray(p.answers) ? p.answers : []).forEach(function (a) { if (a && !isBlank(a.item_id)) given[toStr(a.item_id)] = a; });
-        var missing = 0, failed = 0, oor = 0, crit = false, rows = [];
+        var missing = 0, failed = 0, oor = 0, na = 0, crit = false, rows = [];
         items.forEach(function (it, i) {
           var a = given[it.id], r = evalAnswer(it, a), note = a ? txt(a.note, 1000) : '';
-          // «Н/З» для критичного пункту (безпека, санобробка) не підтверджує його — це зауваження
-          if (it.critical && r.answered && r.ok === null) r.ok = false;
+          var isNa = r.answered && r.ok === null;
+          if (isNa) na++;
+          // «Н/З» для критичного пункту (безпека, санобробка) не підтверджує його — це зауваження;
+          // для обовʼязкового — лише з поясненням у примітці, інакше це пропущена перевірка — теж зауваження
+          if (isNa && (it.critical || (it.required && !note))) r.ok = false;
           if (!r.answered && it.required) missing++;
           if (it.type === 'check' && r.ok === false) failed++;
           if ((it.type === 'number' || it.type === 'select') && r.ok === false) oor++;
@@ -2077,7 +2239,7 @@ var LinesCore = (function () {
           id: id, ts: ts, started: started, line_id: line.id, occasion: occ, operator: txt(p.operator, 120),
           staff_id: refId(p.staff_id), product: txt(p.product, 200),
           result: missing > 0 || crit ? 'fail' : (failed + oor > 0 ? 'remarks' : 'ok'),
-          total: items.length, failed: failed, out_of_range: oor, missing: missing, comment: txt(p.comment, 2000),
+          total: items.length, failed: failed, out_of_range: oor, missing: missing, na: na, comment: txt(p.comment, 2000),
           device: dev(ctx, p), created: now, 'void': false
         });
         insertRows('checks', [chk]);
@@ -2363,13 +2525,15 @@ var LinesCore = (function () {
           if (!ld) throw bad('Невірна дата останнього виконання');
           if (ld.getTime() > now.getTime() + FUTURE_SLACK) throw bad('Дата останнього виконання не може бути в майбутньому');
         }
-        var uh = isBlank(row.used_hours) ? 0 : toNum(row.used_hours);
-        var um = isBlank(row.used_meter) ? 0 : toNum(row.used_meter);
-        if (uh === null || uh < 0) throw bad('Невірне напрацювання з останнього виконання, мотогод');
-        if (um === null || um < 0) throw bad('Невірне напрацювання за лічильником');
+        var uh = isBlank(row.used_hours) ? null : toNum(row.used_hours);
+        var um = isBlank(row.used_meter) ? null : toNum(row.used_meter);
+        if (!isBlank(row.used_hours) && (uh === null || uh < 0)) throw bad('Невірне напрацювання з останнього виконання, мотогод');
+        if (!isBlank(row.used_meter) && (um === null || um < 0)) throw bad('Невірне напрацювання за лічильником');
         o.base_date = ld || now;
-        o.base_hours = r4(cumAt(line, now) - uh);
-        o.base_meter = meter ? r4(meterValueAt(meter, now) - um) : null;
+        // напрацювання не вказано — рахуємо за журналом від дати виконання (до початку обліку — від його початку);
+        // вказане вручну — загальне напрацювання з того часу (для дат до початку обліку в застосунку)
+        o.base_hours = uh === null ? (ld ? cumAt(line, ld) : cumAt(line, now)) : r4(cumAt(line, now) - uh);
+        o.base_meter = !meter ? null : um === null ? (ld ? meterRefAt(meter, ld) : r4(meterValueAt(meter, now))) : r4(meterValueAt(meter, now) - um);
       } else if (!existing) {
         if (!o.base_date) o.base_date = now;
         if (o.base_hours === null) o.base_hours = cumAt(line, now);
@@ -2389,6 +2553,7 @@ var LinesCore = (function () {
       var now = nowD(), K = kit();
       var id = toStr(row.id);
       if (id && !ID_RE.test(id)) throw bad('Некоректний ID: ' + id.slice(0, 40));
+      if (t === 'units') initSheetUnits();             // рядок із таблиці без відліку — спершу фіксуємо відлік
       var existing = id ? find(t, id) : null;
       var inp = {};
       SCHEMA[t].cols.forEach(function (c) {
@@ -2414,7 +2579,7 @@ var LinesCore = (function () {
         else if (has(row, 'pin')) {
           var pin = toStr(row.pin);
           if (pin) {
-            if (!/^\d{4,8}$/.test(pin)) throw bad('PIN має складатися з 4–8 цифр');
+            if (!PIN_RE.test(pin)) throw bad('PIN має складатися з 4–8 цифр');
             o.pin = pin;
           }
         }
@@ -2456,24 +2621,28 @@ var LinesCore = (function () {
       if (['events', 'checks', 'works', 'readings'].indexOf(t) < 0) throw bad('Анулювати можна лише записи журналів');
       var id = toStr(p.id);
       if (!id) throw bad('Не вказано ID запису');
-      var rows = logAll(t), row = null;
-      for (var i = 0; i < rows.length; i++) if (rows[i].id === id) row = rows[i];
+      // без читання всього журналу: findBy сховища або вікно від ts, який передає клієнт (журнал його має)
+      var row = locateLog(t, id, asDate(p.ts));
       if (!row) throw notFound('Запис не знайдено: ' + id);
       var already = !!row.void, note = txt(p.note, 500);
-      var vLine = t === 'events' ? find('lines', row.line_id) : null, oldFn = null;
-      if (vLine && !already) {
-        // мотогодини до анулювання — для зсуву відліків агрегатів / регламентів
-        oldFn = cumFnOf(rows.filter(function (e) { return e.line_id === vLine.id && !e.void; }).sort(byTs), lineCurSnap(vLine));
+      var vLine = t === 'events' ? find('lines', row.line_id) : null, win = null, oldFn = null;
+      if (vLine) {
+        // події лінії у вікні перед записом; мотогодини до анулювання — для зсуву відліків агрегатів / регламентів
+        win = lineEvents(vLine.id, new Date(row.ts.getTime() - ORDER_WINDOW));
+        if (!already) oldFn = cumFnOf(win, lineCurSnap(vLine));
       }
       if (!already) patchRows(t, [{ id: id, 'void': true, void_note: note }]);
       if (t === 'events') {
-        if (vLine) recomputeLineI(row.line_id, null, already ? {} : { from: row.ts.getTime(), oldFn: oldFn });
+        if (vLine) recomputeFromI(vLine, row.ts, oldFn, win.filter(function (e) { return e.id !== id; }));
       } else if (t === 'checks') {
-        var ans = logSince('answers', new Date(row.ts.getTime() - DAY)).filter(function (a) { return a.check_id === id && !a.void; });
+        var ans = answersOf(row).filter(function (a) { return !a.void; });
         patchRows('answers', ans.map(function (a) { return { id: a.id, 'void': true }; }));
-        if (find('lines', row.line_id)) recomputeLineI(row.line_id);
+        // від чек-листа запуску залежать лише позначки запусків після нього
+        var cLine = row.occasion === 'start' ? find('lines', row.line_id) : null;
+        if (cLine) recomputeFromI(cLine, new Date(row.ts.getTime() - FUTURE_SLACK), null, null);
       } else if (t === 'works') {
-        var linked = findLog('readings', id + '-m', row.ts);
+        var lr = isRecent(row.ts) ? null : logBy('readings', 'id', id + '-m');
+        var linked = lr ? (lr[lr.length - 1] || null) : findLog('readings', id + '-m', row.ts);
         if (linked && !linked.void) patchRows('readings', [{ id: linked.id, 'void': true, void_note: note || 'Анульовано разом із роботою' }]);
         if (row.rule_id && find('rules', row.rule_id)) recomputeRuleI(row.rule_id);
         if (linked && find('meters', linked.meter_id)) recomputeMeterI(linked.meter_id);
@@ -2579,9 +2748,44 @@ var LinesCore = (function () {
     }
     function where(lineId, unitId) { var u = unitName(unitId); return lineName(lineId) + (u ? ' · ' + u : ''); }
 
+    /* ---------- отримувачі листів ---------- */
+    /* хто, крім «Email керівництва» (manager_emails), отримує листи — за посадою в «Персонал» (активні, з email;
+       якщо в людини задано «Лінії» — лише про ці лінії): */
+    var MAIL_ROLES = {
+      digest: ['manager'],                                    // щоденний звіт — усім керівникам
+      due: ['manager', 'mechanic', 'electrician'],            // настав строк ТО / ППР
+      repair: ['manager', 'mechanic', 'electrician'],         // ремонт / аварійна зупинка
+      checklist: ['manager', 'qa']                            // зауваження в чек-листі
+    };
+    function recipients(kind, lineId, extra) {
+      var out = [], seen = {};
+      var add = function (e) {
+        var k = String(e || '').trim().toLowerCase();
+        if (!isEmail(k) || has(seen, k)) return;
+        seen[k] = 1; out.push(k);
+      };
+      settings().manager_emails.forEach(add);
+      var roles = MAIL_ROLES[kind] || ['manager'];
+      tbl('staff').slice().sort(bySort).forEach(function (s) {
+        if (!s.active || roles.indexOf(s.role) < 0 || !s.email) return;
+        if (lineId && s.line_ids.length && s.line_ids.indexOf(lineId) < 0) return;
+        toEmails(s.email).forEach(add);
+      });
+      (extra || []).forEach(add);
+      return out;
+    }
+
+    /* значення відповіді чек-листа для листа; «Н/З» без примітки на обовʼязковому пункті — пропущена перевірка */
+    function ansVal(a) {
+      if (a.ok === null && !a.value) return 'не заповнено';
+      var v = a.value + (a.unit_label && a.type === 'number' ? ' ' + a.unit_label : '');
+      if (a.type === 'check' && a.ok === false && a.value === LABELS.check_value.na && !a.note) v += ' (без пояснення)';
+      return v;
+    }
+
     /* ---------- миттєві сповіщення ---------- */
     function noticeRepair(line, ev) {
-      var S = settings(), K = kit();
+      var K = kit();
       var subject = 'Ремонт / аварійна зупинка — ' + line.name;
       var rows = [
         trHtml(['Лінія', esc(line.name)]),
@@ -2593,11 +2797,11 @@ var LinesCore = (function () {
       if (ev.note) rows.push(trHtml(['Примітка', esc(ev.note)]));
       var text = subject + '\nЧас: ' + K.fmtDT(ev.ts) + '\nПричина: ' + (ev.reason || '—') + '\nПродукт: ' + (ev.product || '—') +
         '\nОператор: ' + (ev.operator || '—') + (ev.note ? '\nПримітка: ' + ev.note : '') + textFooter();
-      return { key: 'repair:' + ev.id, kind: 'repair', to: S.manager_emails.slice(), subject: subject,
+      return { key: 'repair:' + ev.id, kind: 'repair', to: recipients('repair', line.id), subject: subject,
         html: mailWrap(subject, 'Лінію переведено в стан «Ремонт»', tableHtml(rows)), text: text };
     }
     function noticeChecklist(line, chk, answers) {
-      var S = settings(), K = kit();
+      var K = kit();
       var subject = 'Зауваження в чек-листі — ' + line.name + ' (' + label('check_result', chk.result) + ')';
       var badRows = answers.filter(function (a) { return a.ok === false || (a.ok === null && !a.value); });
       var info = tableHtml([
@@ -2608,7 +2812,7 @@ var LinesCore = (function () {
         trHtml(['Продукт', esc(chk.product || '—')])
       ].concat(chk.comment ? [trHtml(['Коментар', esc(chk.comment)])] : []));
       var list = badRows.map(function (a) {
-        var v = a.ok === null ? 'не заповнено' : a.value + (a.unit_label && a.type === 'number' ? ' ' + a.unit_label : '');
+        var v = ansVal(a);
         var norm2 = a.type === 'number' && (a.min !== null || a.max !== null) ? 'норма ' + (a.min !== null ? fmtNum(a.min, 2) : '…') + '–' + (a.max !== null ? fmtNum(a.max, 2) : '…') : '';
         return trHtml([esc(a.section || ''), esc(a.text) + (norm2 ? small(norm2) : ''), esc(v) + (a.note ? small(a.note) : '')]);
       });
@@ -2616,9 +2820,9 @@ var LinesCore = (function () {
       var text = subject + '\n' + label('occasion', chk.occasion) + ' · ' + K.fmtDT(chk.ts) + ' · оператор: ' + (chk.operator || '—') +
         '\nПродукт: ' + (chk.product || '—') + (chk.comment ? '\nКоментар: ' + chk.comment : '') +
         (badRows.length ? '\n\n' + badRows.map(function (a) {
-          return '— ' + a.text + ': ' + (a.ok === null ? 'не заповнено' : a.value) + (a.note ? ' (' + a.note + ')' : '');
+          return '— ' + a.text + ': ' + ansVal(a) + (a.note ? ' (' + a.note + ')' : '');
         }).join('\n') : '') + textFooter();
-      return { key: 'check:' + chk.id, kind: 'checklist', to: S.manager_emails.slice(), subject: subject,
+      return { key: 'check:' + chk.id, kind: 'checklist', to: recipients('checklist', line.id), subject: subject,
         html: mailWrap(subject, 'Чек-лист завершено з результатом «' + label('check_result', chk.result) + '»', body), text: text };
     }
     function mailDue(d, rule) {
@@ -2657,7 +2861,7 @@ var LinesCore = (function () {
         var key = 'due:' + d.rule_id + ':' + K.key(d.ref_date) + (d.ref_work_id ? ':' + d.ref_work_id : '');
         if (sent(key)) return;
         var rule = find('rules', d.rule_id);
-        var to = uniq(S.manager_emails.concat(toEmails(rule && rule.notify).filter(isEmail)));
+        var to = recipients('due', d.line_id, toEmails(rule && rule.notify));
         var m = mailDue(d, rule);
         out.push({ key: key, kind: 'due', to: to, subject: m.subject, html: m.html, text: m.text, rule_id: d.rule_id, line_id: d.line_id });
       });
@@ -2714,7 +2918,18 @@ var LinesCore = (function () {
         return i >= 0 && i + 1 < list.length ? list[i + 1].ts : now;
       };
       var mins = function (e) { return Math.max(0, Math.round((endOf(e).getTime() - e.ts.getTime()) / MIN)); };
-      var repairs = repEvents.length + repWorks.length;
+      // одна поломка — один ремонт (як KPI «Ремонти» на панелі): робота «Ремонт», записана під час стану «Ремонт»
+      // (або повʼязана з подією, що його завершила), окремо не рахується; рядки в листі — обидва
+      var linked = function (w) {
+        return repEvents.some(function (e) {
+          if (e.line_id !== w.line_id) return false;
+          var list = data.evBy[e.line_id] || [], i = list.indexOf(e), nx = i >= 0 && i + 1 < list.length ? list[i + 1] : null;
+          var a = e.ts.getTime() - FUTURE_SLACK, b = (nx ? nx.ts : now).getTime() + FUTURE_SLACK;
+          var x = w.ts.getTime(), y = w.started ? w.started.getTime() : x;
+          return (x >= a && x <= b) || (y >= a && y <= b) || (!!nx && nx.ref_id === w.id);
+        });
+      };
+      var repairs = repEvents.length + repWorks.filter(function (w) { return !linked(w); }).length;
       var hasContent = dueItems.length > 0 || soonItems.length > 0 || failed.length > 0 || repairs > 0 || uncovered > 0;
 
       var subject = 'Облік ліній — звіт за ' + K.fmtD(now);
@@ -2730,7 +2945,8 @@ var LinesCore = (function () {
         text += '\nПОТРІБНО ВИКОНАТИ\n' + dueItems.map(dueText).join('\n') + '\n';
       }
       if (soonItems.length) {
-        var soonTitle = 'Найближчі ' + S.warn_days + ' дн. (' + soonItems.length + ')';
+        // «скоро» — за % інтервалу або за днями (у регламенті може бути свій поріг), тож без «N днів» у заголовку
+        var soonTitle = 'Скоро потрібно виконати (' + soonItems.length + ')';
         html += h2(soonTitle) + tableHtml(soonItems.map(dueRow));
         text += '\n' + soonTitle.toUpperCase() + '\n' + soonItems.map(dueText).join('\n') + '\n';
       }
@@ -2751,12 +2967,12 @@ var LinesCore = (function () {
       if (failed.length) {
         html += h2('Зауваження в чек-листах за добу (' + failed.length + ')') + tableHtml(failed.map(function (a) {
           var c = chk[a.check_id];
-          var v = a.value + (a.unit_label && a.type === 'number' ? ' ' + a.unit_label : '');
+          var v = ansVal(a);
           return trHtml([esc(K.fmtDT(a.ts)), esc(a.text) + small(lineName(a.line_id) + ' · ' + label('occasion', c.occasion) + (c.operator ? ' · ' + c.operator : '')),
             esc(v) + (a.note ? small(a.note) : '')]);
         }));
         text += '\nЗАУВАЖЕННЯ В ЧЕК-ЛИСТАХ ЗА ДОБУ\n' + failed.map(function (a) {
-          return '— ' + K.fmtDT(a.ts) + ' · ' + lineName(a.line_id) + ' · ' + a.text + ': ' + a.value + (a.note ? ' (' + a.note + ')' : '');
+          return '— ' + K.fmtDT(a.ts) + ' · ' + lineName(a.line_id) + ' · ' + a.text + ': ' + ansVal(a) + (a.note ? ' (' + a.note + ')' : '');
         }).join('\n') + '\n';
       }
       if (repairs || stopEvents.length) {
@@ -2802,7 +3018,7 @@ var LinesCore = (function () {
       }
       return {
         subject: subject, html: mailWrap(subject, 'Станом на ' + K.fmtDT(now), html), text: text + textFooter(),
-        to: S.manager_emails.slice(), has_content: hasContent,
+        to: recipients('digest'), has_content: hasContent,
         counts: { due: dueItems.length, soon: soonItems.length, failed: failed.length, repairs: repairs, uncovered: uncovered, stops: stopEvents.length }
       };
     }
@@ -3006,9 +3222,9 @@ var LinesCore = (function () {
       items: items,
       meters: [
         { id: 'M1', line_id: 'L1', unit_id: 'U11', name: 'Цикли дозатора', unit_label: 'цикл.', mode: 'abs', ask_on_end: false, sort: 10, init: 1254300 },
-        { id: 'M2', line_id: 'L1', unit_id: '', name: 'Вироблено, шт', unit_label: 'шт', mode: 'inc', ask_on_end: true, sort: 20 },
+        { id: 'M2', line_id: 'L1', unit_id: '', name: 'Вироблено', unit_label: 'шт', mode: 'inc', ask_on_end: true, sort: 20 },
         { id: 'M3', line_id: 'L2', unit_id: 'U22', name: 'Цикли дозатора', unit_label: 'цикл.', mode: 'abs', ask_on_end: false, sort: 10, init: 684200 },
-        { id: 'M4', line_id: 'L2', unit_id: '', name: 'Вироблено, шт', unit_label: 'шт', mode: 'inc', ask_on_end: true, sort: 20 },
+        { id: 'M4', line_id: 'L2', unit_id: '', name: 'Вироблено', unit_label: 'шт', mode: 'inc', ask_on_end: true, sort: 20 },
         { id: 'M5', line_id: 'L3', unit_id: 'U31', name: 'Етикеток нанесено', unit_label: 'шт', mode: 'abs', ask_on_end: true, sort: 10, init: 1843200 }
       ],
       rules: [

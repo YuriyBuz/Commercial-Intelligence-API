@@ -23,7 +23,10 @@
      mailQuota      — залишок денного ліміту листів (типово 100)
      ui             — true: доступний SpreadsheetApp.getUi() (як у меню); типово false (веб-застосунок / тригер)
      sheets         — назви аркушів нової таблиці (типово ['Аркуш1'])
-     spreadsheetId, spreadsheetName, userEmail, webAppUrl, echo (дублювати console.* у stdout)
+     cellLimit      — ліміт клітинок однієї таблиці (типово 10 000 000, як у Google Sheets)
+     webAppUrl      — адреса …/exec (getService().getUrl() під час doGet/doPost — див. inspect.webRequest)
+     devUrl         — адреса …/dev (getService().getUrl() поза веб-запитом: меню, редактор, тригер)
+     spreadsheetId, spreadsheetName, userEmail, echo (дублювати console.* у stdout)
 
    globals: SpreadsheetApp, LockService, CacheService, PropertiesService, MailApp, ScriptApp,
      ContentService, Utilities, Session, Logger, console, Date (підміна з керованим годинником:
@@ -40,14 +43,18 @@
                                  введенні в Sheets), raw(r,c,v) (без перетворення), insertColumnBefore(c,n),
                                  moveColumn(from,to), deleteRows(r,n)
      formulas                  — журнал усіх формул, записаних через API [{sheet,row,col,formula}]
-     spreadsheet               — { timeZone(), url, id }
+     spreadsheet               — { timeZone(), url, id, cells() } (cells — клітинок у сітці всіх аркушів)
+     spreadsheets()            — інші таблиці (SpreadsheetApp.create): [{id, name, url, timeZone(), cells(),
+                                 sheetNames(), sheet(name)}]
+     webRequest(fn)            — виконати fn як веб-запит (/exec); loadGasProject так обгортає doGet/doPost
      mails, mailQuota(n?), failNextMail(msg)
      triggers()                — [{id, handler, type, atHour, everyDays, everyHours, everyMinutes, tz, …}]
      properties()              — копія Script Properties
      cache                     — { get(k), keys(), clear() }
      lock                      — { hold(), release(), held(), attempts } — імітація «чужого» блокування
      clock                     — { now(), set(v), advance(ms), real() }
-     ui                        — { enable(b), available(), alerts, menus, toasts }
+     ui                        — { enable(b), available(), alerts, menus, toasts, prompts, reply(text, button='OK') }
+                                 (reply — відповідь на наступний Ui.prompt; без неї prompt повертає CLOSE)
      logs                      — записи console.* та Logger.log
 
    СЕМАНТИКА (як у справжньому Apps Script)
@@ -58,9 +65,18 @@
        що не є числом) — формула (записується в журнал formulas; getValues повертає '#ERROR!');
        провідний апостроф — буквальний текст (апостроф не зберігається); "007", "12.5", "5,5", "-3",
        "1e3", "12%" — числа; "25.09.2026[ 08:00]", "2026-09-25[ 08:00]" — дати (у поясі таблиці);
-       "12:30" — час (дата 30.12.1899); TRUE/FALSE — логічні; Date і boolean зберігаються як є;
+       "12:30" — час (дата 30.12.1899); TRUE/FALSE — логічні; boolean зберігається як є;
+     • дата-час у клітинці — «настінний» час у поясі таблиці (як серійне число Sheets): Date при записі
+       переводиться в пояс таблиці, при читанні — назад; тому setSpreadsheetTimeZone зсуває вже записані
+       моменти часу (як у Sheets), а неоднозначна година переходу з літнього часу читається однаково;
+     • формат «Звичайний текст» (setNumberFormat('@')): рядок зберігається буквально — без формул, чисел,
+       дат і навіть із провідним апострофом;
      • перевірка «прапорець» (requireCheckbox) робить порожні клітинки діапазону значенням false
        (тому вони враховуються в getLastRow — як у Sheets);
+     • сітка таблиці (усі рядки × стовпці всіх аркушів, і порожні теж) — не більше cellLimit клітинок:
+       insertSheet / insertRowsAfter / insertColumnsAfter / create понад ліміт кидають помилку, як у Sheets;
+     • getService().getUrl(): під час doGet/doPost — …/exec, інакше (меню, тригер) — …/dev, як у новій моделі
+       розгортань Apps Script;
      • невідомий часовий пояс в Utilities.formatDate/parseDate мовчки стає GMT (як у Java);
      • виклик неіснуючого методу будь-якого обʼєкта mock кидає «… is not implemented in mock» —
        так тести ловлять використання API, якого немає в Apps Script.
@@ -136,13 +152,33 @@ function offsetOf(ms, tz) {
 }
 /* локальний час поясу → мс UTC */
 function zonedToMs(y, M, d, H, m, s, S, tz) {
-  const guess = RealDate.UTC(y, M - 1, d, H || 0, m || 0, s || 0, S || 0);
-  const off = offsetOf(guess, tz);
-  let t = guess - off;
-  const off2 = offsetOf(t, tz);
-  if (off2 !== off) t = guess - off2;
+  return wallToMs(RealDate.UTC(y, M - 1, d, H || 0, m || 0, s || 0, S || 0), tz);
+}
+/* зсув поясу з кешем по 15 хв (переходи літнього часу — на межах чвертей години UTC) */
+const OFF_STEP = 900000;
+const offCache = new Map();
+function offsetFast(ms, tz) {
+  const b = Math.floor(ms / OFF_STEP), k = tz + '|' + b;
+  let o = offCache.get(k);
+  if (o === undefined) {
+    if (offCache.size > 200000) offCache.clear();
+    o = offsetOf(b * OFF_STEP, tz);
+    offCache.set(k, o);
+  }
+  return o;
+}
+/* «настінний» час (мс, ніби UTC) у поясі tz → момент часу */
+function wallToMs(wall, tz) {
+  const off = offsetFast(wall, tz);
+  let t = wall - off;
+  const off2 = offsetFast(t, tz);
+  if (off2 !== off) t = wall - off2;
   return t;
 }
+/* дата-час у клітинці: «настінний» час поясу таблиці (як серійне число Sheets) */
+class Serial { constructor(wall) { this.wall = wall; } }
+const isSerial = (v) => v instanceof Serial;
+const toSerial = (ms, tz) => new Serial(ms + offsetFast(ms, tz));
 
 /* шаблони java.text.SimpleDateFormat (підмножина) */
 function tokenize(pattern) {
@@ -231,9 +267,11 @@ export function createGasMock(options = {}) {
   const opt = {
     tz: 'Europe/Kyiv', spreadsheetTz: null, now: null, mailQuota: 100, ui: false, sheets: ['Аркуш1'],
     spreadsheetId: '1MOCKspreadsheetID', spreadsheetName: 'Облік ліній (mock)', userEmail: 'owner@example.com',
-    webAppUrl: 'https://script.google.com/macros/s/MOCK_DEPLOYMENT/exec', echo: false, ...options
+    webAppUrl: 'https://script.google.com/macros/s/MOCK_DEPLOYMENT/exec',
+    devUrl: 'https://script.google.com/macros/s/MOCK_HEAD_DEPLOYMENT/dev', echo: false, ...options
   };
   const scriptTz = opt.tz;
+  let webDepth = 0;                              // > 0 — виконується doGet / doPost (адреса …/exec)
 
   /* ---------- годинник ---------- */
   let clockFn = null, fixedMs = null;
@@ -264,13 +302,24 @@ export function createGasMock(options = {}) {
   const logs = [];
   const formulaLog = [];
 
-  /* ---------- таблиця ---------- */
-  let ssTz = opt.spreadsheetTz || scriptTz;
-  const book = { id: opt.spreadsheetId, name: opt.spreadsheetName, sheets: [], nextId: 1, active: null, toasts: [] };
+  /* ---------- таблиці (основна — getActiveSpreadsheet; інші — SpreadsheetApp.create) ---------- */
+  const books = [];
+  let sheetSeq = 1;
   const modelOf = new WeakMap();                 // proxy аркуша → модель
+  const cellLimit = opt.cellLimit || 10000000;
+  const bookCells = (bk) => bk.sheets.reduce((n, s) => n + s.maxRows * s.maxCols, 0);
+  function checkCells(bk, add) {
+    if (bookCells(bk) + add > cellLimit) {
+      throw new Error('This action would increase the number of cells in the workbook above the limit of ' + cellLimit + ' cells.');
+    }
+  }
+  /* клітинка → значення для getValues: дата-час — момент у поточному поясі таблиці */
+  const outVal = (bk, v) => (isSerial(v) ? mkDate(wallToMs(v.wall, bk.tz)) : v);
+  const dateIn = (bk, ms) => toSerial(ms, bk.tz);
+  const wallIn = (y, M, d, H, m, s) => new Serial(RealDate.UTC(y, M - 1, d, H || 0, m || 0, s || 0));
 
-  /* введення значення «як користувач» → { v, f } (f — формула) */
-  function enter(v) {
+  /* введення значення «як користувач» → { v, f } (f — формула); text — формат «Звичайний текст» */
+  function enter(v, bk, text) {
     if (v === null || v === undefined) return { v: '' };
     if (typeof v === 'boolean') return { v };
     if (typeof v === 'number') {
@@ -279,10 +328,11 @@ export function createGasMock(options = {}) {
     }
     if (isDateObj(v)) {
       if (isNaN(v.getTime())) throw new Error('Invalid Date cannot be written to a cell');
-      return { v: mkDate(v.getTime()) };
+      return { v: dateIn(bk, v.getTime()) };
     }
     if (typeof v !== 'string') throw sigError('SpreadsheetApp.Range.setValues (значення типу ' + typeof v + ')');
     if (v.length > 50000) throw new Error('Your input contains more than the maximum of 50000 characters in a single cell.');
+    if (text) return { v };                         // «Звичайний текст»: буквально, разом з апострофом
     if (v.charAt(0) === '\'') return { v: v.slice(1) };
     if (v === '') return { v: '' };
     if (v.charAt(0) === '=') return { f: v };
@@ -293,14 +343,14 @@ export function createGasMock(options = {}) {
     if (m) return { v: Number(m[1].replace(',', '.')) / 100 };
     m = /^(\d{1,2})\.(\d{1,2})\.(\d{4})(?:\s+(\d{1,2}):(\d{2})(?::(\d{2}))?)?$/.exec(t);
     if (m && +m[2] >= 1 && +m[2] <= 12 && +m[1] >= 1 && +m[1] <= 31) {
-      return { v: mkDate(zonedToMs(+m[3], +m[2], +m[1], +(m[4] || 0), +(m[5] || 0), +(m[6] || 0), 0, ssTz)) };
+      return { v: wallIn(+m[3], +m[2], +m[1], +(m[4] || 0), +(m[5] || 0), +(m[6] || 0)) };
     }
     m = /^(\d{4})-(\d{1,2})-(\d{1,2})(?:[ T](\d{1,2}):(\d{2})(?::(\d{2}))?)?$/.exec(t);
     if (m && +m[2] >= 1 && +m[2] <= 12 && +m[3] >= 1 && +m[3] <= 31) {
-      return { v: mkDate(zonedToMs(+m[1], +m[2], +m[3], +(m[4] || 0), +(m[5] || 0), +(m[6] || 0), 0, ssTz)) };
+      return { v: wallIn(+m[1], +m[2], +m[3], +(m[4] || 0), +(m[5] || 0), +(m[6] || 0)) };
     }
     m = /^(\d{1,2}):(\d{2})(?::(\d{2}))?$/.exec(t);
-    if (m && +m[1] < 24) return { v: mkDate(zonedToMs(1899, 12, 30, +m[1], +m[2], +(m[3] || 0), 0, ssTz)) };
+    if (m && +m[1] < 24) return { v: wallIn(1899, 12, 30, +m[1], +m[2], +(m[3] || 0)) };
     if (/^[+-]/.test(v)) return { f: '=' + v };      // «+…» / «-…» Sheets сприймає як формулу
     return { v };
   }
@@ -308,12 +358,18 @@ export function createGasMock(options = {}) {
   const CELL_KEY = (r, c) => r * 32768 + c;
 
   class SheetModel {
-    constructor(name) {
-      this.name = name; this.id = book.nextId++;
-      this.rows = []; this.maxRows = 1000; this.maxCols = 26; this.frozenRows = 0;
+    constructor(bk, name, rows, cols) {
+      this.book = bk; this.name = name; this.id = sheetSeq++;
+      this.rows = []; this.maxRows = rows || 1000; this.maxCols = cols || 26; this.frozenRows = 0;
       this.formulas = new Map(); this.notes = new Map();
       this.formats = []; this.validations = []; this.styles = []; this.widths = new Map();
+      this.textCols = new Set();                   // стовпці, де колись задано формат '@'
       this.tabColor = null; this.colDirty = true; this.lastColCache = 0; this.proxy = null;
+    }
+    isText(r, c) {
+      if (!this.textCols.has(c)) return false;
+      const o = this.lastOp(this.formats, r, c);
+      return !!(o && o.f === '@');
     }
     get(r, c) { const row = this.rows[r - 1]; if (!row) return ''; const v = row[c - 1]; return v === undefined ? '' : v; }
     put(r, c, v) {
@@ -365,6 +421,16 @@ export function createGasMock(options = {}) {
     shiftCols(after, n) {
       for (const row of this.rows) if (row && row.length > after) row.splice(after, 0, ...new Array(n).fill(''));
       this.remapKeys((r, c) => (c > after ? [r, c + n] : [r, c]));
+      this.colDirty = true;
+    }
+    dropRows(pos, n) {                  // видалення n рядків від pos
+      this.rows.splice(pos - 1, n);
+      this.remapKeys((r, c) => (r < pos ? [r, c] : r < pos + n ? [0, 0] : [r - n, c]));
+      this.colDirty = true;
+    }
+    dropCols(pos, n) {
+      for (const row of this.rows) if (row && row.length >= pos) row.splice(pos - 1, n);
+      this.remapKeys((r, c) => (c < pos ? [r, c] : c < pos + n ? [0, 0] : [r, c - n]));
       this.colDirty = true;
     }
     remapKeys(fn) {
@@ -440,13 +506,13 @@ export function createGasMock(options = {}) {
           const row = sh.rows[r - 1 + i], a = new Array(nc);
           for (let j = 0; j < nc; j++) {
             const v = row ? row[c - 1 + j] : undefined;
-            a[j] = v === undefined ? '' : isDateObj(v) ? mkDate(v.getTime()) : v;
+            a[j] = v === undefined ? '' : outVal(sh.book, v);
           }
           out[i] = a;
         }
         return out;
       },
-      getValue() { count('getValue'); const v = sh.get(r, c); return isDateObj(v) ? mkDate(v.getTime()) : v; },
+      getValue() { count('getValue'); return outVal(sh.book, sh.get(r, c)); },
       setValues(values) {
         count('setValues'); count('setValues:' + sh.name);
         if (!Array.isArray(values)) throw sigError('SpreadsheetApp.Range.setValues');
@@ -462,7 +528,7 @@ export function createGasMock(options = {}) {
             throw new Error('The number of columns in the data does not match the number of columns in the range. The data has ' +
               row.length + ' but the range has ' + nc + '.');
           }
-          conv[i] = row.map(enter);                  // спершу перетворення: помилка не записує частину
+          conv[i] = row.map((v, j) => enter(v, sh.book, sh.isText(r + i, c + j)));   // спершу перетворення: помилка не записує частину
         }
         count('cellsWritten', nr * nc);
         for (let i = 0; i < nr; i++) for (let j = 0; j < nc; j++) sh.write(r + i, c + j, conv[i][j]);
@@ -470,8 +536,7 @@ export function createGasMock(options = {}) {
       },
       setValue(v) {
         count('setValue');
-        const x = enter(v);
-        cells((rr, cc) => sh.write(rr, cc, x));
+        cells((rr, cc) => sh.write(rr, cc, enter(v, sh.book, sh.isText(rr, cc))));
         return P;
       },
       getFormulas() {
@@ -493,6 +558,7 @@ export function createGasMock(options = {}) {
       setNumberFormat(f) {
         if (typeof f !== 'string') throw sigError('SpreadsheetApp.Range.setNumberFormat');
         count('format'); sh.formats.push({ r, c, nr, nc, f });
+        if (f === '@') for (let j = 0; j < nc; j++) sh.textCols.add(c + j);
         return P;
       },
       setDataValidation(rule) {
@@ -521,12 +587,12 @@ export function createGasMock(options = {}) {
     const S = {
       getName: () => sh.name,
       setName(n) {
-        if (book.sheets.some((x) => x !== sh && x.name === n)) throw new Error('A sheet with the name "' + n + '" already exists. Please enter another name.');
+        if (sh.book.sheets.some((x) => x !== sh && x.name === n)) throw new Error('A sheet with the name "' + n + '" already exists. Please enter another name.');
         sh.name = String(n); return sh.proxy;
       },
       getSheetId: () => sh.id,
-      getIndex: () => book.sheets.indexOf(sh) + 1,
-      getParent: () => ssProxy,
+      getIndex: () => sh.book.sheets.indexOf(sh) + 1,
+      getParent: () => sh.book.proxy,
       getLastRow() { count('getLastRow'); return sh.lastRow(); },
       getLastColumn() { count('getLastColumn'); return sh.lastCol(); },
       getMaxRows: () => sh.maxRows,
@@ -549,6 +615,7 @@ export function createGasMock(options = {}) {
         checkInt(after, 'SpreadsheetApp.Sheet.insertRowsAfter'); checkInt(howMany, 'SpreadsheetApp.Sheet.insertRowsAfter');
         if (after < 1 || after > sh.maxRows) throw new Error('Those rows are out of bounds.');
         if (howMany < 1) throw new Error('The number of rows to insert must be at least 1.');
+        checkCells(sh.book, howMany * sh.maxCols);
         count('insertRows'); sh.shiftRows(after, howMany); sh.maxRows += howMany;
         return sh.proxy;
       },
@@ -556,21 +623,29 @@ export function createGasMock(options = {}) {
         checkInt(after, 'SpreadsheetApp.Sheet.insertColumnsAfter'); checkInt(howMany, 'SpreadsheetApp.Sheet.insertColumnsAfter');
         if (after < 1 || after > sh.maxCols) throw new Error('Those columns are out of bounds.');
         if (howMany < 1) throw new Error('The number of columns to insert must be at least 1.');
+        checkCells(sh.book, howMany * sh.maxRows);
         count('insertColumns'); sh.shiftCols(after, howMany); sh.maxCols += howMany;
+        return sh.proxy;
+      },
+      deleteColumns(pos, howMany) {
+        checkInt(pos, 'SpreadsheetApp.Sheet.deleteColumns'); checkInt(howMany, 'SpreadsheetApp.Sheet.deleteColumns');
+        if (pos < 1 || howMany < 1 || pos + howMany - 1 > sh.maxCols) throw new Error('Those columns are out of bounds.');
+        if (howMany >= sh.maxCols) throw new Error('You can\'t delete all the columns on the sheet.');
+        count('deleteColumns'); sh.dropCols(pos, howMany); sh.maxCols -= howMany;
         return sh.proxy;
       },
       deleteRows(pos, howMany) {
         checkInt(pos, 'SpreadsheetApp.Sheet.deleteRows'); checkInt(howMany, 'SpreadsheetApp.Sheet.deleteRows');
         if (pos < 1 || howMany < 1 || pos + howMany - 1 > sh.maxRows) throw new Error('Those rows are out of bounds.');
         if (howMany >= sh.maxRows) throw new Error('You can\'t delete all the rows on the sheet.');
-        count('deleteRows'); sh.rows.splice(pos - 1, howMany); sh.maxRows -= howMany; sh.colDirty = true;
+        count('deleteRows'); sh.dropRows(pos, howMany); sh.maxRows -= howMany;
         return sh.proxy;
       },
       getFrozenRows: () => sh.frozenRows,
       setFrozenRows(n) { checkInt(n, 'SpreadsheetApp.Sheet.setFrozenRows'); sh.frozenRows = n; return sh.proxy; },
       setTabColor(color) { sh.tabColor = color; return sh.proxy; },
       setColumnWidth(col, w) { checkInt(col, 'SpreadsheetApp.Sheet.setColumnWidth'); sh.widths.set(col, w); return sh.proxy; },
-      activate() { book.active = sh; return sh.proxy; }
+      activate() { sh.book.active = sh; return sh.proxy; }
     };
     sh.proxy = strict('Sheet', S);
     modelOf.set(sh.proxy, sh);
@@ -578,47 +653,57 @@ export function createGasMock(options = {}) {
   }
 
   /* ---------- Spreadsheet ---------- */
-  function addSheet(name, index) {
-    if (book.sheets.some((x) => x.name === name)) throw new Error('A sheet with the name "' + name + '" already exists. Please enter another name.');
-    const sh = new SheetModel(name);
-    const at = index === undefined ? book.sheets.length : Math.max(0, Math.min(book.sheets.length, index));
-    book.sheets.splice(at, 0, sh);
-    book.active = sh;
+  function addSheet(bk, name, index, rows, cols) {
+    if (bk.sheets.some((x) => x.name === name)) throw new Error('A sheet with the name "' + name + '" already exists. Please enter another name.');
+    const sh = new SheetModel(bk, name, rows, cols);
+    const at = index === undefined ? bk.sheets.length : Math.max(0, Math.min(bk.sheets.length, index));
+    bk.sheets.splice(at, 0, sh);
+    bk.active = sh;
     return sh;
   }
-  opt.sheets.forEach((n) => addSheet(n));
-  const ssObj = {
-    getId: () => book.id,
-    getName: () => book.name,
-    getUrl: () => 'https://docs.google.com/spreadsheets/d/' + book.id + '/edit',
-    getSheets: () => book.sheets.map(sheetProxy),
-    getSheetByName(name) { count('getSheetByName'); const sh = book.sheets.find((x) => x.name === name); return sh ? sheetProxy(sh) : null; },
-    insertSheet(a, b, c) {
-      if (c !== undefined) throw notImpl('Spreadsheet.insertSheet(name, index, options)');
-      let name, index;
-      if (typeof a === 'string') { name = a; index = b; } else if (typeof a === 'number') index = a;
-      if (index !== undefined) checkInt(index, 'SpreadsheetApp.Spreadsheet.insertSheet');
-      if (name === undefined) { let n = book.sheets.length + 1; while (book.sheets.some((x) => x.name === 'Аркуш' + n)) n++; name = 'Аркуш' + n; }
-      count('insertSheet');
-      return sheetProxy(addSheet(name, index));
-    },
-    deleteSheet(sheet) {
-      const sh = modelOf.get(sheet);
-      if (!sh) throw sigError('SpreadsheetApp.Spreadsheet.deleteSheet');
-      if (book.sheets.length === 1) throw new Error('You can\'t remove all the sheets in a document.');
-      book.sheets.splice(book.sheets.indexOf(sh), 1);
-      if (book.active === sh) book.active = book.sheets[0];
-    },
-    getActiveSheet: () => sheetProxy(book.active || book.sheets[0]),
-    setActiveSheet(sheet) { const sh = modelOf.get(sheet); if (!sh) throw sigError('SpreadsheetApp.Spreadsheet.setActiveSheet'); book.active = sh; return sheet; },
-    getSpreadsheetTimeZone: () => ssTz,
-    setSpreadsheetTimeZone(tz) { if (!tzValid(tz)) throw new Error('Invalid argument: timeZone'); ssTz = tz; },
-    toast(msg, title, timeout) { book.toasts.push({ msg: String(msg), title: title === undefined ? '' : String(title), timeout }); }
-  };
-  const ssProxy = strict('Spreadsheet', ssObj);
+  function makeBook(id, name, tz, sheetNames, rows, cols) {
+    const bk = { id, name, tz, sheets: [], active: null, toasts: [], proxy: null };
+    sheetNames.forEach((n) => { checkCells(bk, (rows || 1000) * (cols || 26)); addSheet(bk, n, undefined, rows, cols); });
+    const obj = {
+      getId: () => bk.id,
+      getName: () => bk.name,
+      getUrl: () => 'https://docs.google.com/spreadsheets/d/' + bk.id + '/edit',
+      getSheets: () => bk.sheets.map(sheetProxy),
+      getSheetByName(n) { count('getSheetByName'); const sh = bk.sheets.find((x) => x.name === n); return sh ? sheetProxy(sh) : null; },
+      insertSheet(a, b, c) {
+        if (c !== undefined) throw notImpl('Spreadsheet.insertSheet(name, index, options)');
+        let n, index;
+        if (typeof a === 'string') { n = a; index = b; } else if (typeof a === 'number') index = a;
+        if (index !== undefined) checkInt(index, 'SpreadsheetApp.Spreadsheet.insertSheet');
+        if (n === undefined) { let k = bk.sheets.length + 1; while (bk.sheets.some((x) => x.name === 'Аркуш' + k)) k++; n = 'Аркуш' + k; }
+        checkCells(bk, 1000 * 26);
+        count('insertSheet');
+        return sheetProxy(addSheet(bk, n, index));
+      },
+      deleteSheet(sheet) {
+        const sh = modelOf.get(sheet);
+        if (!sh || sh.book !== bk) throw sigError('SpreadsheetApp.Spreadsheet.deleteSheet');
+        if (bk.sheets.length === 1) throw new Error('You can\'t remove all the sheets in a document.');
+        bk.sheets.splice(bk.sheets.indexOf(sh), 1);
+        if (bk.active === sh) bk.active = bk.sheets[0];
+      },
+      getActiveSheet: () => sheetProxy(bk.active || bk.sheets[0]),
+      setActiveSheet(sheet) { const sh = modelOf.get(sheet); if (!sh || sh.book !== bk) throw sigError('SpreadsheetApp.Spreadsheet.setActiveSheet'); bk.active = sh; return sheet; },
+      getSpreadsheetTimeZone: () => bk.tz,
+      // як у Sheets: змінюється лише тлумачення вже записаних дат (вони зберігаються як «настінний» час)
+      setSpreadsheetTimeZone(z) { if (!tzValid(z)) throw new Error('Invalid argument: timeZone'); bk.tz = z; },
+      toast(msg, title, timeout) { bk.toasts.push({ msg: String(msg), title: title === undefined ? '' : String(title), timeout }); }
+    };
+    bk.proxy = strict('Spreadsheet', obj);
+    books.push(bk);
+    return bk;
+  }
+  const book = makeBook(opt.spreadsheetId, opt.spreadsheetName, opt.spreadsheetTz || scriptTz, opt.sheets);
+  const ssProxy = book.proxy;
+  let bookSeq = 0;
 
   /* ---------- UI ---------- */
-  const uiState = { available: !!opt.ui, alerts: [], menus: [] };
+  const uiState = { available: !!opt.ui, alerts: [], menus: [], prompts: [], replies: [] };
   const Button = { OK: 'OK', CANCEL: 'CANCEL', YES: 'YES', NO: 'NO', CLOSE: 'CLOSE' };
   const ButtonSet = { OK: 'OK', OK_CANCEL: 'OK_CANCEL', YES_NO: 'YES_NO', YES_NO_CANCEL: 'YES_NO_CANCEL' };
   const uiProxy = strict('Ui', {
@@ -630,6 +715,16 @@ export function createGasMock(options = {}) {
       else rec = { title: String(a), prompt: String(b), buttons: c };
       uiState.alerts.push(rec);
       return Button.OK;
+    },
+    /* відповідь — з черги inspect.ui.reply(); без неї — вікно закрито */
+    prompt(a, b, c) {
+      let rec;
+      if (arguments.length === 1) rec = { title: '', prompt: String(a), buttons: 'OK' };
+      else if (arguments.length === 2) rec = { title: '', prompt: String(a), buttons: b };
+      else rec = { title: String(a), prompt: String(b), buttons: c };
+      uiState.prompts.push(rec);
+      const ans = uiState.replies.length ? uiState.replies.shift() : { text: '', button: Button.CLOSE };
+      return strict('PromptResponse', { getResponseText: () => ans.text, getSelectedButton: () => ans.button });
     },
     createMenu(caption) {
       const menu = { caption: String(caption), items: [] };
@@ -651,8 +746,17 @@ export function createGasMock(options = {}) {
     getActiveSpreadsheet: () => ssProxy,
     getActive: () => ssProxy,
     openById(id) {
-      if (id !== book.id) throw new Error('Unexpected error while getting the method or property openById on object SpreadsheetApp.');
-      return ssProxy;
+      const bk = books.find((x) => x.id === id);
+      if (!bk) throw new Error('Unexpected error while getting the method or property openById on object SpreadsheetApp.');
+      return bk.proxy;
+    },
+    /* нова таблиця на Диску власника (дозвіл spreadsheets); пояс — як у скрипту */
+    create(name, rows, columns) {
+      if (typeof name !== 'string' || !name) throw sigError('SpreadsheetApp.create');
+      if (rows !== undefined) checkInt(rows, 'SpreadsheetApp.create');
+      if (columns !== undefined) checkInt(columns, 'SpreadsheetApp.create');
+      count('create');
+      return makeBook('1MOCKnew' + (++bookSeq), name, scriptTz, ['Аркуш1'], rows, columns).proxy;
     },
     flush() { count('flush'); },
     getUi() {
@@ -821,7 +925,7 @@ export function createGasMock(options = {}) {
       if (i < 0) throw new Error('Trigger not found');
       triggers.splice(i, 1);
     },
-    getService: () => strict('Service', { getUrl: () => opt.webAppUrl, isEnabled: () => true }),
+    getService: () => strict('Service', { getUrl: () => (webDepth > 0 ? opt.webAppUrl : opt.devUrl), isEnabled: () => true }),
     getScriptId: () => 'mock-script-id',
     EventType,
     TriggerSource: { CLOCK: 'CLOCK', SPREADSHEETS: 'SPREADSHEETS', DOCUMENTS: 'DOCUMENTS', FORMS: 'FORMS', CALENDAR: 'CALENDAR' },
@@ -893,10 +997,10 @@ export function createGasMock(options = {}) {
   };
 
   /* ---------- інспектор ---------- */
-  function sheetInspector(name) {
-    const sh = book.sheets.find((x) => x.name === name);
+  function sheetInspector(name, bk = book) {
+    const sh = bk.sheets.find((x) => x.name === name);
     if (!sh) return null;
-    const cp = (v) => (isDateObj(v) ? mkDate(v.getTime()) : v);
+    const cp = (v) => outVal(sh.book, v);
     const grow = (r, c) => { if (r > sh.maxRows) sh.maxRows = r; if (c > sh.maxCols) sh.maxCols = c; };
     const I = {
       name,
@@ -938,10 +1042,10 @@ export function createGasMock(options = {}) {
         return null;
       },
       /* «людські» правки: без лічильників викликів API */
-      type(r, c, v) { grow(r, c); sh.write(r, c, enter(v)); return I; },
+      type(r, c, v) { grow(r, c); sh.write(r, c, enter(v, sh.book, sh.isText(r, c))); return I; },
       typeRow(r, arr) { arr.forEach((v, j) => I.type(r, j + 1, v)); return I; },
       appendRow(arr) { return I.typeRow(sh.lastRow() + 1, arr); },
-      raw(r, c, v) { grow(r, c); sh.formulas.delete(CELL_KEY(r, c)); sh.put(r, c, v); return I; },
+      raw(r, c, v) { grow(r, c); sh.formulas.delete(CELL_KEY(r, c)); sh.put(r, c, isDateObj(v) ? dateIn(sh.book, v.getTime()) : v); return I; },
       insertColumnBefore(col, n = 1) { sh.shiftCols(col - 1, n); sh.maxCols += n; return I; },
       moveColumn(from, to) {
         const R = sh.rows.length, vals = [];
@@ -967,7 +1071,12 @@ export function createGasMock(options = {}) {
     sheetNames: () => book.sheets.map((s) => s.name),
     sheet: sheetInspector,
     formulas: formulaLog,
-    spreadsheet: { timeZone: () => ssTz, url: ssObj.getUrl(), id: book.id, toasts: book.toasts },
+    spreadsheet: { timeZone: () => book.tz, url: ssProxy.getUrl(), id: book.id, toasts: book.toasts, cells: () => bookCells(book) },
+    spreadsheets: () => books.filter((bk) => bk !== book).map((bk) => ({
+      id: bk.id, name: bk.name, url: bk.proxy.getUrl(), timeZone: () => bk.tz, cells: () => bookCells(bk),
+      sheetNames: () => bk.sheets.map((x) => x.name), sheet: (n) => sheetInspector(n, bk)
+    })),
+    webRequest(fn) { webDepth++; try { return fn(); } finally { webDepth--; } },
     mails,
     mailQuota(n) { if (n !== undefined) quota = n; return quota; },
     failNextMail(msg) { failNext = msg || 'Mail service error (mock)'; },
@@ -995,7 +1104,9 @@ export function createGasMock(options = {}) {
       available: () => uiState.available,
       alerts: uiState.alerts,
       menus: uiState.menus,
-      toasts: book.toasts
+      toasts: book.toasts,
+      prompts: uiState.prompts,
+      reply(text, button = 'OK') { uiState.replies.push({ text: String(text), button }); }
     },
     logs,
     Date: FakeDate
@@ -1017,6 +1128,11 @@ export function loadGasProject(options = {}) {
   for (const f of files) {
     const src = f.source !== undefined ? f.source : readFileSync(f.path, 'utf8');
     vm.runInContext(src, ctx, { filename: f.name || basename(f.path || 'script.gs') });
+  }
+  // doGet / doPost — веб-запит до …/exec (для ScriptApp.getService().getUrl())
+  for (const fn of ['doGet', 'doPost']) {
+    const orig = ctx[fn];
+    if (typeof orig === 'function') ctx[fn] = function (e) { return inspect.webRequest(() => orig.call(this, e)); };
   }
   return { ctx, globals, inspect };
 }

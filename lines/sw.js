@@ -3,13 +3,16 @@
    • власні файли застосунку: спершу мережа, кеш — запасний варіант (офлайн);
    • шрифти Google: спершу кеш (вони версіоновані в URL);
    • НІКОЛИ не кешуємо дані: script.google.com / googleusercontent.com, запити з
-     action= / callback= (API, JSONP) та будь-які не-GET (POST) запити;
-   • нова версія чекає, доки користувач не натисне «Оновити» (повідомлення skipWaiting).
+     action= / callback= (API, JSONP), службові адреси емулятора /__* та будь-які не-GET (POST) запити;
+   • нова версія чекає, доки користувач не натисне «Оновити» (повідомлення skipWaiting);
+   • встановлення вдається лише з ПОВНИМ кешем оболонки (без мережі посеред оновлення нова версія
+     не встановиться — лишається попередня з повним кешем); старі кеші видаляються лише тоді,
+     коли кеш нової версії повний.
    Кеші мають префікс 'fl-lines-' — чужі кеші того ж домену не чіпаємо.
    ===================================================================== */
 'use strict';
 
-var VERSION = 'v1';
+var VERSION = 'v2';
 var PREFIX = 'fl-lines-';
 var SHELL = PREFIX + 'shell-' + VERSION;
 var FONTS = PREFIX + 'fonts-v1';
@@ -18,16 +21,16 @@ var SHELL_FILES = [
   './',
   './index.html',
   './manifest.webmanifest',
-  './assets/styles.css?v=1',
-  './assets/operator.css?v=1',
-  './assets/manager.css?v=1',
-  './assets/core.js?v=1',
-  './assets/local-store.js?v=1',
-  './assets/api.js?v=1',
-  './assets/ui.js?v=1',
-  './assets/app.js?v=1',
-  './assets/operator.js?v=1',
-  './assets/manager.js?v=1',
+  './assets/styles.css?v=2',
+  './assets/operator.css?v=2',
+  './assets/manager.css?v=2',
+  './assets/core.js?v=2',
+  './assets/local-store.js?v=2',
+  './assets/api.js?v=2',
+  './assets/ui.js?v=2',
+  './assets/app.js?v=2',
+  './assets/operator.js?v=2',
+  './assets/manager.js?v=2',
   './assets/icons/icon.svg',
   './assets/icons/favicon-32.png',
   './assets/icons/icon-192.png',
@@ -36,20 +39,42 @@ var SHELL_FILES = [
   './assets/icons/apple-touch-icon.png'
 ];
 
+/* без іконок застосунок працює — їх відсутність не зриває встановлення; решта файлів обовʼязкові */
+function optional(u) { return u.indexOf('/icons/') >= 0; }
+function required() { return SHELL_FILES.filter(function (u) { return !optional(u); }); }
+/* обовʼязкові файли, яких немає в кеші c → Promise<[url]> */
+function missing(c) {
+  return Promise.all(required().map(function (u) {
+    return c.match(new Request(u)).then(function (hit) { return hit ? null : u; });
+  })).then(function (l) { return l.filter(Boolean); });
+}
+
 self.addEventListener('install', function (e) {
   e.waitUntil(caches.open(SHELL).then(function (c) {
-    // по одному: відсутній файл не зриває встановлення
     return Promise.all(SHELL_FILES.map(function (u) {
-      return c.add(new Request(u, { cache: 'reload' })).catch(function () { /* пропуск */ });
+      return c.add(new Request(u, { cache: 'reload' })).catch(function (err) {
+        if (optional(u)) return;                     // іконка — не критично
+        throw err;                                   // інакше встановлення не вдається: працює попередня версія
+      });
     }));
   }));
 });
 
 self.addEventListener('activate', function (e) {
-  e.waitUntil(caches.keys().then(function (keys) {
-    return Promise.all(keys.filter(function (k) {
-      return k.indexOf(PREFIX) === 0 && k !== SHELL && k !== FONTS;
-    }).map(function (k) { return caches.delete(k); }));
+  e.waitUntil(caches.open(SHELL).then(function (c) {
+    // кеш могли частково витіснити між встановленням і активацією — докачуємо, поки є мережа
+    return missing(c).then(function (m) {
+      if (!m.length) return [];
+      return Promise.all(m.map(function (u) { return c.add(new Request(u, { cache: 'reload' })).catch(function () { /* офлайн */ }); }))
+        .then(function () { return missing(c); });
+    });
+  }).then(function (still) {
+    if (still.length) return;                        // новий кеш неповний — старі не чіпаємо (запасний варіант офлайн)
+    return caches.keys().then(function (keys) {
+      return Promise.all(keys.filter(function (k) {
+        return k.indexOf(PREFIX) === 0 && k !== SHELL && k !== FONTS;
+      }).map(function (k) { return caches.delete(k); }));
+    });
   }).then(function () { return self.clients.claim(); }));
 });
 
@@ -87,6 +112,7 @@ self.addEventListener('fetch', function (e) {
   if (url.origin !== self.location.origin) return;
   if (req.url.indexOf(self.registration.scope) !== 0) return;
   if (url.searchParams.has('action') || url.searchParams.has('callback')) return;
+  if (req.url.slice(self.registration.scope.length).indexOf('__') === 0) return;   // службові адреси емулятора (/__control, /__sheets…) — повз кеш
 
   // спершу мережа, кеш — запасний варіант
   e.respondWith(fetch(req).then(function (res) {

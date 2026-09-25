@@ -18,7 +18,7 @@
 
   --ink:#EFE7D9;
   --muted:#ABA092;
-  --dim:#80766A;
+  --dim:#948A7D;             /* ≥4.5:1 на всіх панелях темної теми */
 
   --accent:#E8A33D;          /* текст / рамки / посилання */
   --accent-bg:#E8A33D;       /* заливка головних кнопок */
@@ -32,7 +32,7 @@
   --info:#7F9BD8; --info-soft:rgba(111,143,208,.15);
 
   /* кольори станів лінії (SPEC 4.3) */
-  --st-off:#7E746A;
+  --st-off:#8C8278;          /* світліше за SPEC #7E746A: дрібний темний текст на смузі «Не працює» — ≥4.5:1 */
   --st-run:#86B860;
   --st-setup:#6F8FD0;
   --st-stop:#E8A33D;
@@ -192,11 +192,12 @@ body.no-config .tb-net,body.no-config .tb-op,body.no-config #tbMenu{display:none
 .view:focus{outline:none}
 .page{min-width:0}
 .page-head{display:flex;align-items:center;flex-wrap:wrap;gap:12px 18px;margin:0 0 20px}
-.page-head .ph-main{flex:1;min-width:0}
-.page-head h1{font-size:30px;font-weight:600;letter-spacing:.01em;overflow-wrap:anywhere}
+/* заголовок має власну основу — дії (чипи, кнопки) переносяться під нього, а не стискають його до 1 px */
+.page-head .ph-main{flex:1 1 min(280px,calc(100% - 72px));min-width:0}
+.page-head h1{font-size:30px;font-weight:600;letter-spacing:.01em;overflow-wrap:break-word;hyphens:auto}
 .page-head .ph-k{font-family:var(--f-display);font-size:13.5px;letter-spacing:.14em;text-transform:uppercase;color:var(--dim);margin-bottom:2px}
 .page-head .ph-sub{color:var(--muted);font-size:15.5px;margin-top:4px}
-.page-head .ph-act{display:flex;flex-wrap:wrap;gap:10px}
+.page-head .ph-act{display:flex;flex-wrap:wrap;gap:10px;flex:0 1 auto;min-width:0}
 .page-head .back{margin-left:-8px}
 .section-title{font-family:var(--f-display);font-size:14px;font-weight:600;letter-spacing:.14em;text-transform:uppercase;color:var(--dim);margin:26px 0 12px}
 
@@ -284,7 +285,7 @@ body.no-config .tb-net,body.no-config .tb-op,body.no-config #tbMenu{display:none
 .bigbtn .bb-badge{font-family:var(--f-mono);font-size:14px;padding:3px 9px;border-radius:999px;background:var(--bad-bg);color:#fff}
 .bigbtn .bb-chev{color:var(--dim)}
 .bigbtn.solid{background:var(--tone);border-color:var(--tone);color:var(--st-ink)}
-.bigbtn.solid .bb-s{color:inherit;opacity:.82}
+.bigbtn.solid .bb-s{color:inherit;font-weight:500}
 .bigbtn.solid .bb-ic{background:rgba(0,0,0,.14);color:inherit}
 .bigbtn.solid:hover{filter:brightness(1.06)}
 .bigbtn.compact{min-height:68px;padding:10px 14px}
@@ -476,13 +477,14 @@ input[type=datetime-local].inp,input[type=date].inp{font-family:var(--f-mono)}
 .modal.modal-sm{max-width:480px}
 .modal.modal-lg{max-width:980px}
 .modal.modal-full{max-width:none;height:100%}
-.modal-head{display:flex;align-items:center;gap:10px;min-height:64px;padding:6px 8px 6px 22px;border-bottom:1px solid var(--line)}
-.modal-head h2{flex:1;min-width:0;font-size:22px;overflow-wrap:anywhere}
+/* у вікні стискається лише тіло (прокрутка): заголовок і кнопки завжди видно повністю */
+.modal-head{display:flex;align-items:center;gap:10px;min-height:64px;padding:6px 8px 6px 22px;border-bottom:1px solid var(--line);flex-shrink:0}
+.modal-head h2{flex:1;min-width:0;font-size:22px;overflow-wrap:break-word;hyphens:auto}
 .modal-body{flex:1 1 auto;overflow:auto;padding:20px 22px;-webkit-overflow-scrolling:touch}
 .modal-text{font-size:17px;line-height:1.5}
 .modal-text p:last-child{margin-bottom:0}
-.modal-err{margin:0 22px 14px;padding:10px 14px;border:1px solid var(--bad);border-radius:var(--r);background:var(--bad-soft);color:var(--bad);font-weight:600;font-size:15.5px}
-.modal-foot{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:10px;padding:14px 22px;border-top:1px solid var(--line);background:var(--panel-2)}
+.modal-err{margin:0 22px 14px;padding:10px 14px;border:1px solid var(--bad);border-radius:var(--r);background:var(--bad-soft);color:var(--bad);font-weight:600;font-size:15.5px;flex-shrink:0}
+.modal-foot{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:10px;padding:14px 22px;border-top:1px solid var(--line);background:var(--panel-2);flex-shrink:0}
 .modal.is-busy .modal-body{opacity:.7}
 .modal.shake{animation:shake .35s}
 @keyframes shake{0%,100%{transform:translateX(0)}25%{transform:translateX(-8px)}50%{transform:translateX(7px)}75%{transform:translateX(-4px)}}
@@ -639,6 +641,8 @@ table.tbl tr.tbl-empty td{text-align:center;color:var(--dim);padding:28px}
 .wiz-card .lead{color:var(--muted);font-size:17px;margin-bottom:22px}
 .wiz-foot{display:flex;flex-wrap:wrap;gap:10px;justify-content:space-between;margin-top:26px;padding-top:18px;border-top:1px solid var(--line)}
 .wiz-foot .btn{min-width:140px}
+.wiz-show{display:inline-flex;margin:-10px 0 6px;font-size:15.5px;color:var(--muted)}
+.wiz-show input{width:24px;height:24px}
 .modes{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}
 .modecard{
   display:flex;flex-direction:column;gap:10px;padding:20px;text-align:left;
@@ -738,9 +742,16 @@ table.tbl tr.tbl-empty td{text-align:center;color:var(--dim);padding:28px}
   .wiz-steps li span{display:none}
   .wiz-steps li{padding:6px}
 }
+@media (max-width:420px){
+  /* довгі слова («переналаштування») вміщуються поряд із кнопкою «Назад» без розриву посеред слова */
+  .page-head h1{font-size:23px}
+}
 @media (max-width:370px){
   .tb-op .lbl{display:none}
   .brand span{display:none}
+}
+@media (max-width:340px){
+  .page-head h1{font-size:20px}
 }
 
 /* ================= ДОСТУПНІСТЬ / ДРУК ================= */

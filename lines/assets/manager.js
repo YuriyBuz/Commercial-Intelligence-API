@@ -82,7 +82,7 @@
   function isOffline() { var n = Api.net(); return n.mode === 'remote' && n.online === false; }
 
   /* ------------------------------ кеш даних розділу ------------------------------ */
-  var cache = { gen: 0, admin: null, adminAt: 0, adminGen: -1, dash: {}, plan: null, planKey: '', planAt: 0, rep: null };
+  var cache = { gen: 0, admin: null, adminAt: 0, adminGen: -1, dash: {}, plan: null, planKey: '', planAt: 0, rep: null, works: null };
   var inflight = {};
   function once(key, fn) {
     if (inflight[key]) return inflight[key];
@@ -130,7 +130,7 @@
   }
   /* дані змінилися: скинути кеш і оновити стан застосунку */
   function touched() {
-    cache.gen++; cache.adminAt = 0; cache.dash = {}; cache.planAt = 0; cache.rep = null;
+    cache.gen++; cache.adminAt = 0; cache.dash = {}; cache.planAt = 0; cache.rep = null; cache.works = null;
     return App.refresh();
   }
   /* збереження рядка довідника → Promise<row>; помилка → Error з текстом для людей */
@@ -232,6 +232,9 @@
     cont: { label: 'Робота без запуску', glyph: '→', text: 'лінія працювала з попередньої доби' },
     idle: { label: 'Не працювала', glyph: '', text: 'роботи не було' }
   };
+  /* «Н/З» (не застосовується) у чек-листах: сума за списком / текст для рядка */
+  function naSum(list) { var n = 0; (list || []).forEach(function (c) { n += +c.na || 0; }); return n; }
+  function naText(c) { return c && +c.na > 0 ? 'Н/З: ' + c.na : ''; }
   function cellTitle(l, x) {
     var m = CST[x.status] || CST.idle;
     var s = l.name + ' · ' + fmt.dayLabel(x.day) + ' — ' + m.label + '.';
@@ -239,6 +242,8 @@
     if (x.uncovered) s += ' Без чек-листа: ' + x.uncovered + '.';
     if (x.forced) s += ' Запуск попри зауваження: ' + x.forced + '.';
     if (x.checks && x.checks.length) s += ' Чек-листів: ' + x.checks.length + '.';
+    var na = naSum(x.checks);
+    if (na) s += ' Відповідей «Н/З»: ' + na + '.';
     if (x.run_h) s += ' Робота: ' + fmt.hm(x.run_h) + '.';
     return s;
   }
@@ -288,7 +293,8 @@
       '<div class="section-title">Чек-листи за день · ' + chk.length + '</div>' +
       (chk.length ? '<div class="list">' + chk.map(function (c) {
         return '<button type="button" class="list-item m-li-btn" data-chk="' + esc(c.id) + '" data-ts="' + esc(c.ts) + '"><div class="li-main"><div class="li-t">' +
-          esc(lbl('occasion', c.occasion)) + ' · ' + esc(fmt.time(c.ts)) + '</div></div>' + resultBadge(c.result) + icon('next', 20, 'dim') + '</button>';
+          esc(lbl('occasion', c.occasion)) + ' · ' + esc(fmt.time(c.ts)) + '</div>' + (naText(c) ? '<div class="li-s">' + esc(naText(c)) + '</div>' : '') + '</div>' +
+          resultBadge(c.result) + icon('next', 20, 'dim') + '</button>';
       }).join('') + '</div>' : '<div class="list"><div class="list-empty">Чек-листів цього дня не було</div></div>');
     var md = UI.modal({
       title: l.name + ' · ' + fmt.dayLabel(key), size: 'md', className: 'm-modal', body: body,
@@ -313,7 +319,8 @@
       actions: [{ label: 'Скасувати', tone: 'ghost', value: null }, { label: 'Анулювати', icon: 'trash', tone: 'danger', onClick: function (mm) {
         var note = mm.body.querySelector('[name="void_note"]').value.trim();
         if (!note) { UI.setErrors(mm.body, { void_note: 'Вкажіть причину — її побачать у журналі й таблиці' }); return false; }
-        return Api.call('void', { table: table, id: row.id, note: note }).then(function (r) {
+        // ts запису — сервер шукає його вікном навколо цього часу, а не читанням усього журналу
+        return Api.call('void', { table: table, id: row.id, ts: row.ts || undefined, note: note }).then(function (r) {
           if (!r.ok) throw new Error(errText(r));
           return true;
         });
@@ -346,8 +353,13 @@
         var val = a.value === '' || a.value === null || a.value === undefined ? '<span class="dim">не заповнено</span>' :
           esc(a.value) + (a.type === 'number' && a.unit_label ? ' ' + esc(a.unit_label) : '');
         var nt = a.type === 'number' ? normText(a) : '';
+        // «Н/З» без пояснення на обовʼязковому пункті або на критичному — перевірку не підтверджено (зауваження)
+        var naBad = a.type === 'check' && a.ok === false && a.value === LBL.check_value.na;
+        var naCrit = naBad && (a.note || (App.item(a.item_id) || {}).critical);
         return '<div class="m-an a-' + st + '"><span class="m-an-mk" aria-hidden="true">' + (st === 'ok' ? '✓' : st === 'bad' ? '✕' : '–') + '</span>' +
-          '<div class="m-an-t">' + esc(a.text) + (nt ? '<small>норма: ' + esc(nt) + '</small>' : '') + (a.note ? '<em>' + esc(a.note) + '</em>' : '') + '</div>' +
+          '<div class="m-an-t">' + esc(a.text) + (nt ? '<small>норма: ' + esc(nt) + '</small>' : '') +
+          (naBad ? '<small class="c-bad">' + (naCrit ? '«Н/З» не підтверджує критичний пункт' : '«Н/З» без пояснення — перевірку пропущено') + '</small>' : '') +
+          (a.note ? '<em>' + esc(a.note) + '</em>' : '') + '</div>' +
           '<div class="m-an-v">' + val + '<span class="sr">' + (st === 'ok' ? ' (в нормі)' : st === 'bad' ? ' (зауваження)' : '') + '</span></div></div>';
       }).join('') + '</div></div>';
     }).join('');
@@ -366,8 +378,8 @@
         '<span>' + esc(fmt.datetime(c.ts)) + '</span>' + (c.operator ? '<span>' + icon('user', 16) + esc(c.operator) + '</span>' : '') +
         (c.product ? '<span>' + icon('box', 16) + esc(c.product) + '</span>' : '') + '</div>' +
         '<div class="m-chk-nums">' +
-        [['Пунктів', c.total], ['Зауважень', c.failed], ['Поза нормою', c.out_of_range], ['Не заповнено', c.missing]].map(function (x) {
-          return '<span class="' + (x[0] !== 'Пунктів' && x[1] > 0 ? 'bad' : '') + '"><b>' + esc(String(x[1] || 0)) + '</b>' + esc(x[0]) + '</span>';
+        [['Пунктів', c.total], ['Зауважень', c.failed, 1], ['Поза нормою', c.out_of_range, 1], ['Не заповнено', c.missing, 1]].concat(+c.na > 0 ? [['Н/З', c.na]] : []).map(function (x) {
+          return '<span class="' + (x[2] && x[1] > 0 ? 'bad' : '') + '"><b>' + esc(String(x[1] || 0)) + '</b>' + esc(x[0]) + '</span>';
         }).join('') + (dur !== null && dur >= 0 ? '<span><b>' + esc(fmt.duration(dur)) + '</b>тривалість</span>' : '') + '</div>' +
         (c.comment ? '<div class="box m-comment">' + icon('info') + '<span>' + esc(c.comment) + '</span></div>' : '') +
         answersHtml(r.answers || []) +
@@ -506,11 +518,14 @@
         if (v.duration_min > 0) p.started = new Date(ts - v.duration_min * 60000).toISOString();
         if (meter && v.meter_value !== null && v.meter_value !== undefined) p.meter_value = v.meter_value;
         return Api.write('work', p, { wait: 6000 }).then(function (r) {
-          if (!r.ok) {
+          // пам’ять пристрою переповнена: запис прийнято в чергу вкладки й надішлеться — це не відмова
+          // (попередження показує App); повторне «Записати» створило б дубль
+          if (!r.ok && !memQueued(r)) {
             if (r.op) Api.discardRejected(r.op.op_id);
             throw new Error(r.message || 'Сервер відхилив запис');
           }
-          if (r.queued) UI.toast('Роботу збережено на пристрої — надішлеться автоматично, щойно буде зв’язок', { tone: 'info' });
+          if (memQueued(r)) UI.toast('Роботу прийнято, але пам’ять пристрою заповнена — не закривайте застосунок, доки запис не надішлеться', { tone: 'warn', ms: 8000 });
+          else if (r.queued) UI.toast('Роботу збережено на пристрої — надішлеться автоматично, щойно буде зв’язок', { tone: 'info' });
           else {
             var nd = r.data && r.data.due;
             UI.toast('Роботу записано' + (nd ? ' · строк ТО: ' + (lbl('due_status', nd.status) || '').toLowerCase() : ''), { tone: 'ok' });
@@ -522,6 +537,8 @@
     });
     md.result.then(function (v) { if (v && onDone) onDone(v); });
   }
+  /* Api.write: запис у черзі лише в пам’яті вкладки (сховище пристрою переповнене) — надішлеться, це не відмова */
+  function memQueued(r) { return !!(r && !r.ok && r.queued && r.error === 'STORAGE_FULL'); }
   /* перевірка числових полів: сирий текст не число / межі */
   function numErrs(root, v, errs, spec) {
     Object.keys(spec).forEach(function (k) {
@@ -556,12 +573,22 @@
   }
   function issuesBox(issues) {
     if (!issues || !issues.length) return '';
-    var why = { no_id: 'рядок без ID — застосунок його пропускає', duplicate: 'повторений ID — діє лише перший рядок з цим ID' };
-    return '<div class="box err m-issues" role="alert">' + icon('alert') + '<div><b>У Google-таблиці є рядки довідників, які застосунок пропускає (' + issues.length + ').</b>' +
+    var why = {
+      no_id: 'рядок без ID — застосунок його пропускає; задайте унікальний ID або видаліть порожній рядок',
+      duplicate: 'повторений ID — діє лише перший рядок з цим ID; задайте іншому рядку унікальний ID',
+      bad_pin: 'PIN некоректний (має бути 4–8 цифр) — вхід за PIN не працює; введіть PIN у стовпець «PIN» ще раз (формат «Звичайний текст», напр. 0427) або задайте його в розділі «Персонал»'
+    };
+    return '<div class="box err m-issues" role="alert">' + icon('alert') + '<div><b>У Google-таблиці є рядки довідників, які потребують виправлення (' + issues.length + ').</b>' +
       '<ul>' + issues.slice(0, 12).map(function (x) {
-        return '<li>Аркуш «' + esc(x.sheet) + '»: ' + (x.id ? 'ID <span class="mono">' + esc(x.id) + '</span>' : '') + (x.name ? ' «' + esc(x.name) + '»' : '') + ' — ' + esc(why[x.problem] || x.problem) + '</li>';
+        return '<li>Аркуш «' + esc(x.sheet) + '»: ' + (x.id ? 'ID <span class="mono">' + esc(x.id) + '</span>' : '') + (x.name ? ' «' + esc(x.name) + '»' : '') + ' — ' + esc(why[x.problem] || 'помилка в рядку (' + x.problem + ')') + '</li>';
       }).join('') + (issues.length > 12 ? '<li>… та ще ' + (issues.length - 12) + '</li>' : '') + '</ul>' +
-      '<p class="small">Відкрийте таблицю й виправте ці рядки: задайте унікальний ID або видаліть порожній рядок.</p></div></div>';
+      '<p class="small">Відкрийте Google-таблицю й виправте ці рядки — після оновлення даних повідомлення зникне.</p></div></div>';
+  }
+  /* ID людей із некоректним PIN у таблиці (config_issues bad_pin) */
+  function badPinIds(issues) {
+    var o = {};
+    (issues || []).forEach(function (x) { if (x.problem === 'bad_pin' && x.id) o[x.id] = 1; });
+    return o;
   }
 
   /* ================================= ОГЛЯД ================================= */
@@ -577,12 +604,101 @@
       });
     });
   }
-  function overviewView(p, host, ctx) {
-    var sh = shell(host, 'overview', { title: 'Огляд' });
-    var st = { d: null, err: null, rep: null, at: 0, showAll: false, loading: false };
-    function head() {
-      sh.setHead({ title: 'Огляд', sub: freshSub(st.at), actions: actBtn('refresh', 'Оновити', 'refresh') });
+  /* період показників огляду: 7 / 14 / 30 / 62 дні до сьогодні або свій (з … по …, не довше 62 днів) */
+  var OV_DAYS = [7, 14, 30, 62], OV_MAX = 62;
+  var oState = { period: '14', from: '', to: '' };
+  function daysText(n) { return n + ' ' + fmt.plural(n, ['день', 'дні', 'днів']); }
+  function keyShort(k) { return k.slice(8, 10) + '.' + k.slice(5, 7) + (k.slice(0, 4) === todayKey().slice(0, 4) ? '' : '.' + k.slice(0, 4)); }
+  function keyDate(k) { return k.slice(8, 10) + '.' + k.slice(5, 7) + '.' + k.slice(0, 4); }
+  function ovRange() {
+    var tk = todayKey();
+    if (oState.period === 'custom' && isKey(oState.from) && isKey(oState.to)) {
+      var to = oState.to > tk ? tk : oState.to, from = oState.from > to ? to : oState.from, cut = false;
+      if (U.keyDiff(from, to) + 1 > OV_MAX) { from = keyAdd(to, -(OV_MAX - 1)); cut = true; }
+      return { custom: true, from: from, to: to, days: U.keyDiff(from, to) + 1, cut: cut };
     }
+    var n = OV_DAYS.indexOf(+oState.period) >= 0 ? +oState.period : 14;
+    return { custom: false, from: keyAdd(tk, -(n - 1)), to: tk, days: n };
+  }
+  function rangeText(rg) {
+    if (!rg.custom) return daysText(rg.days);
+    return rg.from === rg.to ? keyShort(rg.from) : keyShort(rg.from) + ' – ' + keyShort(rg.to);
+  }
+  /* поточний (back=0) або попередній (back=1) календарний місяць */
+  function monthRange(back) {
+    var tk = todayKey(), first = tk.slice(0, 8) + '01';
+    if (!back) return { from: first, to: tk };
+    var last = keyAdd(first, -1);
+    return { from: last.slice(0, 8) + '01', to: last };
+  }
+  /* показники за період: до сьогодні — dashboard {days}; минулий період — {from, to}.
+     Сервер, який не знає from/to, повертає останні дні — такі дані не видаємо за інший період. */
+  function getDashRange(rg, maxAge) {
+    if (rg.to === todayKey()) return getDash(rg.days, maxAge);
+    var key = rg.from + ':' + rg.to, c = cache.dash[key], g = cache.gen;
+    if (c && c.gen === g && Date.now() - c.at < (maxAge === undefined ? 30000 : maxAge)) return Promise.resolve(c.r);
+    return once('dash' + key + ':' + g, function () {
+      return Api.call('dashboard', { days: rg.days, from: rg.from, to: rg.to }).then(function (r) {
+        if (r.ok && (!r.days || r.days[0] !== rg.from || r.days[r.days.length - 1] !== rg.to)) {
+          return { ok: false, error: 'RANGE', message: 'Сервер не підтримує показники за минулий період — оновіть серверну частину (Apps Script) до поточної версії застосунку. Періоди, що закінчуються сьогодні, доступні й зараз.' };
+        }
+        if (r.ok && g === cache.gen) cache.dash[key] = { r: r, at: Date.now(), gen: g };
+        return r;
+      });
+    });
+  }
+  function dashAt(rg) { var c = cache.dash[rg.to === todayKey() ? rg.days : rg.from + ':' + rg.to]; return c ? c.at : Date.now(); }
+  /* роботи за період: простій лінії за записами робіт і зведення за агрегатами */
+  function worksIn(rg, force) {
+    var key = rg.from + ':' + rg.to, c = cache.works, g = cache.gen;
+    if (!force && c && c.key === key && c.gen === g && Date.now() - c.at < 30000) return Promise.resolve(c.r);
+    return once('works' + key + ':' + g, function () {
+      return Api.call('history', { from: rg.from, to: rg.to, types: ['works'], include_void: false, limit: 5000 }).then(function (r) {
+        if (r.ok && g === cache.gen) cache.works = { key: key, gen: g, at: Date.now(), r: r };
+        return r;
+      });
+    });
+  }
+  /* зведення робіт по лініях і агрегатах: кількість за видами, простій лінії («Простій лінії, хв» у записі роботи) */
+  function worksAgg(works) {
+    var line = {}, unit = {}, units = [], order = {};
+    App.lines().forEach(function (l, i) { order[l.id] = i; });
+    (works || []).forEach(function (w) {
+      if (w.void || !App.line(w.line_id)) return;
+      var dm = +w.downtime_min > 0 ? +w.downtime_min : 0, uk = w.line_id + '|' + (w.unit_id || '');
+      var L = line[w.line_id] || (line[w.line_id] = { n: 0, types: {}, down: 0, downN: 0 });
+      var u = unit[uk];
+      if (!u) { u = unit[uk] = { line_id: w.line_id, unit_id: w.unit_id || '', n: 0, types: {}, down: 0, downN: 0, last: null }; units.push(u); }
+      [L, u].forEach(function (a) { a.n++; a.types[w.work_type] = (a.types[w.work_type] || 0) + 1; a.down += dm; if (dm) a.downN++; });
+      if (!u.last || Date.parse(w.ts) > Date.parse(u.last)) u.last = w.ts;
+    });
+    units.sort(function (a, b) { return (b.down - a.down) || (b.n - a.n) || (order[a.line_id] - order[b.line_id]) || unitName(a.unit_id).localeCompare(unitName(b.unit_id), 'uk'); });
+    return { line: line, units: units };
+  }
+  var NO_WORKS = { n: 0, types: {}, down: 0, downN: 0 };
+  function typesText(types) {
+    var ks = Object.keys(LBL.work_type).filter(function (k) { return types[k]; });
+    Object.keys(types).forEach(function (k) { if (!LBL.work_type[k]) ks.push(k); });
+    return ks.map(function (k) { return (LBL.work_type[k] || k) + ' ' + types[k]; }).join(' · ');
+  }
+  /* хвилини простою → «45 хв», «3 год 20 хв» (без переходу в доби — це сума простоїв) */
+  function minText(m) {
+    m = Math.round(m || 0);
+    if (m < 60) return m + ' хв';
+    return Math.floor(m / 60) + ' год' + (m % 60 ? ' ' + (m % 60) + ' хв' : '');
+  }
+  function overviewView(p, host, ctx) {
+    if (p.days && OV_DAYS.indexOf(+p.days) >= 0) oState.period = String(+p.days);
+    if (isKey(p.from) && isKey(p.to)) { oState.period = 'custom'; oState.from = p.from; oState.to = p.to; }
+    var sh = shell(host, 'overview', { title: 'Огляд' });
+    sh.body.innerHTML = '<div class="m-ov-now"></div><div class="m-filters m-ovp no-print"></div><div class="m-ov-per" aria-live="polite"></div>';
+    var nowEl = sh.body.querySelector('.m-ov-now'), barEl = sh.body.querySelector('.m-ovp'), perEl = sh.body.querySelector('.m-ov-per');
+    var st = { d: null, k: null, err: null, rep: null, w: null, wErr: null, rg: null, at: 0, showAll: false, unitsAll: false, seq: 0 };
+    function head() {
+      sh.setHead({ title: 'Огляд', sub: freshSub(st.at), actions: actBtn('csv', 'CSV', 'download', { title: 'Звіт по лініях і агрегатах за вибраний період — для Excel' }) + actBtn('refresh', 'Оновити', 'refresh') });
+    }
+    /* дані за останні 7 днів для KPI: з показників періоду, якщо він їх охоплює */
+    function kpiData() { var rg = st.rg; return rg && st.d && rg.to === todayKey() && rg.days >= 7 ? st.d : st.k; }
     function kpis() {
       var lines = App.lines(), by = {}, run = 0;
       lines.forEach(function (l) { var s = App.lineStatus(l.id); by[s.state] = (by[s.state] || 0) + 1; if (s.state === 'run') run++; });
@@ -592,7 +708,7 @@
       var h = kpi({ label: 'Працюють зараз', icon: 'play', value: run + '<small> з ' + lines.length + '</small>', sub: esc(other || (lines.length ? 'усі лінії в роботі' : 'ліній немає')), tone: run ? 'ok' : 'neutral' }) +
         kpi({ label: 'Прострочено ТО', icon: 'alert', value: String(due), sub: due ? 'потрібно виконати' : 'усе вчасно', tone: due ? 'bad' : 'ok', href: '#/m/maintenance?tab=due&status=due' }) +
         kpi({ label: 'Скоро ТО', icon: 'clock', value: String(soon), sub: soon ? 'наближається строк' : 'найближчим часом немає', tone: soon ? 'warn' : 'ok', href: '#/m/maintenance?tab=due&status=soon' });
-      var d = st.d;
+      var d = kpiData();
       if (d) {
         var keys = d.days.slice(-7), set = {}, starts = 0, cov = 0, stopH = 0, repH = 0;
         keys.forEach(function (k) { set[k] = 1; });
@@ -614,6 +730,7 @@
       return '<div class="m-kpis">' + h + '</div>';
     }
     function statusTable() {
+      var S = (App.state && App.state.settings) || {};
       var rows = App.lines().map(function (l) { return { l: l, s: App.lineStatus(l.id), due: App.dueFor(l.id) }; });
       return rtable([
         { label: 'Лінія', cls: 'm-rt-main', html: function (r) { return '<b>' + esc(r.l.name) + '</b>' + (r.l.kind ? '<small class="dim">' + esc(r.l.kind) + '</small>' : ''); } },
@@ -629,19 +746,21 @@
           if (!c || !c.ts) return '';
           return esc(lbl('occasion', c.occasion)) + ' · ' + esc(fmt.dt(c.ts)) + ' ' + resultBadge(c.result);
         } },
-        { label: 'ТО', html: function (r) {
+        { label: 'ТО', cls: 'm-st-to', html: function (r) {
           var nd = 0, ns = 0;
           r.due.forEach(function (d) { if (d.status === 'due') nd++; else if (d.status === 'soon') ns++; });
           var b = [];
           if (nd) b.push(UI.badge('прострочено ' + nd, 'due', { icon: 'alert' }));
           if (ns) b.push(UI.badge('скоро ' + ns, 'soon'));
-          var inWork = r.s.state === 'run' || r.s.state === 'stop';
-          if (inWork && (r.s.flag === 'no_checklist' || !r.s.start_check_valid)) b.push(UI.badge('без чек-листа', 'bad'));
+          // те саме правило, що й на плитці та екрані лінії: пізній чек-лист закриває питання,
+          // довга зміна після чек-листа — не порушення (для неї окрема позначка long_run)
+          if (App.checkMissing(r.s)) b.push(UI.badge('без чек-листа', 'bad', { icon: 'checklist' }));
+          if (r.s.long_run) b.push(UI.badge('понад ' + fmt.num(S.long_run_hours || 16) + ' год без завершення', 'soon', { icon: 'clock' }));
           return b.length ? '<div class="badges">' + b.join('') + '</div>' : '<span class="c-ok small">у нормі</span>';
         } }
       ], rows, { cls: 'm-wide', empty: 'Ліній немає — додайте їх у розділі «Обладнання»', attrs: function (r) { return { 'data-open': r.l.id, class: 'clickable', tabindex: '0', title: 'Відкрити лінію' }; } });
     }
-    function hoursHtml(d, lines) {
+    function hoursHtml(d, lines, rg) {
       var WS = UI.STATES.filter(function (s) { return s !== 'off'; });
       return '<div class="m-hss">' + lines.map(function (l) {
         var s = d.stats[l.id];
@@ -660,11 +779,11 @@
         }).join('');
         return '<div class="m-hs"><div class="m-hs-h"><b>' + esc(l.name) + '</b><span class="num">робота ' + esc(fmt.hours(h.run || 0)) + '</span></div>' +
           UI.stackBar(parts, { height: 16 }) +
-          '<div class="m-dc" aria-hidden="true">' + cols + '</div>' +
+          '<div class="m-dc' + (cols && d.days.length > 31 ? ' m-dc-dense' : '') + '" aria-hidden="true">' + cols + '</div>' +
           '<div class="m-hs-f">' + WS.filter(function (x) { return x !== 'run' && h[x] > 0.01; }).map(function (x) {
             return '<span><i style="background:' + UI.stateColor(x) + '"></i>' + esc(UI.stateLabel(x)) + ' ' + esc(fmt.hours(h[x])) + '</span>';
           }).join('') + '<span class="dim">не працювала ' + esc(fmt.hours(h.off || 0)) + '</span></div></div>';
-      }).join('') + '</div>' + UI.stateLegend(WS) + '<p class="dim small m-note">Стовпчики — доби (висота = 24 год), смуга — сумарно за 14 днів без часу, коли лінія не працювала.</p>';
+      }).join('') + '</div>' + UI.stateLegend(WS) + '<p class="dim small m-note">Стовпчики — доби (висота = 24 год), смуга — сумарно за ' + esc(rg.custom ? 'період ' + rangeText(rg) : rangeText(rg)) + ' без часу, коли лінія не працювала.</p>';
     }
     function stopsHtml(d, lines) {
       var agg = {}, per = {}, tot = 0;
@@ -675,10 +794,66 @@
       var items = Object.keys(agg).filter(function (k) { return agg[k] > 0.005; }).sort(function (a, b) { return agg[b] - agg[a]; }).map(function (k) {
         return { label: k, value: agg[k], color: 'var(--st-stop)', valueText: fmt.hm(agg[k]), title: per[k].join('\n') };
       });
-      return UI.bars(items, { empty: 'Простоїв за 14 днів не було' }) + (items.length ? '<p class="m-total">Разом простоїв: <b>' + esc(fmt.hm(tot)) + '</b></p>' : '');
+      return UI.bars(items, { empty: 'Простоїв за період не було' }) + (items.length ? '<p class="m-total">Разом простоїв: <b>' + esc(fmt.hm(tot)) + '</b></p>' : '');
+    }
+    /* звіт по лініях: робота, простої, ремонти (переходи в «Ремонт» і години), роботи за видами, простій за записами робіт */
+    function reportRows(d, lines) {
+      var wa = st.w, tot = { total: true, h: {}, s: { starts: 0, repairs: 0, repair_h: 0 }, w: wa ? { n: 0, types: {}, down: 0, downN: 0 } : null };
+      var rows = lines.filter(function (l) { return d.stats[l.id]; }).map(function (l) {
+        var s = d.stats[l.id], h = s.hours || {}, w = wa ? wa.line[l.id] || NO_WORKS : null;
+        UI.STATES.forEach(function (x) { tot.h[x] = (tot.h[x] || 0) + (h[x] || 0); });
+        tot.s.starts += s.starts || 0; tot.s.repairs += s.repairs || 0; tot.s.repair_h += s.repair_h || 0;
+        if (w) {
+          tot.w.n += w.n; tot.w.down += w.down; tot.w.downN += w.downN;
+          Object.keys(w.types).forEach(function (k) { tot.w.types[k] = (tot.w.types[k] || 0) + w.types[k]; });
+        }
+        return { l: l, h: h, s: s, w: w };
+      });
+      if (rows.length > 1) rows.push(tot);
+      return rows;
+    }
+    function reportHtml(d, lines) {
+      var rows = reportRows(d, lines), pend = !st.w && !st.wErr;
+      var wCell = function (r, fn) { return r.w ? fn(r.w) : pend ? '<span class="dim">…</span>' : '<span class="dim">—</span>'; };
+      var h = st.wErr ? '<div class="box warn m-rep-note">' + icon('alert') + '<span>Роботи за період не завантажено: ' + esc(errText(st.wErr, true)) + '</span></div>' : '';
+      if (st.w && st.w.truncated) h += '<div class="box warn m-rep-note">' + icon('alert') + '<span>Робіт за період понад 5000 — враховано лише останні. Виберіть коротший період.</span></div>';
+      return h + rtable([
+        { label: 'Лінія', cls: 'm-rt-main', html: function (r) { return r.total ? '<b>Усі лінії</b>' : '<b>' + esc(r.l.name) + '</b>'; } },
+        { label: 'Робота', html: function (r) { return '<b class="num">' + esc(fmt.hours(r.h.run || 0)) + '</b><small class="dim">' + esc('запусків: ' + (r.s.starts || 0)) + '</small>'; } },
+        { label: 'Простої', html: function (r) { return '<span class="num">' + esc(fmt.hours(r.h.stop || 0)) + '</span>'; } },
+        { label: 'Ремонти', html: function (r) {
+          var n = r.s.repairs || 0, rh = r.s.repair_h || 0;
+          return '<b class="num' + (n ? ' c-warn' : '') + '">' + n + '</b>' + (rh > 0.004 ? '<small class="dim">' + esc(fmt.hours(rh)) + ' у ремонті</small>' : '');
+        } },
+        { label: 'Роботи', cls: 'm-rep-w', html: function (r) {
+          return wCell(r, function (w) { return '<b class="num">' + w.n + '</b>' + (w.n ? '<small class="dim">' + esc(typesText(w.types)) + '</small>' : ''); });
+        } },
+        { label: 'Простій за роботами', html: function (r) {
+          return wCell(r, function (w) {
+            return w.down > 0 ? '<b class="num">' + esc(minText(w.down)) + '</b><small class="dim">' + esc(w.downN + ' ' + fmt.plural(w.downN, ['запис', 'записи', 'записів']) + ' з простоєм') + '</small>' : '<span class="dim">—</span>';
+          });
+        } }
+      ], rows, { cls: 'm-rep m-wide', empty: 'Ліній немає', attrs: function (r) {
+        return r.total ? { class: 'm-tot' } : { 'data-open': 'L|' + r.l.id, class: 'clickable', tabindex: '0', title: 'Журнал лінії за період' };
+      } }) + '<p class="dim small m-note">Ремонти — переходи лінії в стан «Ремонт» і час у ньому. Роботи — записи налаштувань, ремонтів, ТО і ППР; простій за роботами — сума поля «Простій лінії, хв» у цих записах.</p>';
+    }
+    function unitsHtml() {
+      if (st.wErr) return '<div class="list"><div class="list-empty">Роботи за період не завантажено</div></div>';
+      if (!st.w) return UI.spinner('Завантаження робіт…');
+      var list = st.w.units, show = st.unitsAll ? list : list.slice(0, 10);
+      if (!list.length) return '<div class="list"><div class="list-empty">За період робіт не записано</div></div>';
+      return rtable([
+        { label: 'Агрегат', cls: 'm-rt-main', html: function (u) {
+          return '<b>' + esc(u.unit_id ? unitName(u.unit_id) : 'Лінія загалом (без агрегата)') + '</b><small class="dim">' + esc(lineName(u.line_id)) + '</small>';
+        } },
+        { label: 'Роботи', cls: 'm-rep-w', html: function (u) { return '<b class="num">' + u.n + '</b><small class="dim">' + esc(typesText(u.types)) + '</small>'; } },
+        { label: 'Простій за роботами', html: function (u) { return u.down > 0 ? '<b class="num">' + esc(minText(u.down)) + '</b>' : '<span class="dim">—</span>'; } },
+        { label: 'Остання робота', html: function (u) { return u.last ? '<span class="num">' + esc(fmt.dt(u.last)) + '</span>' : ''; } }
+      ], show, { cls: 'm-rep m-rep-u', attrs: function (u) { return { 'data-open': 'U|' + u.line_id + '|' + u.unit_id, class: 'clickable', tabindex: '0', title: 'Роботи в журналі' }; } }) +
+        (list.length > show.length ? '<div class="btn-row m-more"><button type="button" class="btn sm ghost" data-m="units-all">Показати всі (' + list.length + ')</button></div>' : '');
     }
     function issuesHtml(list) {
-      if (!list.length) return '<div class="list"><div class="list-empty">За 14 днів зауважень у чек-листах і ремонтів не було</div></div>';
+      if (!list.length) return '<div class="list"><div class="list-empty">За період зауважень у чек-листах і ремонтів не було</div></div>';
       var show = st.showAll ? list : list.slice(0, 8);
       return '<div class="list m-iss">' + show.map(function (it, i) {
         return '<button type="button" class="list-item m-li-btn" data-iss="' + i + '"><span class="m-iss-ic k-' + esc(it.kind) + '">' + icon(it.kind === 'repair' ? 'wrench' : 'alert', 20) + '</span>' +
@@ -687,33 +862,116 @@
           (it.note ? '<div class="li-s m-iss-n">' + esc(it.note) + '</div>' : '') + '</div>' + icon('next', 20, 'dim') + '</button>';
       }).join('') + '</div>' + (list.length > show.length ? '<div class="btn-row m-more"><button type="button" class="btn sm ghost" data-m="more">Показати всі (' + list.length + ')</button></div>' : '');
     }
+    /* перемикач періоду: окремий блок, не перемальовується разом із даними (щоб не збивати введення дат) */
+    function drawBar() {
+      var rg = ovRange(), tk = todayKey(), cust = oState.period === 'custom';
+      barEl.innerHTML = '<div class="m-frow"><div class="m-fl"><span>Показники за період</span>' + UI.segmented({ name: 'ov_period', value: oState.period, size: 'sm', label: 'Період показників',
+        options: OV_DAYS.map(function (n) { return { value: String(n), label: daysText(n) }; }).concat([{ value: 'custom', label: 'Свій' }]) }) + '</div>' +
+        (cust ? '<label class="m-fl"><span>З</span><input class="inp" type="date" name="ov_from" value="' + esc(rg.from) + '" max="' + esc(tk) + '"></label>' +
+          '<label class="m-fl"><span>По</span><input class="inp" type="date" name="ov_to" value="' + esc(rg.to) + '" max="' + esc(tk) + '"></label>' +
+          '<div class="m-fl"><span>Швидкий вибір</span><div class="m-ovp-q">' + actBtn('month-0', 'Цей місяць', '', { tone: 'ghost' }) + actBtn('month-1', 'Минулий місяць', '', { tone: 'ghost' }) + '</div></div>' : '') +
+        '</div><p class="dim small m-fhint m-ovp-h"' + (cust && rg.cut ? '' : ' hidden') + '>Період — не довше ' + OV_MAX + ' днів: показано ' + esc(rangeText(rg)) + '.</p>';
+    }
+    function syncHint() {
+      var rg = ovRange(), el = barEl.querySelector('.m-ovp-h');
+      if (!el) return;
+      el.hidden = !(oState.period === 'custom' && rg.cut);
+      el.textContent = 'Період — не довше ' + OV_MAX + ' днів: показано ' + rangeText(rg) + '.';
+    }
+    function drawNow() {
+      nowEl.innerHTML = kpis() + (cache.admin ? issuesBox(cache.admin.config_issues) : '') +
+        card('Стан ліній', statusTable(), { icon: 'grid', hint: 'рядок — відкрити лінію', flush: true, cls: 'm-card-tbl' });
+    }
+    function drawPer() {
+      var lines = App.lines(), d = st.d, rg = st.rg || ovRange(), pt = rangeText(rg);
+      if (st.err) { perEl.innerHTML = errBox(st.err, 'retry'); return; }
+      if (!d) { perEl.innerHTML = UI.spinner('Завантаження показників…'); return; }
+      var iss = d.issues || [];
+      perEl.innerHTML = card('Щоденні перевірки · ' + pt, matrixHtml(d, lines), { icon: 'checklist', hint: 'клітинка — подробиці дня' }) +
+        card('Роботи, ремонти й простої · ' + pt, reportHtml(d, lines), { icon: 'wrench', hint: 'рядок — записи в журналі', flush: true, cls: 'm-card-tbl m-card-rep' }) +
+        '<div class="m-grid2">' + card('Години за станами · ' + pt, hoursHtml(d, lines, rg), { icon: 'activity' }) +
+        card('Причини простоїв · ' + pt, stopsHtml(d, lines), { icon: 'pause' }) + '</div>' +
+        card('Агрегати: роботи й простій · ' + pt, unitsHtml(), { icon: 'box', hint: 'рядок — роботи в журналі', flush: true, cls: 'm-card-tbl' }) +
+        card('Зауваження та ремонти · ' + pt, issuesHtml(iss), { icon: 'alert', flush: true, hint: iss.length >= 30 ? 'останні 30' : '' });
+    }
     function draw() {
       if (!ctx.alive()) return;
       head();
-      var lines = App.lines(), d = st.d;
-      var h = kpis() + (cache.admin ? issuesBox(cache.admin.config_issues) : '') + (st.err ? errBox(st.err, 'retry') : '');
-      h += card('Стан ліній', statusTable(), { icon: 'grid', hint: 'рядок — відкрити лінію', flush: true, cls: 'm-card-tbl' });
-      if (d) {
-        h += card('Щоденні перевірки · 14 днів', matrixHtml(d, lines), { icon: 'checklist', hint: 'клітинка — подробиці дня' });
-        h += '<div class="m-grid2">' + card('Години за станами · 14 днів', hoursHtml(d, lines), { icon: 'activity' }) +
-          card('Причини простоїв · 14 днів', stopsHtml(d, lines), { icon: 'pause' }) + '</div>';
-        h += card('Зауваження та ремонти · 14 днів', issuesHtml(d.issues || []), { icon: 'alert', flush: true });
-      } else if (!st.err) h += UI.spinner('Завантаження показників…');
-      sh.body.innerHTML = h;
+      drawNow();
+      drawPer();
     }
     function load(force) {
-      if (st.loading) return;
-      st.loading = true;
-      var pd = getDash(14, force ? 0 : 30000), pr = repairsSince(keyAdd(todayKey(), -6), force);
-      loadAdmin(false).then(function (a) { if (ctx.alive() && a.ok && a.config_issues && a.config_issues.length && !sh.body.querySelector('.m-issues')) draw(); });
-      return Promise.all([pd, pr]).then(function (res) {
-        st.loading = false;
-        if (!ctx.alive()) return;
-        if (res[0].ok) { st.d = res[0]; st.err = null; st.at = cache.dash[14] ? cache.dash[14].at : Date.now(); } else st.err = res[0];
+      var seq = ++st.seq, rg = ovRange(), tk = todayKey(), same = st.rg && st.rg.from === rg.from && st.rg.to === rg.to;
+      if (!same) { st.d = null; st.w = null; st.err = null; st.wErr = null; st.showAll = false; st.unitsAll = false; }
+      st.rg = rg;
+      var pd = getDashRange(rg, force ? 0 : 30000), pr = repairsSince(keyAdd(tk, -6), force);
+      var pk = rg.to === tk && rg.days >= 7 ? null : getDash(7, force ? 0 : 30000);
+      var pw = worksIn(rg, force);
+      loadAdmin(false).then(function (a) { if (ctx.alive() && a.ok && a.config_issues && a.config_issues.length && !sh.body.querySelector('.m-issues')) drawNow(); });
+      if (!same) drawPer();
+      pw.then(function (r) {
+        if (!ctx.alive() || seq !== st.seq) return;
+        if (r.ok) { st.w = worksAgg(r.works); st.w.truncated = !!(r.truncated && r.truncated.works); st.wErr = null; } else { st.w = null; st.wErr = r; }
+        if (st.d) drawPer();
+      });
+      return Promise.all([pd, pr, pk]).then(function (res) {
+        if (!ctx.alive() || seq !== st.seq) return;
+        if (res[0].ok) { st.d = res[0]; st.err = null; st.at = dashAt(rg); } else { st.d = null; st.err = res[0]; }
         st.rep = res[1];
+        st.k = res[2] && res[2].ok ? res[2] : null;
         draw();
       });
     }
+    /* звіт по лініях і агрегатах за період — CSV для Excel */
+    function exportCsv() {
+      var d = st.d, rg = st.rg, wa = st.w;
+      if (!d || !rg) { UI.toast(st.err ? 'Немає показників для вивантаження' : 'Показники ще завантажуються', { tone: 'info' }); return; }
+      var rows = [];
+      App.lines().forEach(function (l) {
+        var s = d.stats[l.id];
+        if (!s) return;
+        var cov = 0;
+        (d.compliance[l.id] || []).forEach(function (x) { cov += x.covered; });
+        rows.push({ line: l.name, unit: '', s: s, cov: cov, w: wa ? wa.line[l.id] || NO_WORKS : null });
+        if (wa) wa.units.filter(function (u) { return u.line_id === l.id; }).forEach(function (u) {
+          rows.push({ line: l.name, unit: u.unit_id ? unitName(u.unit_id) : 'без агрегата', s: null, w: u });
+        });
+      });
+      var WT = Object.keys(LBL.work_type), r2 = function (v) { return Math.round((v || 0) * 100) / 100; };
+      var cols = [
+        { label: 'Лінія', csv: function (r) { return r.line; } },
+        { label: 'Агрегат', csv: function (r) { return r.unit; } },
+        { label: 'Період з', csv: function () { return keyDate(rg.from); } },
+        { label: 'Період по', csv: function () { return keyDate(rg.to); } }
+      ].concat(UI.STATES.map(function (x) {
+        return { label: UI.stateLabel(x) + ', год', csv: function (r) { return r.s ? r2((r.s.hours || {})[x]) : ''; } };
+      })).concat([
+        { label: 'Запусків', csv: function (r) { return r.s ? r.s.starts || 0 : ''; } },
+        { label: 'Запусків із чек-листом', csv: function (r) { return r.s ? r.cov : ''; } },
+        { label: 'Ремонтів (переходів у «Ремонт»)', csv: function (r) { return r.s ? r.s.repairs || 0 : ''; } },
+        { label: 'Робіт усього', csv: function (r) { return r.w ? r.w.n : ''; } }
+      ]).concat(WT.map(function (k) {
+        return { label: 'Робіт: ' + LBL.work_type[k], csv: function (r) { return r.w ? r.w.types[k] || 0 : ''; } };
+      })).concat([
+        { label: 'Простій за роботами, хв', csv: function (r) { return r.w ? Math.round(r.w.down) : ''; } }
+      ]);
+      UI.csv('zvit-linii-' + rg.from + '_' + rg.to + '.csv', cols, rows);
+      if (!wa) UI.toast('Роботи за період ще не завантажено — стовпці робіт порожні', { tone: 'info' });
+    }
+    host.addEventListener('change', function (e) {
+      var t = e.target, dn = e.detail && e.detail.name;
+      if (dn === 'ov_period') {
+        oState.period = e.detail.value || '14';
+        if (oState.period === 'custom' && !(isKey(oState.from) && isKey(oState.to))) { var m0 = monthRange(0); oState.from = m0.from; oState.to = m0.to; }
+        drawBar(); load(false);
+        return;
+      }
+      if (t && (t.name === 'ov_from' || t.name === 'ov_to')) {
+        if (!isKey(t.value)) return;
+        oState[t.name === 'ov_from' ? 'from' : 'to'] = t.value;
+        syncHint(); load(false);
+      }
+    });
     host.addEventListener('click', function (e) {
       var b = e.target.closest('[data-m], [data-cell], [data-iss]');
       if (!b) return;
@@ -732,15 +990,32 @@
       }
       var a = b.getAttribute('data-m');
       if (a === 'refresh') { App.refresh(); load(true); }
-      else if (a === 'retry') { st.err = null; draw(); load(true); }
-      else if (a === 'more') { st.showAll = true; draw(); }
+      else if (a === 'retry') { st.err = null; st.rg = null; load(true); }
+      else if (a === 'more') { st.showAll = true; drawPer(); }
+      else if (a === 'units-all') { st.unitsAll = true; drawPer(); }
+      else if (a === 'csv') exportCsv();
+      else if (a === 'month-0' || a === 'month-1') {
+        var m = monthRange(a === 'month-1' ? 1 : 0);
+        oState.from = m.from; oState.to = m.to;
+        drawBar(); load(false);
+      }
     });
-    bindRows(host, function (id) { App.go('#/line/' + encodeURIComponent(id)); });
-    draw();
+    bindRows(nowEl, function (id) { App.go('#/line/' + encodeURIComponent(id)); });
+    /* рядок звіту → журнал за той самий період: лінія (стани й роботи) або агрегат (роботи) */
+    bindRows(perEl, function (v) {
+      var pv = String(v).split('|'), rg = st.rg;
+      if (!rg) return;
+      var q = '&from=' + rg.from + '&to=' + rg.to;
+      if (pv[0] === 'L') App.go('#/m/journal?line=' + encodeURIComponent(pv[1]) + '&types=events,works' + q);
+      else if (pv[0] === 'U') App.go('#/m/journal?line=' + encodeURIComponent(pv[1]) + (pv[2] ? '&unit=' + encodeURIComponent(pv[2]) : '') + '&types=works' + q);
+    });
+    head();
+    drawBar();
+    drawNow();
     load(false);
     return {
-      onBoot: function (state, meta) { if (meta && meta.source === 'queue') draw(); else load(false); },
-      onQueue: function () { draw(); }
+      onBoot: function (state, meta) { if (meta && meta.source === 'queue') { head(); drawNow(); } else load(false); },
+      onQueue: function () { drawNow(); }
     };
   }
   /* запис журналу за id (з вікна ±1 доба) → подробиці */
@@ -1051,7 +1326,7 @@
       case 'checks':
         return { main: '<b>' + esc(lbl('occasion', r.occasion)) + '</b> ' + resultBadge(r.result),
           sub: [r.total + ' ' + fmt.plural(r.total || 0, ['пункт', 'пункти', 'пунктів']), r.failed ? 'зауважень: ' + r.failed : '', r.out_of_range ? 'поза нормою: ' + r.out_of_range : '',
-            r.missing ? 'не заповнено: ' + r.missing : '', r.product, r.comment].filter(Boolean).join(' · '), who: r.operator };
+            r.missing ? 'не заповнено: ' + r.missing : '', naText(r), r.product, r.comment].filter(Boolean).join(' · '), who: r.operator };
       case 'works':
         return { main: '<b>' + esc(r.title || lbl('work_type', r.work_type)) + '</b> ' + UI.badge(lbl('work_type', r.work_type), r.work_type === 'repair' ? 'bad' : 'muted') +
           (r.rule_id ? ' ' + UI.badge('за регламентом', 'info') : ''),
@@ -1225,7 +1500,8 @@
           '<span>' + esc(starts ? cov + ' з ' + starts + ' ' + fmt.plural(starts, ['запуску', 'запусків', 'запусків']) + ' із чек-листом' : 'запусків не було') + '</span></div>' +
           UI.stackBar(parts, { height: 12 }) +
           '<div class="m-cs-l"><span><i style="background:var(--ok)"></i>норма ' + (s.checks_ok || 0) + '</span><span><i style="background:var(--warn)"></i>із зауваженнями ' + (s.checks_remarks || 0) + '</span>' +
-          '<span><i style="background:var(--bad)"></i>не пройдено ' + (s.checks_fail || 0) + '</span>' + (s.out_of_range ? '<span>поза нормою: ' + s.out_of_range + '</span>' : '') + '</div></div>';
+          '<span><i style="background:var(--bad)"></i>не пройдено ' + (s.checks_fail || 0) + '</span>' + (s.out_of_range ? '<span>поза нормою: ' + s.out_of_range + '</span>' : '') +
+          (s.checks_na ? '<span title="Відповідей «Не застосовується»">Н/З: ' + s.checks_na + '</span>' : '') + '</div></div>';
       }).join('') + '</div>';
     }
     function listHtml() {
@@ -1240,7 +1516,8 @@
           { label: 'Коли', cls: 'm-rt-main', html: function (c) { return '<b>' + esc(lbl('occasion', c.occasion)) + '</b> ' + resultBadge(c.result) + (c.void ? ' ' + UI.badge('анульовано', 'bad') : ''); } },
           { label: 'Підсумок', html: function (c) {
             var bad = [c.failed ? 'зауважень: ' + c.failed : '', c.out_of_range ? 'поза нормою: ' + c.out_of_range : '', c.missing ? 'не заповнено: ' + c.missing : ''].filter(Boolean);
-            return esc((c.total || 0) + ' ' + fmt.plural(c.total || 0, ['пункт', 'пункти', 'пунктів'])) + (bad.length ? '<small class="c-bad">' + esc(bad.join(' · ')) + '</small>' : '<small class="dim">без зауважень</small>');
+            return esc((c.total || 0) + ' ' + fmt.plural(c.total || 0, ['пункт', 'пункти', 'пунктів'])) + (bad.length ? '<small class="c-bad">' + esc(bad.join(' · ')) + '</small>' : '<small class="dim">без зауважень</small>') +
+              (naText(c) ? '<small class="dim m-na">' + esc(naText(c)) + '</small>' : '');
           } },
           { label: 'Оператор · продукт', html: function (c) { return esc(c.operator || '') + (c.product ? '<small class="dim">' + esc(c.product) + '</small>' : ''); } }
         ], list.slice(0, cState.show), { cls: 'm-jtbl2', empty: 'Чек-листів за умовами немає', attrs: function (c) { return { 'data-open': c.id, class: 'clickable' + (c.void ? ' is-void' : ''), tabindex: '0' }; } }) +
@@ -1689,8 +1966,9 @@
       }).then(function (s) {
         if (s === null) return;
         Api.write('reading', { meter_id: m.id, value: UI.num(s), mode: m.mode, operator: 'Керівник', note: 'Внесено в розділі керівництва' }, { wait: 5000 }).then(function (r) {
-          if (!r.ok) { if (r.op) Api.discardRejected(r.op.op_id); UI.alert({ title: 'Показник не записано', text: r.message || 'Сервер відхилив запис' }); return; }
-          UI.toast(r.queued ? 'Показник збережено на пристрої — надішлеться автоматично' : 'Показник записано', { tone: r.queued ? 'info' : 'ok' });
+          if (!r.ok && !memQueued(r)) { if (r.op) Api.discardRejected(r.op.op_id); UI.alert({ title: 'Показник не записано', text: r.message || 'Сервер відхилив запис' }); return; }
+          if (memQueued(r)) UI.toast('Показник прийнято, але пам’ять пристрою заповнена — не закривайте застосунок, доки запис не надішлеться', { tone: 'warn', ms: 8000 });
+          else UI.toast(r.queued ? 'Показник збережено на пристрої — надішлеться автоматично' : 'Показник записано', { tone: r.queued ? 'info' : 'ok' });
           touched();
           reload();
         });
@@ -1742,13 +2020,15 @@
         '</div></fieldset>' +
         UI.field.number({ name: 'warn_days', label: 'Попереджати за', value: r ? r.warn_days : null, unit: 'дн.', hint: 'Порожньо — як у налаштуваннях (' + nf(S.warn_days) + ' дн.)' }) +
         UI.field.number({ name: 'warn_pct', label: 'Попереджати з', value: r ? r.warn_pct : null, unit: '%', hint: 'Порожньо — ' + nf(S.warn_pct) + ' % інтервалу' }) +
-        UI.field.text({ name: 'notify', label: 'Email для сповіщень', value: r ? r.notify : '', className: 'span-2', maxLength: 500, placeholder: 'mechanic@zavod.ua', hint: 'Додатково до керівництва; кілька — через кому' }) +
+        UI.field.text({ name: 'notify', label: 'Email для сповіщень', value: r ? r.notify : '', className: 'span-2', maxLength: 500, placeholder: 'mechanic@zavod.ua', hint: 'Додатково до керівництва й механіків / електриків лінії з розділу «Персонал»; кілька — через кому' }) +
         UI.field.textarea({ name: 'instructions', label: 'Інструкція', value: r ? r.instructions : '', className: 'span-2', rows: 3, maxLength: 4000, placeholder: 'Що зробити, які матеріали, на що звернути увагу' }) +
         (canHelp ? '<fieldset class="span-2 m-fs"><legend>' + (isNew ? 'Відлік першого строку' : 'Змінити відлік') + '</legend>' +
-          '<p class="dim small">Якщо роботу вже виконували до початку обліку — вкажіть коли і скільки напрацьовано відтоді. ' + (isNew ? 'Якщо поля порожні, відлік почнеться з сьогодні.' : 'Порожні поля — відлік не змінюється.') + '</p><div class="form-grid">' +
+          '<p class="dim small">Вкажіть, коли роботу виконували востаннє, — напрацювання відтоді застосунок порахує з журналу. ' +
+          '«Напрацювання відтоді» / «За лічильником відтоді» заповнюйте лише для дати до початку обліку (загальне напрацювання з того часу). ' +
+          (isNew ? 'Якщо поля порожні, відлік почнеться з сьогодні.' : 'Порожні поля — відлік не змінюється.') + '</p><div class="form-grid">' +
           UI.field.date({ name: 'last_done_date', label: 'Востаннє виконано', attrs: { max: todayKey() } }) +
-          UI.field.number({ name: 'used_hours', label: 'Напрацювання відтоді', unit: 'мотогод' }) +
-          UI.field.number({ name: 'used_meter', label: 'За лічильником відтоді', hint: 'Якщо задано лічильник' }) + '</div></fieldset>'
+          UI.field.number({ name: 'used_hours', label: 'Напрацювання відтоді', unit: 'мотогод', hint: 'Лише для дати до початку обліку; порожньо — з журналу' }) +
+          UI.field.number({ name: 'used_meter', label: 'За лічильником відтоді', hint: 'Якщо задано лічильник; порожньо — з журналу' }) + '</div></fieldset>'
           : '<div class="span-2 box info m-formhint">' + icon('info') + 'Відлік веде журнал робіт: востаннє виконано ' + esc(fmt.date(r.last_date)) + '. Щоб задати нове виконання, запишіть роботу («Позначити виконаним»).</div>') +
         sortField(r) + '<div></div>' + activeField(r) + '</div>';
       formModal({
@@ -1829,6 +2109,15 @@
 
   /* ================================= ПЕРСОНАЛ ================================= */
   var staffOff = false;
+  /* хто з «Персонал» отримує листи (ядро: MAIL_ROLES; потрібні email і активність) */
+  var MAIL_ROLES_TEXT = 'Керівник — усі листи (щоденний звіт, строки ТО, ремонти, зауваження в чек-листах); Механік / Електрик — строки ТО і ремонти; ' +
+    'Контроль якості — зауваження в чек-листах; Оператор / Наладчик — листів не отримують. Вибрані «Лінії» обмежують листи про події цими лініями';
+  function mailHint(role, hasLines) {
+    var what = { manager: 'всі листи: щоденний звіт, строки ТО, ремонти, зауваження в чек-листах', mechanic: 'листи про строки ТО і ремонти',
+      electrician: 'листи про строки ТО і ремонти', qa: 'листи про зауваження в чек-листах' }[role];
+    if (!what) return (lbl('role', role) || 'Ця посада') + ' — листів не отримує (листи — керівникам, механікам, електрикам і контролю якості).';
+    return 'Отримуватиме ' + what + (hasLines ? (role === 'manager' ? ' (про події — лише вибраних ліній, звіт — повний)' : ' — лише вибраних ліній') : ' — про всі лінії') + '.';
+  }
   function staffView(p, host, ctx) {
     var sh = shell(host, 'staff', { title: 'Персонал', actions: actBtn('add-staff', 'Додати людину', 'plus', { tone: 'primary' }) });
     var st = { a: cache.admin, err: null };
@@ -1840,31 +2129,46 @@
       if (!ctx.alive()) return;
       if (!st.a) { sh.body.innerHTML = st.err ? errBox(st.err, 'retry') : UI.spinner('Завантаження…'); return; }
       var all = st.a.staff.slice().sort(bySort), off = all.filter(function (s) { return !s.active; }).length;
-      var list = all.filter(function (s) { return staffOff || s.active; });
+      var list = all.filter(function (s) { return staffOff || s.active; }), badPin = badPinIds(st.a.config_issues);
       sh.body.innerHTML = '<div class="m-tb"><span class="muted">' + all.filter(function (s) { return s.active; }).length + ' активних</span><span class="grow"></span>' + offToggle(off, staffOff) + '</div>' +
         rtable([
           { label: 'ПІБ', cls: 'm-rt-main', html: function (s) { return '<b>' + esc(s.name) + '</b>' + (s.active ? '' : ' ' + UI.badge('вимкнено', 'muted')); } },
           { label: 'Посада', html: function (s) { return esc(lbl('role', s.role)); } },
           { label: 'Лінії', html: linesText },
           { label: 'Email', html: function (s) { return s.email ? '<span class="m-mail">' + esc(s.email) + '</span>' : ''; } },
-          { label: 'PIN', html: function (s) { return s.has_pin ? '<span class="m-pin">' + icon('lock', 16) + 'є</span>' : '<span class="dim">без PIN</span>'; } }
+          { label: 'PIN', html: function (s) {
+            if (badPin[s.id]) return UI.badge('PIN некоректний', 'bad', { icon: 'alert' }) + '<small class="dim">вхід за PIN не працює</small>';
+            return s.has_pin ? '<span class="m-pin">' + icon('lock', 16) + 'є</span>' : '<span class="dim">без PIN</span>';
+          } }
         ], list, { empty: 'Людей ще немає', attrs: function (s) { return { 'data-open': s.id, class: 'clickable' + (s.active ? '' : ' m-off-row'), tabindex: '0' }; } }) +
-        '<p class="dim small m-note">Оператор обирає себе на планшеті перед записом. Якщо задано PIN — його треба ввести. «Лінії» обмежують, на яких планшетах людина в списку; порожньо — усі лінії.</p>';
+        '<p class="dim small m-note">Оператор обирає себе на планшеті перед записом. Якщо задано PIN — його треба ввести. «Лінії» обмежують, на яких планшетах людина в списку; порожньо — усі лінії.</p>' +
+        '<p class="dim small m-note">' + icon('send', 16) + ' Листи отримують активні люди з email — за посадою: ' + esc(MAIL_ROLES_TEXT) + '.</p>';
     }
     function staffForm(s) {
       var isNew = !s, ls = (st.a.lines || []).filter(function (l) { return l.active || (s && s.line_ids.indexOf(l.id) >= 0); }).sort(bySort);
+      var pinBad = !!(s && badPinIds(st.a.config_issues)[s.id]);
       var body = '<div class="form-grid">' +
         UI.field.text({ name: 'name', label: 'Прізвище та імʼя', value: s ? s.name : '', required: true, className: 'span-2', maxLength: 120 }) +
         UI.field.select({ name: 'role', label: 'Посада', value: s ? s.role : 'operator', options: UI.options('role') }) +
-        UI.field.email({ name: 'email', label: 'Email', value: s ? s.email : '', maxLength: 200, placeholder: 'для сповіщень (необовʼязково)' }) +
+        UI.field.email({ name: 'email', label: 'Email', value: s ? s.email : '', maxLength: 200, placeholder: 'необовʼязково',
+          hint: mailHint(s ? s.role : 'operator', !!(s && s.line_ids.length)) }) +
         UI.field.chips({ name: 'line_ids', label: 'Лінії', multi: true, value: s ? s.line_ids : [], className: 'span-2', options: ls.map(function (l) { return { value: l.id, label: l.name }; }),
-          hint: 'Не вибрано жодної — людина може працювати на всіх лініях' }) +
+          hint: 'Не вибрано жодної — усі лінії (і на планшетах, і в листах)' }) +
         UI.field.password({ name: 'pin', label: s && s.has_pin ? 'Новий PIN' : 'PIN', maxLength: 8, inputmode: 'numeric', attrs: { autocomplete: 'new-password', pattern: '[0-9]*' },
-          placeholder: s && s.has_pin ? 'не змінювати' : 'без PIN', hint: '4–8 цифр. Оператор вводить його на планшеті.' }) +
+          placeholder: s && s.has_pin && !pinBad ? 'не змінювати' : 'без PIN',
+          hint: pinBad ? 'PIN у Google-таблиці некоректний, вхід за ним не працює — введіть новий (4–8 цифр) або приберіть PIN.' : '4–8 цифр. Оператор вводить його на планшеті.' }) +
         (s && s.has_pin ? UI.field.check({ name: 'clear_pin', label: 'Прибрати PIN', value: false, className: 'm-chk-al' }) : '<div></div>') +
         sortField(s) + '<div></div>' + activeField(s) + '</div>';
       formModal({
         title: isNew ? 'Нова людина' : s.name, body: body,
+        onOpen: function (md) {
+          // підказка «хто отримує листи» — за вибраною посадою й лініями
+          var upd = function () {
+            var v = UI.readForm(md.body), h = md.body.querySelector('[data-field="email"] .field-hint');
+            if (h) h.textContent = mailHint(v.role, !!(v.line_ids && v.line_ids.length));
+          };
+          md.body.addEventListener('change', upd);
+        },
         extra: !isNew && s.active ? { label: 'Вимкнути', icon: 'power', tone: 'ghost', className: 'm-danger-t m-foot-left', onClick: function (mm) { mm.close(null); deactivate('staff', s, 'людину', function () { load(true); }); return false; } } : null,
         validate: function (v, mm) {
           var e = {};
@@ -1934,7 +2238,9 @@
       case 'list':
         return UI.field.textarea({ name: name, label: lab, value: (val || []).join('\n'), rows: 5, className: 'span-2', hint: 'Кожен пункт з нового рядка.', maxLength: 4000 });
       case 'emails':
-        return UI.field.textarea({ name: name, label: lab, value: (val || []).join(', '), rows: 2, className: 'span-2', hint: hint + '. Можна з нового рядка.', maxLength: 2000, placeholder: 'director@zavod.ua, engineer@zavod.ua' });
+        if (m.key === 'manager_emails') hint += '. Можна з нового рядка. Керівники з email у розділі «Персонал» отримують листи й без цього поля; механіки, електрики й контроль якості — листи за своєю посадою.';
+        else hint += '. Можна з нового рядка.';
+        return UI.field.textarea({ name: name, label: lab, value: (val || []).join(', '), rows: 2, className: 'span-2', hint: hint, maxLength: 2000, placeholder: 'director@zavod.ua, engineer@zavod.ua' });
       case 'tz':
         return UI.field.text({ name: name, label: lab, value: val, hint: hint, datalist: TZS, maxLength: 60 });
       default:
@@ -1998,13 +2304,13 @@
     }
     function digestHtml() {
       var d = st.digest;
-      if (!d) return '<p class="dim">Щоденний звіт формується о ' + esc(String(cur().digest_hour)) + ':00 і надсилається на email керівництва.</p>' + actBtn('digest', 'Показати звіт зараз', 'eye');
+      if (!d) return '<p class="dim">Щоденний звіт формується о ' + esc(String(cur().digest_hour)) + ':00 і надсилається на «Email керівництва» та керівникам з email у розділі «Персонал».</p>' + actBtn('digest', 'Показати звіт зараз', 'eye');
       if (d.loading) return UI.spinner('Формуємо звіт…');
       if (!d.ok) return errBox(d, 'digest');
       var to = (d.to || []).join(', '), c = d.counts || {};
       return '<div class="m-dg-meta">' + UI.kv([
         ['Тема', esc(d.subject)],
-        ['Кому', to ? '<span class="m-mail">' + esc(to) + '</span>' : '<span class="c-warn">email керівництва не задано — звіт нікому не надсилатиметься</span>'],
+        ['Кому', to ? '<span class="m-mail">' + esc(to) + '</span>' : '<span class="c-warn">нікому: немає ні «Email керівництва», ні керівників з email у розділі «Персонал» — звіт не надсилатиметься</span>'],
         ['Зміст', d.has_content ? 'є що повідомити: прострочено ТО ' + (c.due || 0) + ', скоро ' + (c.soon || 0) + ', зауважень ' + (c.failed || 0) + ', ремонтів ' + (c.repairs || 0) :
           'нічого термінового' + (cur().digest_mode === 'if_any' ? ' — за режимом «лише коли є що повідомити» звіт не надсилатиметься' : '')]
       ]) + '</div><iframe class="m-dg-frame" sandbox="" title="Попередній перегляд щоденного звіту" referrerpolicy="no-referrer"></iframe>' +
@@ -2098,7 +2404,7 @@
           if (!y) return;
           var md = UI.modal({ title: 'Скидання демо-даних', body: UI.spinner('Створюємо демо-дані заново…'), locked: true, size: 'sm' });
           LocalBackend.resetDemo().then(function () {
-            cache.gen++; cache.admin = null; cache.adminAt = 0; cache.dash = {}; cache.planAt = 0; cache.rep = null;
+            cache.gen++; cache.admin = null; cache.adminAt = 0; cache.dash = {}; cache.planAt = 0; cache.rep = null; cache.works = null;
             return App.refresh();
           }).then(function () {
             md.close();
@@ -2137,5 +2443,5 @@
   });
 
   /* для інших екранів і тестів */
-  window.Manager = { markDone: markDone, openCheck: openCheck, openRecord: openRecord, refreshCache: function () { cache.gen++; cache.adminAt = 0; cache.dash = {}; cache.planAt = 0; cache.rep = null; } };
+  window.Manager = { markDone: markDone, openCheck: openCheck, openRecord: openRecord, refreshCache: function () { cache.gen++; cache.adminAt = 0; cache.dash = {}; cache.planAt = 0; cache.rep = null; cache.works = null; } };
 })();

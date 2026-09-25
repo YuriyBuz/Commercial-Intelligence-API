@@ -63,18 +63,39 @@ var App = (function () {
   function lineStatus(lineId) { return Api.lineStatus(lineId, state); }
   function dueFor(lineId) { return Api.dueFor(lineId, state); }
   function now() { return Api.now(); }
-  /* години роботи сьогодні з урахуванням часу після bootstrap (для живого відображення) */
+  /* години роботи сьогодні (день заводу) з урахуванням часу після bootstrap (для живого відображення).
+     today_h із bootstrap, порахованого вчора (планшет офлайн після півночі), — це вже не «сьогодні». */
   function liveTodayHours(s) {
     if (!s) return 0;
-    var h = s.today_h || 0;
-    if (s.state === 'run' && s.as_of) {
-      var from = Math.max(Date.parse(s.as_of), s.since ? Date.parse(s.since) : 0);
-      var ms = now().getTime() - from;
-      if (ms > 0 && fmt.dayKey(now()) === fmt.dayKey(new Date(from))) h += ms / 3600000;
+    var t = now().getTime(), today = fmt.dayKey(new Date(t));
+    var asOf = tms(s.as_of), sameDay = !isNaN(asOf) && fmt.dayKey(new Date(asOf)) === today;
+    var h = sameDay ? (s.today_h || 0) : 0;
+    if (s.state === 'run') {
+      var since = tms(s.since), from = NaN;
+      if (sameDay) from = isNaN(since) ? asOf : Math.max(asOf, since);
+      else if (!isNaN(since)) { var d0 = fmt.dayStart(today); from = Math.max(since, d0 ? d0.getTime() : since); }
+      if (!isNaN(from) && t > from) h += (t - from) / 3600000;
     }
     return h;
   }
+  /* лінія працює без чек-листа запуску — одне правило для плитки, екрана лінії й таблиці керівника:
+     запуск цієї роботи позначено «без чек-листа» (або про нього нічого не відомо, а робота почалася недавно —
+     у межах checklist_valid_hours) і відтоді чинного чек-листа запуску не пройдено. Звичайна довга зміна
+     після чек-листа — НЕ порушення (для неї є попередження long_run). */
+  function checkMissing(s) {
+    if (!s || (s.state !== 'run' && s.state !== 'stop') || s.start_check_valid) return false;
+    var S = (state && state.settings) || {}, validMs = (S.checklist_valid_hours || 12) * 3600000;
+    var ws = tms(s.work_since), lc = s.last_check;
+    // чек-лист запуску пройдено вже в цій роботі (зокрема пізній) — навіть якщо його строк минув
+    if (lc && lc.occasion === 'start' && !isNaN(ws) && tms(lc.ts) >= ws) return false;
+    if (s.flag === 'no_checklist') return true;
+    // поточна подія й почала цю роботу, і сервер не позначив її — запуск був із чинним чек-листом
+    if (!isNaN(ws) && tms(s.since) === ws) return false;
+    if (S.require_start_checklist === false || isNaN(ws)) return false;
+    return now().getTime() - ws < validMs;
+  }
   function mode() { return Api.config().mode || ''; }
+  function tms(v) { var d = UI.toDate(v); return d ? d.getTime() : NaN; }
 
   /* ------------------------------ тема ------------------------------ */
   function applyTheme(t) {
@@ -92,8 +113,16 @@ var App = (function () {
   function theme() { return document.documentElement.getAttribute('data-theme') === 'light' ? 'light' : 'dark'; }
 
   /* ------------------------------ маршрутизатор ------------------------------ */
-  var routes = [], current = null, seq = 0, dirty = false, navStack = [], lastHash = '', skipHash = false, viewEl = null, started = false;
+  var routes = [], current = null, seq = 0, dirty = false, lastHash = '', viewEl = null, started = false;
   var waitingText = '';
+  /* історія: кожен запис позначено номером (history.state.fl) — так відрізняємо «назад» / «вперед» / новий
+     перехід. navHash[i] — хеш запису i, відомий у цьому сеансі; histBase — номер запису, з якого сеанс почався. */
+  var histIdx = 0, histBase = 0, navHash = [], leaving = false;
+  function stateIdx() { var s = history.state; return s && typeof s === 'object' && typeof s.fl === 'number' ? s.fl : null; }
+  function stamp(i) {
+    var s = history.state && typeof history.state === 'object' ? history.state : {};
+    try { history.replaceState(assign({}, s, { fl: i }), ''); } catch (e) { /* пропуск */ }
+  }
   function compile(pattern) {
     var keys = [];
     var src = String(pattern || '/').replace(/\/+$/, '') || '/';
@@ -157,7 +186,8 @@ var App = (function () {
     var cur = current = { loc: loc, m: m, ctx: ctx, ctrl: null, waiting: false };
     lastHash = loc.hash;
     updateChrome();
-    if (reason === 'nav') window.scrollTo(0, 0);
+    // новий екран під пальцем: другий дотик подвійного тапу не повинен натиснути кнопку на ньому
+    if (reason === 'nav') { window.scrollTo(0, 0); UI.armTapGuard(); }
     if (!m) { renderNotFound(host, loc); emit('route', ctx); return; }
     if (m.r.opts.boot !== false && !state) { cur.waiting = true; renderWaiting(host); emit('route', ctx); return; }
     if (m.r.opts.title) setTitle(m.r.opts.title);
@@ -178,30 +208,53 @@ var App = (function () {
     dirty = false;
     if (o.replace) {
       history.replaceState(history.state, '', hash);
-      if (navStack.length) navStack[navStack.length - 1] = hash; else navStack.push(hash);
+      navHash[histIdx] = hash;
       render('nav');
     } else if (location.hash === hash) render('nav');
     else location.hash = hash;
   }
-  /* назад у межах застосунку; якщо історії немає — на fallback (типово '#/') */
+  /* назад у межах застосунку; якщо історії цього сеансу немає — на fallback (типово '#/') */
   function back(fallback) {
-    if (navStack.length > 1) history.back();
+    if (histIdx > histBase) history.back();
     else go(fallback || '#/', { replace: true });
   }
+  /* назад саме на hash: якщо попередній запис історії — він, крок назад; інакше перехід із заміною запису */
+  function backTo(hash) {
+    hash = String(hash || '#/');
+    if (histIdx > histBase && navHash[histIdx - 1] === hash) history.back();
+    else go(hash, { replace: true });
+  }
+  /* хеш попереднього запису історії цього сеансу або '' */
+  function prevHash() { return histIdx > histBase ? navHash[histIdx - 1] || '' : ''; }
   function onHashChange() {
-    if (skipHash) { skipHash = false; return; }
     var h = location.hash || '#/';
-    if (h === lastHash) return;
+    var idx = stateIdx();
+    if (h === lastHash) { if (idx !== null) histIdx = idx; return; }
     if (dirty && lastHash) {
-      var target = h, from = lastHash;
-      history.replaceState(history.state, '', from);
+      // брудний екран: скасовуємо сам перехід, НЕ переписуючи інших записів історії
+      var target = h, step = idx === null ? null : idx - histIdx;
+      if (step === null) history.back();              // новий запис (посилання): повернутися; запис «уперед» лишиться зайвим
+      else if (step) history.go(-step);               // «Назад» / «Вперед» браузера: зробити крок у зворотний бік
+      else history.replaceState(history.state, '', lastHash);
+      if (leaving) return;                            // питання вже на екрані
+      leaving = true;
       UI.confirm({ title: 'Покинути екран?', text: 'Введені дані ще не збережено — їх буде втрачено.', ok: 'Покинути', cancel: 'Залишитися', danger: true })
-        .then(function (yes) { if (yes) { dirty = false; location.hash = target; } });
+        .then(function (yes) {
+          leaving = false;
+          if (!yes) return;
+          dirty = false;
+          if (step) history.go(step);                 // повторити той самий крок історії
+          else location.hash = target;
+        });
       return;
     }
-    if (navStack.length >= 2 && navStack[navStack.length - 2] === h) navStack.pop();
-    else navStack.push(h);
-    if (navStack.length > 60) navStack.splice(0, navStack.length - 60);
+    if (idx === null) {                               // новий запис історії: позначаємо, «уперед» більше немає
+      idx = histIdx + 1;
+      stamp(idx);
+      navHash.length = idx;
+    }
+    histIdx = idx;
+    navHash[idx] = h;
     render('nav');
   }
   function setDirty(b) { dirty = !!b; }
@@ -324,6 +377,11 @@ var App = (function () {
       h += '<div class="banner warn">' + icon('alert') + '<span class="b-msg">Сервер відхилив ' + n.rejected + ' ' +
         fmt.plural(n.rejected, ['запис', 'записи', 'записів']) + '. Перегляньте й виправте або видаліть.</span>' +
         '<button type="button" class="btn sm" data-action="show-queue">Переглянути</button></div>';
+    }
+    if (n.storage_full) {
+      h += '<div class="banner err">' + icon('alert') + '<span class="b-msg"><b>Пам’ять браузера заповнена.</b> Записи, ще не надіслані на сервер (' + n.pending +
+        '), зберігаються лише до закриття застосунку — не закривайте й не оновлюйте його, доки їх не надіслано. Звільніть місце: налаштування браузера → дані сайтів.</span>' +
+        '<button type="button" class="btn sm" data-action="show-queue">Черга</button></div>';
     }
     if (storeError) {
       h += '<div class="banner err">' + icon('alert') + '<span class="b-msg">Не вдалося зберегти демо-дані на пристрої: ' + esc(storeError) + '</span></div>';
@@ -506,11 +564,14 @@ var App = (function () {
     else {
       h += '<div class="list">' + q.map(function (op) {
         var d = describeOp(op);
+        // запис, що не надсилається (завеликий для резервного каналу або багато невдалих спроб), можна видалити
+        var stuck = !op.other_target && !!op.last_error && (op.last_error.error === 'TOO_LARGE' || (op.tries || 0) >= 3);
         return '<div class="list-item"><div class="li-main"><div class="li-t">' + esc(d.title) + '</div><div class="li-s">' + esc(d.sub) +
           (d.sub ? ' · ' : '') + 'записано ' + esc(fmt.dt(op.params && op.params.ts || op.queued_at)) + (op.tries ? ' · спроб: ' + op.tries : '') +
           (op.other_target ? ' · <b>для іншого підключення</b>' : '') + '</div>' +
           (op.last_error ? '<div class="li-err">' + esc(op.last_error.message || op.last_error.error) + '</div>' : '') + '</div>' +
-          (op.other_target ? '<button type="button" class="btn sm" data-q="drop" data-id="' + esc(op.op_id) + '">Видалити</button>' : '') + '</div>';
+          (op.other_target || stuck ? '<button type="button" class="btn sm' + (stuck ? ' ghost' : '') + '" data-q="drop" data-id="' + esc(op.op_id) + '"' +
+            (stuck ? ' data-cur="1"' : '') + '>Видалити</button>' : '') + '</div>';
       }).join('') + '</div>';
     }
     if (rj.length) {
@@ -533,7 +594,9 @@ var App = (function () {
         .then(function (y) { if (y) Api.discardRejected(id); });
       else if (a === 'discard-all') UI.confirm({ title: 'Видалити всі відхилені?', text: 'Усі відхилені записи буде видалено з пристрою.', ok: 'Видалити', danger: true })
         .then(function (y) { if (y) Api.discardRejected('all'); });
-      else if (a === 'drop') UI.confirm({ title: 'Видалити запис із черги?', text: 'Запис призначений для іншого підключення й не буде надісланий.', ok: 'Видалити', danger: true })
+      else if (a === 'drop') UI.confirm({ title: 'Видалити запис із черги?', ok: 'Видалити', danger: true,
+        text: b.getAttribute('data-cur') ? 'Запис ще не надіслано на сервер — після видалення його буде втрачено. Якщо він потрібен, запишіть його знову (коротше).'
+          : 'Запис призначений для іншого підключення й не буде надісланий.' })
         .then(function (y) { if (y) Api.discardQueued(id); });
     });
   }
@@ -658,8 +721,7 @@ var App = (function () {
     var badges = [];
     if (nd) badges.push(UI.badge('ТО: ' + nd + ' ' + fmt.plural(nd, ['прострочене', 'прострочені', 'прострочених']), 'due', { icon: 'alert' }));
     if (ns) badges.push(UI.badge('ТО скоро: ' + ns, 'soon', { icon: 'clock' }));
-    var inWork = s.state === 'run' || s.state === 'stop';
-    if (inWork && (s.flag === 'no_checklist' || !s.start_check_valid)) badges.push(UI.badge('без чек-листа', 'bad', { icon: 'checklist' }));
+    if (checkMissing(s)) badges.push(UI.badge('без чек-листа', 'bad', { icon: 'checklist' }));
     if (s.long_run) badges.push(UI.badge('понад ' + fmt.num(S.long_run_hours || 16) + ' год без завершення', 'soon'));
     var lc = s.last_check, chk = '<dd class="none">—</dd>';
     if (lc && lc.ts) {
@@ -684,13 +746,53 @@ var App = (function () {
   }
 
   /* ---------- #/setup — майстер налаштування пристрою ---------- */
+  /* налаштований пристрій змінює підключення лише керівник (PIN). Якщо сервер недоступний або токен уже
+     невірний, PIN перевірити неможливо — тоді можна продовжити без входу (чинний токен майстер не показує). */
+  var setupOpen = false;
+  function setupGate(host, onOpen) {
+    function draw() {
+      var n = Api.net(), down = n.mode === 'remote' && (n.online === false || !!n.paused);
+      host.innerHTML = '<div class="wiz"><section class="wiz-card"><h1>Налаштування пристрою</h1>' +
+        '<p class="lead">Змінювати підключення цього планшета може лише керівництво — потрібен PIN керівника.</p>' +
+        (down ? '<div class="box warn">' + icon('cloudOff') + (n.paused ? 'Сервер не приймає токен цього пристрою' : 'Немає зв’язку з сервером') +
+          ', тому PIN перевірити неможливо. Підключення можна змінити й без входу — чинний токен при цьому не показується.</div>' : '') +
+        '<div class="wiz-foot"><button type="button" class="btn ghost" data-g="back">' + icon('back') + '<span>Назад</span></button>' +
+        '<div class="btn-row">' + (down ? '<button type="button" class="btn" data-g="skip">' + icon('edit') + '<span>Змінити без входу</span></button>' : '') +
+        '<button type="button" class="btn primary lg" data-g="login">' + icon('lock') + '<span>Увійти як керівник</span></button></div></div></section></div>';
+    }
+    host.addEventListener('click', function (e) {
+      var b = e.target.closest('[data-g]');
+      if (!b) return;
+      var a = b.getAttribute('data-g');
+      if (a === 'back') back('#/device');
+      else if (a === 'skip') onOpen();
+      else requireAdmin({ text: 'Підключення планшета змінює лише керівництво' }).then(function (ok) {
+        if (!current || !current.ctx || current.ctx.host !== host) return;
+        if (ok) onOpen(); else draw();
+      });
+    });
+    draw();
+  }
   function setupView(params, host) {
     setTitle('Налаштування пристрою');
+    var c0 = Api.config();
+    if (c0.mode && !Api.isAdmin() && !setupOpen) {
+      setupGate(host, function () { setupOpen = true; render('refresh'); });
+      return;
+    }
+    setupOpen = false;
+    return setupWizard(host);
+  }
+  function setupWizard(host) {
     var c = Api.config();
-    var d = { step: 1, mode: c.mode || '', endpoint: c.endpoint || '', token: c.token || '', device: c.device || '',
+    // чинний токен у поле НЕ підставляємо: порожнє поле = «залишити поточний» (лише для тієї самої адреси)
+    var keepTok = c.mode === 'remote' && !!c.token;
+    var d = { step: 1, mode: c.mode || '', endpoint: c.endpoint || '', token: '', device: c.device || '',
       pinned_line: c.pinned_line || '', theme: theme(), boot: null, test: null, busy: false, demo: null };
     if (c.mode && state) d.boot = state;
     var first = !c.mode;
+    /* токен для перевірки / збереження: введений або чинний (та сама адреса) */
+    function tokenToUse() { return d.token || (keepTok && d.endpoint === c.endpoint ? c.token : ''); }
     var STEPS = ['Режим', 'Підключення', 'Пристрій'];
 
     function stepsHtml() {
@@ -729,7 +831,10 @@ var App = (function () {
       } else if (t) res = '<div class="box err">' + icon('alert') + esc(t.message || 'Не вдалося підключитися') + '</div>';
       return '<h1>Підключення до таблиці</h1><p class="lead">Адресу веб-застосунку й токен показує меню таблиці <b>«Облік ліній → Показати токен і PIN»</b>.</p>' +
         UI.field.url({ name: 'endpoint', label: 'Адреса веб-застосунку (/exec)', value: d.endpoint, required: true, placeholder: 'https://script.google.com/macros/s/…/exec', attrs: { spellcheck: 'false', autocapitalize: 'off' } }) +
-        UI.field.text({ name: 'token', label: 'Токен доступу', value: d.token, required: true, placeholder: '24 символи', attrs: { spellcheck: 'false', autocapitalize: 'off' } }) +
+        UI.field.password({ name: 'token', label: 'Токен доступу', value: d.token, required: !keepTok, autocomplete: 'off',
+          placeholder: keepTok ? 'залишити поточний токен' : '24 символи', hint: keepTok ? 'Порожнє поле — залишити чинний токен (для тієї самої адреси).' : '',
+          attrs: { spellcheck: 'false', autocapitalize: 'off', autocorrect: 'off' } }) +
+        '<label class="check wiz-show"><input type="checkbox" data-w="show-token"><span>Показати введене</span></label>' +
         '<div class="btn-row" style="margin-bottom:14px"><button type="button" class="btn" data-w="test"' + (d.busy ? ' disabled' : '') + '>' + icon('wifi') + '<span>Перевірити зв’язок</span></button></div>' +
         '<div class="conn-result" aria-live="polite">' + res + '</div>' + foot('Назад', 'Далі', !!(t && t.ok) && !d.busy);
     }
@@ -774,10 +879,12 @@ var App = (function () {
       readInputs();
       var errs = {};
       if (!/^https?:\/\/\S+$/i.test(d.endpoint)) errs.endpoint = 'Вкажіть повну адресу (https://…/exec)';
-      if (!d.token) errs.token = 'Вкажіть токен';
+      // тестове розгортання (/dev) відповідає лише редакторам проєкту — анонімний планшет отримає сторінку входу Google
+      else if (Api.isDevUrl(d.endpoint)) errs.endpoint = 'Це тестова адреса (/dev) — вона працює лише для редакторів проєкту. Потрібна адреса, що закінчується на /exec: Розгорнути → Керування розгортаннями.';
+      if (!tokenToUse()) errs.token = keepTok ? 'Для нової адреси вкажіть токен' : 'Вкажіть токен';
       if (UI.setErrors(host, errs)) return;
       d.busy = true; d.test = null; draw();
-      Api.testConnection(d.endpoint, d.token).then(function (r) {
+      Api.testConnection(d.endpoint, tokenToUse()).then(function (r) {
         d.busy = false;
         if (r.ok) { d.test = r; d.boot = r.boot; }
         else {
@@ -811,7 +918,7 @@ var App = (function () {
       if (UI.setErrors(host, errs)) return;
       var before = Api.target();
       var cfgPatch = { mode: d.mode, device: d.device, pinned_line: d.pinned_line, theme: d.theme };
-      if (d.mode === 'remote') { cfgPatch.endpoint = d.endpoint; cfgPatch.token = d.token; }
+      if (d.mode === 'remote') { cfgPatch.endpoint = d.endpoint; cfgPatch.token = tokenToUse(); }
       Api.saveConfig(cfgPatch);
       if (Api.target() !== before) Api.saveConfig({ operator: null });
       applyTheme(d.theme);
@@ -821,6 +928,11 @@ var App = (function () {
       go(d.pinned_line ? '#/line/' + encodeURIComponent(d.pinned_line) : '#/', { replace: true });
     }
     host.addEventListener('click', function (e) {
+      if (e.target.closest('[data-w="show-token"]')) {
+        var ti = host.querySelector('input[name=token]');
+        if (ti) ti.type = e.target.closest('[data-w="show-token"]').checked ? 'text' : 'password';
+        return;
+      }
       var mc = e.target.closest('[data-mode]');
       if (mc) {
         if (d.mode !== mc.getAttribute('data-mode')) { d.mode = mc.getAttribute('data-mode'); d.boot = null; d.test = null; d.demo = null; }
@@ -885,10 +997,20 @@ var App = (function () {
         ['Токен', '<span class="mono">' + (tok ? '••••' + esc(tok.slice(-4)) : '—') + '</span>'],
         ['Канал', n.transport === 'jsonp' ? 'резервний (JSONP GET)' : 'основний (POST)'],
         ['Останній обмін', n.last_ok_at ? esc(fmt.dt(new Date(n.last_ok_at))) : '—'],
-        ['Годинник', Math.abs(n.skew_ms) < 1500 ? 'збігається із сервером' : 'поправка ' + (n.skew_ms > 0 ? '+' : '−') + esc(fmt.duration(Math.abs(n.skew_ms), { seconds: true }))]]) +
+        ['Годинник', clockText(n)]]) +
+        (Api.isDevUrl(ep) ? '<div class="box err" style="margin-top:12px">' + icon('alert') + '<b>Це тестова адреса (/dev)</b> — вона працює лише для редакторів проєкту. ' +
+          'Вкажіть адресу, що закінчується на <b>/exec</b> (Розгорнути → Керування розгортаннями): «Змінити підключення».</div>' : '') +
         '<div class="conn-result" style="margin-top:12px" aria-live="polite"></div>' +
         '<div class="btn-row" style="margin-top:12px"><button type="button" class="btn" data-d="ping">' + icon('wifi') + '<span>Перевірити зв’язок</span></button>' +
         '<a class="btn" href="#/setup">' + icon('edit') + '<span>Змінити підключення</span></a></div>';
+    }
+    /* годинник пристрою порівняно з сервером: «невідомо», доки не було жодного заміру */
+    function clockText(n) {
+      if (!n.skew_known) return '<span class="dim">ще не звірено із сервером</span>';
+      var tol = Math.max(1500, (n.skew_rtt || 0) / 2);
+      if (Math.abs(n.skew_ms) < tol) return 'збігається із сервером';
+      return 'поправка ' + (n.skew_ms > 0 ? '+' : '−') + esc(fmt.duration(Math.round(Math.abs(n.skew_ms) / 1000) * 1000, { seconds: true })) +
+        (n.skew_rtt > 3000 ? ' <span class="dim">(±' + Math.round(n.skew_rtt / 2000) + ' с)</span>' : '');
     }
     function aboutHtml() {
       var S = state && state.settings || {};
@@ -1016,6 +1138,7 @@ var App = (function () {
     Api.on('ack', onAck);
     Api.on('error', function (e) {
       if (e && e.rejected) UI.toast('Сервер відхилив запис: ' + (e.message || e.error), { tone: 'err', action: { label: 'Деталі', onClick: showQueue } });
+      else if (e && e.error === 'STORAGE_FULL') UI.toast(e.message, { tone: 'err', ms: 10000, action: { label: 'Деталі', onClick: showQueue } });
     });
     Api.on('admin', function (e) {
       if (!e || !e.required) return;
@@ -1040,11 +1163,15 @@ var App = (function () {
     }, 1000);
     registerSW();
 
+    // номер поточного запису історії (після перезавантаження сторінки зберігається в history.state)
+    var i0 = stateIdx();
+    if (i0 === null) { i0 = 0; stamp(0); }
+    histIdx = histBase = i0;
     var c = Api.config();
     if (!c.mode) {
       document.body.classList.add('no-config');
       if (parse().path !== '/setup') history.replaceState(history.state, '', '#/setup');
-      navStack = [location.hash];
+      navHash[histIdx] = location.hash;
       render('nav');
       return;
     }
@@ -1052,7 +1179,7 @@ var App = (function () {
     if (cached) setState(cached);
     var h = location.hash;
     if (c.pinned_line && (!h || h === '#' || h === '#/')) history.replaceState(history.state, '', '#/line/' + encodeURIComponent(c.pinned_line));
-    navStack = [location.hash || '#/'];
+    navHash[histIdx] = location.hash || '#/';
     if (c.mode === 'local' && !cached) waitingText = 'Готуємо демо-дані…';
     render('nav');
     startServices();
@@ -1071,7 +1198,7 @@ var App = (function () {
     get idx() { return idx; },
     on: on, off: off,
     /* маршрутизація */
-    route: route, go: go, back: back, current: currentCtx, rerender: function () { render('refresh'); },
+    route: route, go: go, back: back, backTo: backTo, prevHash: prevHash, current: currentCtx, rerender: function () { render('refresh'); },
     setDirty: setDirty, isDirty: isDirty, setTitle: setTitle, currentLineId: currentLineId,
     /* пристрій */
     config: function () { return Api.config(); }, mode: mode, setTheme: setTheme, theme: theme,
@@ -1079,7 +1206,7 @@ var App = (function () {
     line: line, unit: unit, item: item, meter: meter, rule: rule, staff: staff,
     lines: lines, unitsOf: unitsOf, itemsFor: itemsFor, metersOf: metersOf, rulesOf: rulesOf, staffFor: staffFor,
     /* стан */
-    lineStatus: lineStatus, dueFor: dueFor, now: now, liveTodayHours: liveTodayHours,
+    lineStatus: lineStatus, dueFor: dueFor, now: now, liveTodayHours: liveTodayHours, checkMissing: checkMissing,
     /* люди */
     operator: operator, requireOperator: requireOperator, chooseOperator: chooseOperator, signOut: signOut,
     requireAdmin: requireAdmin, isAdmin: function () { return Api.isAdmin(); }, adminLogout: adminLogout,

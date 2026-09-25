@@ -10,7 +10,7 @@
 
 ## 0. Загальні правила
 
-* Порядок скриптів (`index.html`, усі з `?v=1`): `core.js` → `local-store.js` → `api.js` → `ui.js` →
+* Порядок скриптів (`index.html`, усі з однаковою версією `?v=N`, зараз `?v=2`): `core.js` → `local-store.js` → `api.js` → `ui.js` →
   `app.js` → `operator.js` → `manager.js`. Стилі: `styles.css` → `operator.css` → `manager.css`.
 * Збірки немає. Клієнтський код — ES2017 (`const`/`let`, стрілки, шаблонні рядки дозволені;
   **без** `?.`, `??`, `import/export`). Кожен файл — IIFE або один глобал.
@@ -65,9 +65,19 @@ App.route(pattern, handler, opts?)
 
 «Брудний» екран (форма в процесі): `App.setDirty(true)` / `App.setDirty(false)`, `App.isDirty()`.
 Будь-який `input`/`change` усередині елемента з атрибутом **`data-track-dirty`** позначає екран
-брудним автоматично. Для брудного екрана: без автооновлення; посилання / кнопка «Назад» браузера
-питають «Покинути екран?»; закриття вкладки — стандартне попередження. `App.go()` завжди
-переходить і скидає «брудність» (викликайте після збереження).
+брудним автоматично. Для брудного екрана: без автооновлення; посилання / кнопка «Назад» («Вперед») браузера
+питають «Покинути екран?»; закриття вкладки — стандартне попередження. Перехід при цьому скасовується
+зворотним кроком історії (записи історії не переписуються): «Залишитися» — історія та сама, що й до
+натискання; «Покинути» — той самий крок повторюється. `App.go()` завжди переходить і скидає «брудність»
+(викликайте після збереження).
+
+Кожен запис історії позначено номером (`history.state.fl`) — так роутер відрізняє «назад», «вперед» і
+новий перехід. Не перезаписуйте `history.state` власними об’єктами (лише `history.replaceState(history.state, '', hash)`).
+
+Захист від подвійного дотику: коли відкривається вікно (`UI.modal` і все на ньому) або новий екран,
+другий дотик подвійного тапу, що влучає в нове під пальцем (≤450 мс, ≤64 px від першого; миша — друге
+клацання подвійного), ігнорується (`UI.armTapGuard()` — увімкнути вручну, напр. після перемальовування
+екрана власною дією).
 
 ### 1.3 Навігація
 
@@ -75,6 +85,8 @@ App.route(pattern, handler, opts?)
 |---|---|
 | `App.go('#/line/L1')`, `App.go('/line/L1', {replace:true})` | перехід (replace — без нового запису історії) |
 | `App.back(fallback='#/')` | назад у межах застосунку, інакше `go(fallback,{replace:true})` |
+| `App.backTo(hash)` | назад, якщо попередній запис історії — саме `hash`; інакше `go(hash,{replace:true})` (напр. повернення на екран лінії після збереження) |
+| `App.prevHash()` | хеш попереднього запису історії цього сеансу або `''` |
 | `<a href="#/…" data-back>` | глобально: клік = `App.back(href)` (кнопка «Назад» у `UI.pageHead`) |
 | `App.rerender()` | перемалювати поточний екран |
 | `App.current()` | `ctx` поточного показу або `null` |
@@ -86,14 +98,29 @@ App.route(pattern, handler, opts?)
 | Хеш | Файл | Опис |
 |---|---|---|
 | `#/` | app.js | Лінії (плитки). Закріплений планшет при старті відкриває `#/line/<pinned>` |
-| `#/setup` | app.js | майстер налаштування пристрою (`boot:false`) |
+| `#/setup` | app.js | майстер налаштування пристрою (`boot:false`). На вже налаштованому пристрої — лише з PIN керівника (без зв’язку / з невірним токеном — «Змінити без входу»); чинний токен майстер не показує: поле порожнє = «залишити поточний»; тестову адресу Apps Script (`…/dev`) не приймає — потрібна `/exec` |
 | `#/device` | app.js | налаштування пристрою, черга, «Скинути демо-дані» (`boot:false`) |
-| `#/line/:id` | operator.js | екран лінії (зараз заглушка) |
-| `#/line/:id/check/:occasion` | operator.js | чек-лист `start` \| `changeover` \| `end` |
-| `#/line/:id/work` | operator.js | запис роботи (параметри — через query, напр. `?rule=R5`) |
-| `#/line/:id/history` | operator.js | історія лінії |
-| `#/m` | manager.js | вхід у розділ керівництва (заглушка → `#/m/overview`) |
-| `#/m/:view` | manager.js | `overview · maint · journal · checks · equipment · staff · settings` (головний екран посилається на `#/m/equipment`, коли ліній немає) |
+| `#/line/:id` | operator.js | екран лінії: стан, дії, ТО і ППР лінії, стрічка «сьогодні» |
+| `#/line/:id/check/:occasion` | operator.js | чек-лист `start` \| `changeover` \| `end` (`?then=none` — без зміни стану) |
+| `#/line/:id/work` | operator.js | запис роботи: `?rule=R5&type=to&unit=U1&mode=repair\|maint\|rule\|clean\|setup` |
+| `#/line/:id/history` | operator.js | історія лінії за 14 днів |
+| `#/m` | manager.js | вхід у розділ керівництва → `#/m/overview` |
+| `#/m/:view` | manager.js | розділи (нижче); невідомий id → `#/m/overview`. Головний екран посилається на `#/m/equipment`, коли ліній немає |
+| `#/m/equipment/:line` | manager.js | лінія в «Обладнанні»: `?tab=units\|items\|meters\|rules` |
+
+Розділи керівництва (`#/m/<id>`, **канонічні id**; у посиланнях використовуйте саме їх):
+
+| id | Розділ | Query |
+|---|---|---|
+| `overview` | Огляд: KPI, стан ліній, матриця чек-листів, години за станами, причини простоїв | — |
+| `maintenance` | ТО і ППР (псевдоніми **`maint`**, `plan` — лише для сумісності) | `tab=due\|plan\|year`, `status=due\|soon\|ok\|none`, `line=<id>` |
+| `journal` | Журнал (псевдонім `history`) | `period=today\|7\|30\|90`, `from`/`to=YYYY-MM-DD`, `line`, `unit`, `types=events,checks,works,readings`, `work_type`, `q` |
+| `checks` | Чек-листи | `line=<id>` |
+| `equipment` | Обладнання | — |
+| `staff` | Персонал | — |
+| `settings` | Налаштування | — |
+
+Приклад: KPI «Прострочено ТО» веде на `#/m/maintenance?tab=due&status=due`.
 
 ---
 
@@ -126,7 +153,8 @@ App.route(pattern, handler, opts?)
 | `App.lineStatus(lineId)` | статус лінії **з оптимістичним накладанням черги** (нижче) |
 | `App.dueFor(lineId)` | due-обʼєкти лінії з `state.due` (відсортовані: due, soon, ok, none) |
 | `App.now()` | `Date` з поправкою годинника (= `Api.now()`) |
-| `App.liveTodayHours(status)` | `today_h` + робота після моменту bootstrap (години) |
+| `App.liveTodayHours(status)` | години роботи за СЬОГОДНІ (день заводу): `today_h` + робота після моменту bootstrap; bootstrap учорашній (офлайн через північ) → рахується від півночі |
+| `App.checkMissing(status)` | лінія працює без чек-листа запуску — одне правило для плитки, екрана лінії й таблиці керівника: запуск позначено «без чек-листа» (або невідомо, а робота почалася в межах `checklist_valid_hours`) і відтоді чинного чек-листа запуску не пройдено. Звичайна довга зміна після чек-листа — не порушення (є `long_run`) |
 | `App.refresh()` | надіслати чергу + свіжий bootstrap → `Promise<відповідь>` |
 | `App.mode()` | `'local'` \| `'remote'` \| `''` |
 
@@ -135,13 +163,21 @@ App.route(pattern, handler, opts?)
 ```
 { line_id, state, since /*ISO*/, product, operator, staff_id, event_id, reason, note, flag,
   cum_h /*мотогодини на момент as_of*/, starts, today_h, last_check:{id,ts,occasion,result}|null,
-  start_check_valid, long_run, work_since,
+  start_check_valid /*є чек-лист запуску в межах checklist_valid_hours, новіший за останній перехід лінії в «Не працює»*/,
+  long_run, work_since,
   as_of /*ISO: коли пораховано (boot.now)*/, pending /*к-сть неnадісланих операцій цієї лінії*/ }
 ```
 
+`start_check_valid`: чек-лист запуску «витрачається» першим переходом лінії в «Не працює» (з іншого стану) після нього —
+нова зміна потребує нового чек-листа, навіть якщо `checklist_valid_hours` ще не минули.
+
 Накладання: кожна операція черги `event` змінює `state/since/product/operator/staff_id/reason/note/
 event_id/flag/work_since`; `checklist` — `last_check` (`result:null, pending:true`),
-`start_check_valid=true` для `start`, і `then_event` як подію. Після підтвердження сервер
+`start_check_valid=true` для `start`, і `then_event` як подію. `flag:'no_checklist'` — як у ядрі, лише для
+ЗАПУСКУ (перше «Працює» після «Не працює» без чинного чек-листа, коли `require_start_checklist`), а не для
+повернення в роботу після налаштування / ремонту; подія черги, що переводить лінію в «Не працює» з іншого стану
+(напр., офлайн «Завершити роботу»), скидає `start_check_valid` у `false` (повторне «Не працює» — ні); порядок черги (FIFO)
+дає правильну відповідь і для «завершити → чек-лист запуску» в одній черзі. Після підтвердження сервер
 повертає справжній `status`, і він одразу потрапляє в `App.state` (подія `boot`, `meta.source:'ack'`).
 
 Due-обʼєкт (ядро): `{rule_id, line_id, unit_id, title, work_type, part, status:'due'|'soon'|'ok'|'none',
@@ -178,20 +214,38 @@ summary /*«залишилось 5 дн. · 38 мотогод»*/, overdue_days,
   `opts.timeout` (мс, типово 30000).
 * Коди помилок сервера: `BAD_TOKEN`, `ADMIN_REQUIRED`, `BAD_REQUEST`, `NOT_FOUND`, `UNKNOWN_ACTION`,
   `LOCKED`, `SERVER_ERROR`, `RATE_LIMIT`. Клієнтські (`client:true`): `NETWORK` (немає звʼязку),
-  `TIMEOUT`, `BAD_RESPONSE` (не JSON / HTML-сторінка), `NOT_CONFIGURED`, `TOO_LARGE` (запит задовгий для JSONP).
+  `TIMEOUT`, `BAD_RESPONSE` (не JSON / HTML-сторінка), `NOT_CONFIGURED`, `TOO_LARGE` (запит задовгий для JSONP,
+  а POST теж не пройшов), `STORAGE_FULL` (лише `Api.write`: сховище пристрою переповнене).
 * Транспорт (віддалений режим): `POST` `text/plain;charset=utf-8` з тілом `{...params, action, token, device, admin?}`
-  (без CORS-preflight). Якщо POST падає з `TypeError`, а JSONP-`ping` працює — **до кінця сеансу вкладки**
-  усі запити йдуть JSONP GET `?action=…&token=…&payload=<JSON>&callback=…` (запит повторюється автоматично,
-  крім `save` без `row.id`). Демо-режим: `LocalBackend.handle(req)`.
-* Поправка годинника: `skew = server.now − середина запиту` (лише якщо запит < 3 с).
+  (без CORS-preflight). Якщо POST падає з `TypeError`, а JSONP-`ping` працює — запити йдуть JSONP GET
+  `?action=…&token=…&payload=<JSON>&callback=…` (запит повторюється автоматично, крім `save` без `row.id`).
+  Резервний канал не назавжди: у фоні (після перезавантаження — одразу, далі раз на `postReprobeMs`, 5 хв; на
+  «Надіслати зараз», коли є відкладені записи, — раз на `postReprobeForceMs`) POST перевіряється `ping`-ом і,
+  якщо працює, стає основним знову. Запит, задовгий для адреси JSONP, спершу пробується через POST.
+  Демо-режим: `LocalBackend.handle(req)`.
+* Поправка годинника: `skew = server.now − середина запиту`, точність ±RTT/2. Годяться й повільні відповіді
+  (RTT до `skewMaxRtt`, 30 с); зберігається найточніший замір `{skew, rtt, at}` (`'fl_lines_skew'`), новий
+  береться, коли він точніший, старий застарів (`skewStaleMs`, 6 год) або з ним не узгоджується (годинник
+  перевели). Поки поправки немає (або вона давня), перед надсиланням черги йде `ping`. Записи, яким `Api.write`
+  поставив час сам (`op.auto_ts`), після зміни поправки на ≥`restampMs` (1 хв) отримують виправлений `ts`
+  (час, введений людиною, не змінюється).
 
 Корисні дії для екранів (відповіді — SPEC §3.4 + нотатки ядра):
 `line {line_id, days≤62}` → `{events, checks, works, readings, timeline:[{state,from,to,hours,product,reason}], days:[{day, hours:{state:h}, starts, checks}]}`;
 `check_detail {id, ts?}` → `{check, answers}`; `history {from?, to?, line_id?, unit_id?, types?, work_type?, q?, limit?, include_void?}`;
-`dashboard {days}`; `plan {from?, to?}`; ADMIN: `save {table,row}`, `remove`, `void {table,id,note}`,
+`dashboard {days}`; `plan {from?, to?}`; ADMIN: `save {table,row}`, `remove`, `void {table,id,note,ts?}` (передавайте `ts`
+запису — сервер знайде його вікном навколо цього часу, а не читанням усього журналу),
 `settings_save {values}`, `digest_preview`, `notices {limit}`, `recompute`, `bootstrap` з `{admin:true}`
 (неактивні записи, `manager_emails`, `config_issues`).
 Для `save` НОВОГО рядка передавайте `row.id = Api.newId()` — тоді повтор запиту не створить дубль.
+
+Відповіді «Н/З» (не застосовується) рахуються окремо:
+* рядок чек-листа (`checks` у `line`, `history`, `check_detail`): `{id, ts, started, line_id, occasion, operator, staff_id, product,
+  result:'ok'|'remarks'|'fail', total, failed, out_of_range, missing, na /*к-сть відповідей «Н/З»; стовпець аркуша «Н/З»*/,
+  comment, device, created, void, void_note}`;
+* `dashboard` → `compliance[line_id][]` (дні): `{day, status, starts, covered, run_h, uncovered, forced,
+  checks:[{id, ts, occasion, result, na}]}`;
+* `dashboard` → `stats[line_id]`: `{…, checks, checks_ok, checks_remarks, checks_fail, out_of_range, checks_na}`.
 
 ### 4.2 Запис оператора — `Api.write(action, params, opts?)`
 
@@ -205,6 +259,7 @@ summary /*«залишилось 5 дн. · 38 мотогод»*/, overdue_days,
 | `{ok:true, queued:false, op, data}` | сервер підтвердив за `opts.wait` мс (типово 4000); `data` — відповідь дії (`{ok, event, status}` тощо); `data.duplicate:true` — повтор уже збереженого |
 | `{ok:true, queued:true, op}` | збережено в черзі (офлайн / сервер зайнятий / пауза) — надішлеться сам |
 | `{ok:false, rejected:true, op, error, message}` | сервер відхилив остаточно (`BAD_REQUEST`, `NOT_FOUND`…): запис у списку відхилених |
+| `{ok:false, queued:true, error:'STORAGE_FULL', op, message}` | сховище пристрою переповнене (навіть після звільнення кешу bootstrap і залишків демо-даних): запис лише в пам’яті вкладки й надішлеться, поки застосунок відкритий; `Api.net().storage_full`, подія `error`, банер і тост від App |
 
 `op = {op_id, action, params, target, queued_at, tries, last_error, line_id}`.
 `Api.write` НЕ перевіряє дані: валідуйте форму до запису (обовʼязкові поля, `ts` не старший за 45 днів
@@ -233,12 +288,16 @@ Api.write('reading', { meter_id, value: 1200, mode: 'inc', operator: op.name, no
   у відхилені (`'fl_lines_rejected'`, подія `error`); `LOCKED|SERVER_ERROR|RATE_LIMIT|NETWORK|TIMEOUT|BAD_RESPONSE` →
   лишається, повтор через 5, 15, 30, 60, 120 с; також одразу на `online`, фокус вікна, повернення вкладки,
   новий запис. `BAD_TOKEN` → пауза (банер «Невірний токен»), до зміни токена / успішного запиту / `Api.resume()`.
+  `TOO_LARGE` (запис не вміщується в адресу JSONP, а POST не працює) → запис **відкладено**: лишається в черзі
+  з поясненням, поки канал JSONP його пропускають (решта черги йде далі), і він надсилається, щойно POST
+  запрацює. Запис, що не надсилається (відкладений або ≥3 невдалих спроб), можна видалити у вікні
+  «Синхронізація».
 * Кожна операція привʼязана до підключення (`target`: `'local'` або `'remote:<endpoint>'`); операції
   іншого підключення не надсилаються (їх видно в черзі, можна видалити).
 
 | Виклик | Опис |
 |---|---|
-| `Api.flush(force?)` | надіслати зараз (`true` — ігнорувати паузу між повторами) → `Promise<netInfo>` |
+| `Api.flush(force?)` | надіслати зараз (`true` — ігнорувати паузу між повторами) → `Promise<netInfo>`. Виклик під час активного надсилання запамʼятовується: одразу після нього йде ще один прохід (запис, доданий «на хвості» попереднього пакета, не чекає страховочного таймера), а повернений `Promise` завершується вже після цього проходу |
 | `Api.queue()` | операції поточного підключення (копії, FIFO) |
 | `Api.pendingFor(lineId)` | операції черги лінії — показуйте їх в історії як «очікує синхронізації» |
 | `Api.allQueued()` | усі операції (+ `other_target:true` для чужих) |
@@ -252,17 +311,18 @@ Api.write('reading', { meter_id, value: 1200, mode: 'inc', operator: op.name, no
 
 | Виклик | Опис |
 |---|---|
-| `Api.boot()` | свіжий bootstrap → `Promise<відповідь>`; успіх оновлює кеш (`'fl_lines_boot'`) і генерує `boot` |
+| `Api.boot()` | свіжий bootstrap → `Promise<відповідь>`; успіх оновлює кеш (`'fl_lines_boot'`) і генерує `boot`. Якщо під час запиту прийшло підтвердження запису, одразу після нього йде ще один запит; а в застарілу відповідь повертаються стан лінії, строк ТО й лічильник із таких підтверджень |
 | `Api.cachedBoot()` | кешовані дані поточного підключення або `null` (синхронно) |
 | `Api.primeBoot(data)` | підкласти дані як кеш (використовує майстер) |
 | `Api.lineStatus(lineId, boot?)`, `Api.dueFor(lineId, boot?)` | як `App.lineStatus/dueFor` |
-| `Api.net()` | `{mode, online:true|false|null, transport:'post'|'jsonp'|'local', paused:{code,message}|null, pending, pending_other, rejected, flushing, next_retry_at, last_ok_at, last_error:{error,message,at}|null, boot_at, skew_ms}` |
+| `Api.net()` | `{mode, online:true|false|null, transport:'post'|'jsonp'|'local', paused:{code,message}|null, pending, pending_other, rejected, flushing, next_retry_at, last_ok_at, last_error:{error,message,at}|null, boot_at, skew_ms, skew_known /*чи був замір*/, skew_rtt, storage_full}` |
 | `Api.now()`, `Api.skew()`, `Api.newId()` | час із поправкою; поправка, мс; новий id (12 символів base36) |
 | `Api.config()` / `Api.saveConfig(patch)` | налаштування пристрою `{mode:'local'|'remote'|'', endpoint, token, device, pinned_line, theme:'dark'|'light', operator}` (`'fl_lines_v1'`) |
 | `Api.adminLogin(pin)` → `Promise<відповідь>`, `Api.adminLogout()`, `Api.isAdmin()` | PIN керівника (sessionStorage `'fl_lines_admin'`) |
-| `Api.testConnection(endpoint, token)` | перевірка без збереження → `{ok, transport, version, company, boot}` або помилка |
+| `Api.testConnection(endpoint, token)` | перевірка без збереження → `{ok, transport, version, company, boot}` або помилка (адреса `/dev` → `BAD_REQUEST` одразу) |
+| `Api.isDevUrl(url)` | чи це тестове розгортання Apps Script (`https://script.google.com/…/dev`): воно відповідає лише редакторам проєкту, анонімний планшет отримує сторінку входу Google. Майстер таку адресу не приймає, «Пристрій» показує попередження, а помилки зв’язку для неї пояснюють причину |
 | `Api.isRead(action)`, `Api.target()` | чи READ-дія; ключ поточного підключення |
-| `Api.options` | `{timeout, writeWait, batchMax, backoff:[с…], jsonpMaxUrl, skewMaxRtt, probeTimeout, ackKeepMs}` — для тестів |
+| `Api.options` | `{timeout, writeWait, batchMax, backoff:[с…], jsonpMaxUrl, skewMaxRtt, skewStaleMs, restampMs, probeTimeout, ackKeepMs, postReprobeMs, postReprobeForceMs}` — для тестів |
 
 Події `Api.on(name, fn)` (повертає функцію відписки; `Api.off(name, fn)`):
 `boot (data, {source:'server'|'ack'|'prime', at})`, `queue (netInfo)`, `net (netInfo)`,
@@ -279,6 +339,10 @@ Api.write('reading', { meter_id, value: 1200, mode: 'inc', operator: op.name, no
   «Сповіщення» зі статусом `preview`); `LocalBackend.resetDemo()` → `Promise<summary>`;
   `LocalBackend.info()` → `{ready, admin_pin, key, created, saved, size, error}`; `LocalBackend.ADMIN_PIN = '1234'`;
   `LocalBackend.store`, `LocalBackend.app` (ядро — лише для діагностики).
+* Контракт сховища ядра (`LinesCore.createApp(store)`; так само `SheetStore` у `Server.gs`): `all(t)`, `since(t, date)`,
+  `insert(t, rows)`, `update(t, patches)`, `replace(t, rows)`, `lock(fn)` і **необовʼязковий** `findBy(t, col, value)` →
+  сирі рядки, де стовпець `col` дорівнює `value` (зайві рядки дозволені — ядро фільтрує; `null` = не підтримується, тоді
+  ядро читає вікно журналу або весь журнал). `MemoryStore` і `LocalStore` його мають.
 * Екрани не звертаються до `LocalBackend` напряму — лише через `Api` (однаково для обох режимів).
   Виняток — кнопка «Скинути демо-дані» в налаштуваннях (manager може показати її ж: `App.mode()==='local'`,
   `LocalBackend.resetDemo().then(() => App.refresh())`).
@@ -311,8 +375,9 @@ field*, emptyState, spinner, kv, bars, stackBar, stateBar, legend, stateLegend, 
 `dayKey(d)` 'YYYY-MM-DD' · `monthName(9)` вересень · `relative(d)` «щойно», «5 хв тому», «сьогодні о 14:05», «вчора о 09:10», «через 3 дн.» ·
 `duration(ms)` «3 год 12 хв», «45 хв», «<1 хв», «2 дн. 3 год» (`{seconds:true}` → «40 с») · `clock(ms)` 03:12:45 ·
 `hm(hours)` «3 год 12 хв» · `hours(h, dec?)` «12,5 год» · `num(n, dec)` «12 345,5» · `int(n)` · `pct(0–100)` «85 %» · `frac(0–1)` «85 %» ·
-`plural(n, ['запис','записи','записів'])` · `inputDT(d)` / `fromInputDT(s)` для `datetime-local` (час пристрою) · `inputDate(d)` ·
-`parts(d)` `{y,m,d,H,M,S,wd}` · `setTz(tz)`/`tz()` (App задає сам).
+`plural(n, ['запис','записи','записів'])` · `inputDT(d)` / `fromInputDT(s)` для `datetime-local` і `inputDate(d)` для `type=date` —
+**у поясі заводу**, як і весь показ часу (планшет чи ПК керівника в іншому поясі вводить час за годинником цеху) ·
+`dayStart('YYYY-MM-DD')` → Date (північ дня в поясі заводу) · `parts(d)` `{y,m,d,H,M,S,wd}` · `setTz(tz)`/`tz()` (App задає сам).
 
 ### 6.3 Мітки, стани, іконки
 
@@ -395,7 +460,10 @@ field*, emptyState, spinner, kv, bars, stackBar, stateBar, legend, stateLegend, 
 * текст: `.muted .dim .mono .num (tabular) .cond .small .big .upper .nowrap .ellipsis .right .center .c-ok .c-warn .c-bad .c-info`;
 * `.empty`, `.spin-wrap`/`.spinner`, `.wip` (заглушки), `.no-print`.
 
-Адаптивність: 1280×800 і 800×1280 (планшет), до 360px без горизонтальної прокрутки (точки 1100/900/720/560/480/370 px).
+Адаптивність: 1280×800 і 800×1280 (планшет), до 360px без горизонтальної прокрутки (точки 1100/900/720/560/480/420/370/340 px).
+Заголовок `.page-head` має власну основу (до 280px): дії (`.ph-act`) переносяться під нього, а не стискають його;
+довгі слова не розриваються посеред слова (`overflow-wrap:break-word`, `hyphens:auto`, менший `h1` на ≤420px).
+У вікні стискається лише `.modal-body` (прокрутка) — заголовок і кнопки завжди видно повністю.
 `prefers-reduced-motion` вимикає анімації; є базовий `@media print`.
 Ваші стилі — лише в `operator.css` / `manager.css`, з префіксами класів (`op-…`, `m-…`), без зміни глобальних примітивів.
 
@@ -415,12 +483,119 @@ field*, emptyState, spinner, kv, bars, stackBar, stateBar, legend, stateLegend, 
 | `fl_lines_v1` | налаштування пристрою (`Api.config()`) |
 | `fl_lines_queue` / `fl_lines_rejected` | черга / відхилені операції |
 | `fl_lines_boot` | кеш bootstrap `{target, at, data}` |
-| `fl_lines_skew` | поправка годинника, мс |
+| `fl_lines_skew` | поправка годинника: найточніший замір `{skew /*мс*/, rtt, at}` |
 | `fl_lines_demo_v1` | дані демо-режиму (`LocalStore`) |
 | session `fl_lines_admin` | PIN керівника на сеанс |
-| session `fl_lines_transport` | `{endpoint, t:'jsonp'}` — перемикання на JSONP |
+| session `fl_lines_transport` | `{endpoint, t:'jsonp'}` — перемикання на JSONP (POST перевіряється знову у фоні) |
+
+Сховище переповнене → `Api` звільняє місце (видаляє кеш `fl_lines_boot`, а поза демо-режимом — залишки
+`fl_lines_demo_v1`) і повторює; не вдалося — черга / відхилені живуть у пам’яті вкладки (`storage_full`).
 
 Сервіс-воркер (`sw.js`): кеші з префіксом `fl-lines-`; спершу мережа для власних файлів, спершу кеш для шрифтів Google;
-дані (`script.google.com`, `*.googleusercontent.com`, запити з `action=`/`callback=`, будь-які POST) не кешуються.
+дані (`script.google.com`, `*.googleusercontent.com`, запити з `action=`/`callback=`, службові адреси емулятора `/__*`,
+будь-які POST) не кешуються.
 Реєструється лише на https / localhost. Під час релізу змінюйте `?v=` в `index.html`, `SHELL_FILES` і `VERSION` у `sw.js` —
-планшети покажуть «Доступна нова версія» → «Оновити».
+планшети покажуть «Доступна нова версія» → «Оновити». Встановлення нової версії вдається лише з повним кешем
+оболонки (без іконок — можна): якщо мережа зникла посеред оновлення, працює попередня версія з повним кешем;
+старі кеші видаляються, лише коли кеш нової версії повний. Узгодженість (одна версія, усі скрипти/стилі/іконки в `SHELL_FILES`,
+файли існують) перевіряє тест «реліз» у `tests/e2e.test.mjs` (працює й без браузера).
+
+---
+
+## 10. Глобали екранів: `Operator` і `Manager`
+
+Екрани оператора й керівництва реєструють маршрути самі; назовні вони віддають кілька функцій для повторного
+використання (інший екран, тести). Інших глобалів ці файли не створюють.
+
+### 10.1 `window.Operator` (operator.js)
+
+| Виклик | Опис |
+|---|---|
+| `Operator.openWorkForm(opts)` | модальна форма запису роботи (та сама, що на `#/line/:id/work`) → `Promise<{ids, works, writes} \| null>`; `null` — скасовано або не вибрано оператора. `writes` — масив `Promise` від `Api.write('work', …)` (по одному на роботу) |
+| `Operator.markDone(lineId, ruleId)` | «Позначити виконаним» роботу регламенту: `openWorkForm({mode:'rule'})` + тост → `Promise` як вище |
+| `Operator.showDue(ruleId)` | деталі строку ТО (критерії, інструкція) з кнопкою «Позначити виконаним» |
+| `Operator.openReadings(lineId)` | вікно показників лічильників лінії (потрібен оператор) → `Promise<true \| null>`; записи — `Api.write('reading')` |
+| `Operator.showCheck(id, ts, row?)` | відповіді чек-листа (`check_detail`; `row` — рядок історії для заголовка) → `Promise` закриття |
+| `Operator.showWork(work)` | картка роботи (обʼєкт з історії / `line`) → `Promise` закриття |
+| `Operator.stripHtml(segs, fromMs, toMs, o?)` | HTML стрічки станів за вікно `[from, to)`; `segs = [{state, from, to, reason?, product?, pending?}]` (мс); `o: {axis, cls, info, label}` |
+| `Operator.evalItem(item, value)` | оцінка відповіді як у ядрі → `{answered, ok: true\|false\|null, text, num}` |
+| `Operator.needStartCheck(lineId)` | чи потрібен чек-лист запуску перед «Працює» → `Promise<boolean>` |
+| `Operator.ranSinceOff(lineId)` | чи працювала лінія після останнього «Не працює» → `Promise<true \| false \| null /*невідомо*/>` |
+
+`openWorkForm(opts)`:
+
+| Поле | Значення |
+|---|---|
+| `line_id` | **обовʼязково**; невідома лінія → повідомлення і `null` |
+| `mode` | `'free'` (типово) \| `'repair'` \| `'maint'` (кілька робіт регламенту разом) \| `'rule'` (одна робота регламенту) \| `'clean'` \| `'setup'` |
+| `rule_id` / `rule_ids` | вибрані роботи регламенту (лише цієї лінії; для не-`maint` — перша) |
+| `work_type`, `unit_id`, `title`, `cause`, `description`, `product`, `downtime_min` | початкові значення полів |
+| `started`, `finished` | ISO / `Date`; `finished` типово — `App.now()` |
+| `operator` | `{name, staff_id}` — виконавець за замовчуванням |
+| `requireOperator` | `true` (типово) — спершу `App.requireOperator(line_id)`; `false` — без вибору оператора (виконавця вводять у формі; так робить керівник) |
+| `heading`, `submitLabel` | заголовок вікна і напис кнопки; `silent: true` — без тосту «Роботу записано» |
+
+```js
+// з розділу керівника: та сама форма, що на планшеті
+Operator.openWorkForm({ line_id: 'L2', mode: 'rule', rule_id: 'R3', heading: 'Позначити виконаним', requireOperator: false })
+  .then((r) => { if (r) return Promise.all(r.writes); });
+```
+
+Записи з екранів оператора йдуть через внутрішню обгортку над `Api.write` (позначає дані лінії застарілими після
+підтвердження). Її додатковий `Api.flush(true)` через 80 мс після запису був обходом гонки в `Api.flush`, яку
+виправлено (див. §4.3) — тепер він нешкідливий і не потрібен новому коду.
+
+### 10.2 `window.Manager` (manager.js)
+
+| Виклик | Опис |
+|---|---|
+| `Manager.markDone(due, onDone?)` | «Позначити виконаним» з розділу керівника: `due` — due-обʼєкт (`{rule_id, line_id, unit_id?, work_type?, title?}`); форма — `Operator.openWorkForm` (без вибору оператора), а якщо екрана оператора немає — компактна форма керівника. `onDone(result)` — після підтвердження записів |
+| `Manager.openCheck(id, ts?, onDone?)` | чек-лист із відповідями (`check_detail`) і кнопкою «Анулювати» → `Promise` закриття |
+| `Manager.openRecord(kind, row, onDone?)` | картка запису журналу; `kind`: `'events' \| 'checks' \| 'works' \| 'readings'` (`checks` → `openCheck`); «Анулювати» → `void` з причиною; `onDone()` — після анулювання |
+| `Manager.refreshCache()` | скинути кеш розділу (довідники керівника, огляд, план) — наступний показ завантажить свіжі дані |
+
+Розділи керівника — `#/m/<id>` з канонічними id (§1.4): **`maintenance`** для «ТО і ППР» (`maint` — псевдонім).
+Дії керівника — `Api.call` (потрібен звʼязок); доступ — після `App.requireAdmin()` (PIN).
+
+---
+
+## 11. Локальний емулятор і наскрізні тести
+
+`tools/dev-server.mjs` (без залежностей) роздає `lines/` як сайт і відповідає на `/exec` як веб-застосунок Apps Script:
+виконує **справжні** `core.js` + `Server.gs` через `tools/gas-mock.mjs` над таблицею в памʼяті (`setup()` при старті).
+
+```
+npm run dev                         # = node tools/dev-server.mjs --seed  → http://localhost:8787/
+node tools/dev-server.mjs --port 8787 --host 127.0.0.1 --seed --token dev-token --admin-pin 1234 \
+                          --latency 300 --persist /tmp/lines.json --verbose
+```
+
+У майстрі планшета: «Google-таблиця підприємства» → адреса `http://localhost:8787/exec`, токен `dev-token`;
+PIN керівника — `1234` (друкуються при старті). `--persist` зберігає таблицю (значення аркушів і властивості скрипту)
+у JSON між запусками; `--host 0.0.0.0` — доступ з планшета в мережі (без https сервіс-воркер там не працює).
+Службові адреси `/__*` відповідають лише цьому компʼютеру (loopback), без CORS; запити з чужих сторінок (Origin /
+`Sec-Fetch-Site: cross-site|same-site`) і з чужим `Host` (DNS rebinding) → 403. `--expose-control` дозволяє їх з мережі
+(обережно: `/__sheets` віддає всю таблицю разом із PIN персоналу). Файл `--persist` статично не роздається.
+Сервіс-воркер застосунку службові адреси `/__*` не кешує.
+
+| Адреса | Призначення |
+|---|---|
+| `POST /exec` (text/plain JSON) → `doPost`; `GET /exec?action=…&payload=…[&callback=fn]` → `doGet` (JSON або JSONP) | API, як у Google (CORS `*`, `OPTIONS` → 405 — preflight не підтримується, як і в Apps Script) |
+| `POST /__control {"down":true\|false}` | «аварія»: зʼєднання з `/exec` обривається (статичні файли працюють). Команди `/__control` — лише `POST` з `Content-Type: application/json` (інакше 415) |
+| `POST /__control {"offline":true\|false}` | «мережі немає»: обриваються і `/exec`, і статичні файли (зокрема запити сервіс-воркера — оболонка лише з кешу) |
+| `POST /__control {"blockPost":true}` | обривати лише POST — клієнт переходить на резервний канал JSONP |
+| `POST /__control {"loseResponses":N}` | наступні N записів виконати, але обірвати зʼєднання замість відповіді (перевірка ідемпотентних повторів) |
+| `POST /__control {"latency":мс}` · `{"reset":true,"seed":true}` · `{"run":"hourlyJob"}` | затримка; нова таблиця; серверна функція (`hourlyJob, dailyJob, refreshPlan, recomputeAll, checkDueNow, sendDigestNow, seedDemoData, setup`) |
+| `GET /__control` (або `POST {}`) | стан `{down, offline, block_post, latency, lose_responses, requests, static_served, dropped_static, dropped_exec}` без токена й PIN; `GET` із параметрами → 405 |
+| `GET /__sheets[?name=Журнал стану][&values=1]` | дані аркушів `{name, header, rows:[{Заголовок: значення}]}` (дати — ISO) |
+| `GET /__mails`, `GET /__requests` | надіслані листи; журнал запитів до `/exec` (дія, пакет, результати `ok/duplicate/…`, `lost`) |
+
+У коді: `const srv = await startDevServer({port: 0, seed: true, token, adminPin, latencyMs, persistFile, exposeControl, quiet: true})` →
+`{url, endpoint, token, adminPin, port, setDown(), setOffline(), blockPost(), loseResponses(n), setLatency(), reset(), run(), sheets(), mails(), requests(), stats(), project, close()}`.
+
+Тести: `npm test` — ядро і сервер (без встановлень); `npm run test:e2e` — Playwright (глобальний пакет, headless Chromium;
+без Playwright файл пропускається з поясненням); `npm run test:all` — усе. Сценарії e2e: демо-режим (майстер, повна зміна
+оператора, керівник: огляд, річний графік, нова лінія / агрегат / пункт / регламент), віддалений режим через емулятор
+(майстер, записи в аркушах з українськими назвами, «аварія» з чергою й повтором без дублікатів, JSONP, PWA-старт без мережі
+(сервер обриває й запити сервіс-воркера — оболонка лише з кешу), ТО з екрана лінії, анулювання в журналі), захист службових
+адрес емулятора, 360 px без горизонтальної прокрутки, без помилок у консолі.

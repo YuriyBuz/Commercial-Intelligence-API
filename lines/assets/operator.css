@@ -26,7 +26,7 @@
 .op-st-sync{display:inline-flex;opacity:.85}
 .op-st-time{display:flex;flex-direction:column;align-items:flex-end;line-height:1.1;margin-left:auto}
 .op-clock{font-family:var(--f-mono);font-size:42px;font-weight:500;letter-spacing:-.01em;font-variant-numeric:tabular-nums}
-.op-st-time small{font-family:var(--f-display);font-size:15.5px;font-weight:600;letter-spacing:.04em;opacity:.85}
+.op-st-time small{font-family:var(--f-display);font-size:15.5px;font-weight:600;letter-spacing:.04em}
 .op-st-reason{padding:12px 20px;background:var(--panel-2);border-bottom:1px solid var(--line-soft);font-size:18px;font-weight:600;overflow-wrap:anywhere}
 .op-st-meta{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px 22px;margin:0;padding:16px 20px}
 .op-st-meta > div{min-width:0}
@@ -171,7 +171,11 @@ button.op-rec:hover{background:var(--hover)}
 /* сторінки чек-листа й роботи — вужчі, по центру */
 body[data-route="/line/:id/check/:occasion"] .view > .page,
 body[data-route="/line/:id/work"] .view > .page{max-width:1040px;margin:0 auto}
-body[data-route="/line/:id/check/:occasion"] .toast-host{bottom:112px}
+/* тости чек-листа — вгорі, під панеллю застосунку, і «прозорі» для дотиків: знизу вони закривали кнопки
+   відповідей і «Завершити», а дотик лише прибирав тост (кнопку дії в тості натиснути можна) */
+body[data-route="/line/:id/check/:occasion"] .toast-host{top:calc(var(--topbar) + 10px);bottom:auto}
+body[data-route="/line/:id/check/:occasion"] .toast-host .t{pointer-events:none}
+body[data-route="/line/:id/check/:occasion"] .toast-host .t .btn{pointer-events:auto}
 
 /* ---------- чек-лист ---------- */
 .op-ck-info .card-body{display:flex;flex-wrap:wrap;align-items:flex-end;gap:14px 28px}
@@ -199,6 +203,9 @@ body[data-route="/line/:id/check/:occasion"] .toast-host{bottom:112px}
 .op-item.is-ok{border-left-color:var(--ok)}
 .op-item.is-bad{border-left-color:var(--bad);background:linear-gradient(0deg,var(--bad-soft),var(--bad-soft)),var(--panel)}
 .op-item.is-na{border-left-color:var(--dim)}
+/* «Н/З» в обов’язковому пункті без пояснення — стане зауваженням, якщо не пояснити */
+.op-item.is-na-why{border-left-color:var(--accent)}
+.op-note-req .op-na-why{color:var(--accent)}
 .op-item.is-missing{border-color:var(--accent);border-left-color:var(--accent);box-shadow:0 0 0 2px var(--accent-line)}
 .op-item.flash{animation:op-flash 1.1s ease-out}
 @keyframes op-flash{0%{box-shadow:0 0 0 6px var(--accent-line)}100%{box-shadow:0 0 0 2px var(--accent-line)}}
@@ -211,6 +218,8 @@ body[data-route="/line/:id/check/:occasion"] .toast-host{bottom:112px}
 .op-item.t-text,.op-item.t-select{grid-template-columns:minmax(0,1fr)}
 .op-item-note{grid-column:1 / -1}
 .op-item-note .field{margin:0}
+/* поля, які браузер сам прокручує у видиму область (фокус, екранна клавіатура), — не під нижню панель */
+.op-ck .inp{scroll-margin-top:calc(var(--topbar) + 16px);scroll-margin-bottom:160px}
 .op-add-note{
   display:inline-flex;align-items:center;gap:6px;min-height:40px;margin:4px 0 -8px -8px;padding:0 8px;
   border:0;border-radius:var(--r);background:transparent;color:var(--dim);font-size:14.5px;
@@ -379,12 +388,20 @@ button.op-hday:hover{background:var(--hover)}
   .op-an-v{max-width:none;text-align:left}
 }
 @media (max-width:420px){
+  /* 360 px: «Налаштування завершено» і «НАЛАШТУВАННЯ» — без розриву посеред слова */
+  .op-acts-prim .bigbtn{gap:12px;padding:14px 16px}
+  .op-acts-prim .bigbtn .bb-ic{flex-basis:48px;height:48px}
+  .op-acts-prim .bigbtn .bb-l{font-size:22px}
+  .op-st-name b{font-size:22px;overflow-wrap:break-word;hyphens:auto}
   .op-tri{grid-template-columns:1fr 1.3fr 60px;gap:6px}
   .op-tri-b{min-width:0;font-size:16.5px;padding:0 4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .op-tri-b .ic{display:none}
 }
 @media (max-width:350px){
+  .op-acts-prim .bigbtn .bb-l{font-size:20px}
+  .op-st-name b{font-size:18px}
   .op-tri-b{font-size:15px}
   .op-acts-grid .bigbtn .bb-l{font-size:18px;overflow-wrap:anywhere}
   .op-acts-grid .bigbtn{gap:12px;padding:12px 14px}
+  .op-acts-grid .bigbtn .bb-ic{flex-basis:40px;height:40px}
 }

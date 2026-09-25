@@ -92,17 +92,28 @@ var Operator = (function () {
   /* ------------------------------ записи ------------------------------ */
   function opFields(op) { return { operator: op.name, staff_id: op.staff_id || '' }; }
   function offline() { var n = Api.net(); return n.mode === 'remote' && (n.online === false || !!n.paused); }
+  /* останній запис не вмістився в пам’ять пристрою (Api.write → {ok:false, queued:true, error:'STORAGE_FULL'}):
+     помилку й банер уже показав App — зеленого «збережено» тоді не показуємо. Подію error Api.write надсилає
+     синхронно, тож стан відомий одразу, без очікування відповіді сервера */
+  var fullSeen = 0, lastWriteFull = false;
+  Api.on('error', function (e) { if (e && e.error === 'STORAGE_FULL') fullSeen++; });
   function savedToast(msg, tone) {
+    if (lastWriteFull) return;
     UI.toast(msg + (offline() ? '. Немає зв’язку — запис у черзі, надішлеться автоматично' : ''), { tone: tone || 'ok', ms: offline() ? 4500 : 3000 });
   }
   function write(action, params) {
+    var before = fullSeen;
     var p = Api.write(action, params);
+    // черга зберігається цілком: якщо останній запис збережено, то й попередні
+    lastWriteFull = fullSeen > before;
     p.then(function (r) { if (r && r.ok) markStale(params.line_id); });
     // обхід гонки в Api.flush: запис, зроблений у «хвості» попереднього надсилання, інакше чекає до 15 с
     setTimeout(function () { if (Api.queue().length) Api.flush(true); }, 80);
     return p;
   }
   function writeEvent(lineId, op, fields) {
+    // екран лінії одразу перемальовується під пальцем — другий дотик подвійного тапу не має влучити в нову кнопку
+    UI.armTapGuard();
     var p = { line_id: lineId };
     var o = opFields(op);
     Object.keys(o).forEach(function (k) { p[k] = o[k]; });
@@ -306,8 +317,6 @@ var Operator = (function () {
      ЕКРАН ЛІНІЇ  #/line/:id
      ===================================================================== */
   var moreOpen = {};
-  var lastLineHash = '';
-  var lastActAt = 0;
 
   function lineMissing(host, id) {
     App.setTitle('Лінію не знайдено');
@@ -320,7 +329,6 @@ var Operator = (function () {
     var l = App.line(p.id);
     if (!l) { lineMissing(host, p.id); return; }
     App.setTitle(l.name);
-    lastLineHash = lineHref(l.id);
     var s = App.lineStatus(l.id);
     var kick = [l.kind, l.area].filter(Boolean).join(' · ') || 'Лінія';
     host.innerHTML = UI.pageHead({ title: l.name, kicker: kick, back: '#/' }) +
@@ -331,11 +339,7 @@ var Operator = (function () {
       var b = e.target.closest('[data-act]');
       if (!b || b.disabled || !host.contains(b)) return;
       e.preventDefault();
-      // захист від подвійного дотику: після прямого запису екран одразу перемальовується, і другий дотик влучив би в іншу кнопку
-      if (Date.now() - lastActAt < 600) return;
-      var a = b.getAttribute('data-act');
-      if (a === 'resume' || a === 'run-direct') lastActAt = Date.now();
-      runAction(l.id, a, b);
+      runAction(l.id, b.getAttribute('data-act'), b);
     });
     host.addEventListener('click', function (e) {
       var seg = e.target.closest('.op-today .op-strip i[data-tip]');
@@ -369,13 +373,13 @@ var Operator = (function () {
       (lc.result ? '<span class="op-res r-' + esc(lc.result) + '">' + esc(UI.label('check_result', lc.result).toLowerCase()) + '</span>' : '<span class="dim">надсилається</span>') : '<span class="dim">—</span>';
     var warn = '';
     var inWork = st === 'run' || st === 'stop';
-    // без чинного чек-листа, хоча робота почалася недавно (довгу роботу покриває попередження long_run)
-    var fresh = s.work_since && nowMs() - tms(s.work_since) < (S().checklist_valid_hours || 12) * 3600000;
-    if (inWork && (s.flag === 'no_checklist' || (!s.start_check_valid && fresh))) {
+    // спільне правило з плиткою і таблицею керівника (App.checkMissing)
+    if (App.checkMissing(s)) {
       warn += '<div class="op-warn bad">' + icon('alert', 22) + '<span>Лінія працює <b>без чек-листа запуску</b>. Пройдіть його зараз — запис буде в історії.</span>' +
         '<button type="button" class="btn sm" data-act="late-check">' + icon('checklist', 18) + '<span>Пройти чек-лист</span></button></div>';
-    } else if (inWork && s.flag === 'forced') {
-      warn += '<div class="op-warn soon">' + icon('alert', 22) + '<span>Лінію запущено попри зауваження в чек-листі.</span></div>';
+    } else if (inWork && (s.flag === 'forced' || lastStartFailed(s))) {
+      warn += '<div class="op-warn soon">' + icon('alert', 22) + '<span>' + (s.flag === 'forced' ? 'Лінію запущено попри зауваження в чек-листі.' :
+        'Чек-лист запуску <b>не пройдено</b> — лінія працює попри зауваження в критичних пунктах.') + '</span></div>';
     }
     if (s.long_run) {
       warn += '<div class="op-warn soon">' + icon('clock', 22) + '<span>Лінія працює понад ' + esc(fmt.num(S().long_run_hours || 16)) +
@@ -614,7 +618,7 @@ var Operator = (function () {
       intro: 'Лінія перейде в стан <b>«Ремонт»</b>. Коли все полагодять — натисніть «Ремонт завершено».',
       html: unitChips(l, '') +
         UI.field.textarea({ name: 'cause', label: 'Що сталося?', required: true, rows: 3, maxLength: 300, placeholder: 'Напр., тече клапан дозатора, не закручує кришки' }) +
-        (S().instant_repair !== false ? '<div class="box info op-note">' + icon('send', 20) + 'Керівництво отримає сповіщення про ремонт.</div>' : ''),
+        (S().instant_repair !== false ? '<div class="box info op-note">' + icon('send', 20) + '<span>Керівництво отримає сповіщення про ремонт.</span></div>' : ''),
       submit: { label: 'Почати ремонт', tone: 'danger', icon: 'wrench' },
       validate: function (root) {
         var v = UI.readForm(root);
@@ -712,6 +716,7 @@ var Operator = (function () {
               if (!res) return;
               writeEvent(l.id, op, { state: 'off', ref_id: res.ids[0] });
               savedToast('Налаштування записано, лінія не працює');
+              endShift(l.id, op);
             });
           }
         }
@@ -724,49 +729,117 @@ var Operator = (function () {
     var u = App.unitsOf(lineId).filter(function (x) { return x.name === m[1].trim(); })[0];
     return u ? u.id : '';
   }
+  /* роботи лінії, записані після початку поточного стану (since): з цього планшета, з черги і з завантаженої історії.
+     Так «Ремонт / ТО завершено» не просить записати ту саму роботу вдруге. → [{id, title, ts, rule_id, downtime_min}] за часом */
+  var doneWorks = {};   // lineId → {since (мс), works} — роботи, збережені кнопкою «Ремонт / ТО завершено»
+  function worksSince(lineId, since) {
+    var t = tms(since), out = [], seen = {};
+    if (isNaN(t)) return out;
+    var add = function (w, any) {
+      if (!w || !w.id || seen[w.id] || w.void || !(any || tms(w.ts) >= t)) return;
+      seen[w.id] = 1;
+      out.push({ id: w.id, title: w.title || UI.label('work_type', w.work_type), ts: w.ts, rule_id: w.rule_id || '', downtime_min: w.downtime_min });
+    };
+    var mem = doneWorks[lineId];
+    if (mem && mem.since === t) mem.works.forEach(function (w) { add(w, true); });
+    Api.pendingFor(lineId).forEach(function (op) { if (op.action === 'work') add(op.params); });
+    [2, 14].forEach(function (d) { var c = cached(lineId, d); if (c) (c.data.works || []).forEach(function (w) { add(w); }); });
+    return out.sort(function (a, b) { return tms(a.ts) - tms(b.ts); });
+  }
+  /* вибір великими кнопками, який не закривається дотиком повз вікно чи Esc — лише явною кнопкою скасування
+     (як UI.choose, але locked: випадковий дотик не повинен лишити лінію в ремонті з уже записаною роботою) */
+  function chooseLocked(o) {
+    var body = (o.text ? '<p class="modal-text">' + esc(o.text) + '</p>' : '') +
+      '<div class="choose-grid cols-1">' + o.options.map(function (x, i) {
+        return UI.bigButton({ label: x.label, sub: x.sub, icon: x.icon, tone: x.tone, attrs: { 'data-choose': i } });
+      }).join('') + '</div>';
+    var m = UI.modal({ title: o.title, size: 'md', body: body, className: 'modal-choose op-next', locked: true,
+      actions: [{ label: o.cancel, value: null, tone: 'ghost' }] });
+    UI.delegate(m.body, 'click', '[data-choose]', function (e, b) { m.close(o.options[+b.getAttribute('data-choose')].value); });
+    return m.result;
+  }
   function workDone(l, op, kind) {
     var s = App.lineStatus(l.id);
-    var o = { line_id: l.id, mode: kind, operator: op, requireOperator: false, started: s.since };
+    // рахуємо заздалегідь, поки заповнюють форму: вікно «Що далі» відкривається одразу після збереження
+    var pre = Promise.all([needStartCheck(l.id), ranSinceOff(l.id)]);
+    var done = worksSince(l.id, s.since), c = cache[l.id + ':2'];
+    // історію лінії ще не завантажено (напр., щойно перезапустили застосунок) — коротко чекаємо на неї
+    var known = done.length || (c && c.data && !c.p) ? Promise.resolve(done) :
+      withTimeout(loadLine(l.id, 2, 60000), 4000).then(function () { return worksSince(l.id, s.since); });
+    return known.then(function (w) { return w.length ? nextAfterWork(l, op, kind, w, pre, false) : recordWork(l, op, kind, pre, []); });
+  }
+  /* форма роботи завершення ремонту / ТО; prior — роботи, уже записані в цьому стані («Записати ще роботу»):
+     простій і початок стану не повторюємо (інакше простій порахується двічі), виконані роботи регламенту не пропонуємо */
+  function recordWork(l, op, kind, pre, prior) {
+    var s = App.lineStatus(l.id), more = prior.length > 0;
+    var o = { line_id: l.id, mode: kind, operator: op, requireOperator: false, started: more ? undefined : s.since };
     if (kind === 'repair') {
       o.cause = s.reason;
       o.unit_id = unitFromNote(l.id, s.note);
-      o.downtime_min = minutesSince(s.since);
-      o.heading = 'Ремонт завершено';
+      if (!prior.some(function (w) { return w.downtime_min > 0; })) o.downtime_min = minutesSince(s.since);
+      o.heading = more ? 'Ще одна робота' : 'Ремонт завершено';
     } else {
-      var titles = String(s.reason || '').split(/;\s*/);
-      o.rule_ids = App.rulesOf(l.id).filter(function (r) { return titles.indexOf(r.title) >= 0; }).map(function (r) { return r.id; });
-      o.heading = 'ТО завершено';
+      var titles = String(s.reason || '').split(/;\s*/), had = prior.map(function (w) { return w.rule_id; });
+      o.rule_ids = App.rulesOf(l.id).filter(function (r) { return titles.indexOf(r.title) >= 0 && had.indexOf(r.id) < 0; }).map(function (r) { return r.id; });
+      o.heading = more ? 'Ще одна робота' : 'ТО завершено';
     }
     o.submitLabel = 'Зберегти і далі';
     return openWorkForm(o).then(function (res) {
       if (!res) return;
-      return nextAfterWork(l, op, kind, res.ids[0]);
+      var t = tms(s.since);
+      if (!isNaN(t)) {
+        if (!doneWorks[l.id] || doneWorks[l.id].since !== t) doneWorks[l.id] = { since: t, works: [] };
+        res.works.forEach(function (w) { doneWorks[l.id].works.push(w); });
+      }
+      savedToast(res.ids.length > 1 ? 'Записано робіт: ' + res.ids.length : 'Роботу записано');
+      return nextAfterWork(l, op, kind, res.works, pre, true);
     });
   }
-  function nextAfterWork(l, op, kind, workId) {
-    return Promise.all([needStartCheck(l.id), ranSinceOff(l.id)]).then(function (r) {
+  function nextAfterWork(l, op, kind, works, pre, fresh) {
+    var last = works[works.length - 1] || {};
+    return pre.then(function (r) {
       var need = r[0], ran = r[1] === true;
       var st = UI.stateLabel(kind);
-      return UI.choose({
-        title: 'Що далі з лінією?', columns: 1, cancel: kind === 'repair' ? 'Ремонт ще триває' : 'ТО ще триває',
-        text: 'Роботу записано. Лінія зараз у стані «' + st + '».',
+      // стан змінили деінде (інший планшет), поки заповнювали форму — роботу записано, далі нічого не пропонуємо
+      if (App.lineStatus(l.id).state !== kind) return;
+      var txt = fresh ? 'Роботу записано.' : works.length > 1 ?
+        'Уже записано робіт: ' + works.length + ', остання — «' + last.title + '» (' + fmt.dt(last.ts) + ').' :
+        'Роботу вже записано: «' + last.title + '» (' + fmt.dt(last.ts) + ').';
+      return chooseLocked({
+        title: 'Що далі з лінією?', cancel: kind === 'repair' ? 'Ремонт ще триває' : 'ТО ще триває',
+        text: txt + ' Лінія зараз у стані «' + st + '».',
         options: [
           { value: 'run', label: 'Запустити лінію', sub: need ? 'Спершу — чек-лист запуску' : 'Одразу в «Працює»', icon: 'play', tone: 'run' },
           { value: 'off', label: 'Зупинити лінію', sub: ran ? 'Чек-лист завершення → Не працює' : 'Лінія не працювала після вимкнення → Не працює', icon: 'power', tone: 'off' }
         ].concat(ran ? [{ value: 'off-now', label: 'Зупинити без чек-листа', sub: 'Буде позначено «Завершення без чек-листа»', icon: 'stop', tone: 'muted' }] : [])
+          .concat(fresh ? [] : [{ value: 'more', label: 'Записати ще роботу', sub: 'Якщо зроблено ще щось', icon: 'wrench', tone: 'muted' }])
       }).then(function (v) {
+        if (v === 'more') return recordWork(l, op, kind, pre, works);
         if (v === 'run') {
           if (need) goCheck(l.id, 'start');
           else { writeEvent(l.id, op, { state: 'run' }); savedToast('Лінію запущено'); }
         } else if (v === 'off') {
           if (ran) goCheck(l.id, 'end');
-          else { writeEvent(l.id, op, { state: 'off', ref_id: workId }); savedToast('Лінія не працює'); }
+          else { writeEvent(l.id, op, { state: 'off', ref_id: last.id }); savedToast('Лінія не працює'); endShift(l.id, op); }
         } else if (v === 'off-now') {
           writeEvent(l.id, op, { state: 'off' });
           savedToast('Лінія не працює');
+          endShift(l.id, op);
         }
       });
     });
+  }
+  /* лінію зупинено («Не працює») — робота цієї людини на лінії завершена: знімаємо її з планшета, щоб дії
+     наступної людини не записувались від її імені (крім випадку, коли вона ще працює на іншій лінії цього планшета) */
+  function endShift(lineId, op) {
+    var cur = App.operator(), nm = function (x) { return String(x || '').trim().toLowerCase(); };
+    if (!cur || (op && nm(op.name) !== nm(cur.name))) return;
+    var elsewhere = App.lines().some(function (x) {
+      if (x.id === lineId) return false;
+      var s = App.lineStatus(x.id);
+      return s.state && s.state !== 'off' && nm(s.operator) === nm(cur.name);
+    });
+    if (!elsewhere) App.signOut();
   }
   function cleanDone(l, op) {
     var s = App.lineStatus(l.id);
@@ -777,6 +850,7 @@ var Operator = (function () {
         if (ran === true) { goCheck(l.id, 'end'); return; }
         writeEvent(l.id, op, { state: 'off', ref_id: res.ids[0] });
         savedToast('Миття записано, лінія не працює');
+        endShift(l.id, op);
       });
     });
   }
@@ -1095,10 +1169,10 @@ var Operator = (function () {
       }, function () { busy = false; });
     });
   }
+  /* після збереження — на екран лінії: крок назад, лише якщо попередній запис історії саме він */
   function returnToLine(lineId) {
     App.setDirty(false);
-    if (lastLineHash === lineHref(lineId)) App.back(lineHref(lineId));
-    else App.go(lineHref(lineId), { replace: true });
+    App.backTo(lineHref(lineId));
   }
 
   /* =====================================================================
@@ -1109,7 +1183,7 @@ var Operator = (function () {
     if (!l) return Promise.resolve(null);
     var ms = bySort(App.metersOf(lineId));
     var s = App.lineStatus(lineId);
-    var hours = '<div class="box op-note">' + icon('clock', 20) + 'Мотогодини лінії: <b>' + esc(numText(s.cum_h)) + '</b> — рахуються автоматично за часом роботи.</div>';
+    var hours = '<div class="box op-note">' + icon('clock', 20) + '<span>Мотогодини лінії: <b>' + esc(fmt.hours(s.cum_h, 1)) + '</b> — рахуються автоматично за часом роботи.</span></div>';
     if (!ms.length) {
       return UI.alert({ title: 'Лічильники · ' + l.name, html: hours + '<p class="op-mt">Для цієї лінії інших лічильників немає. Керівник може додати їх у розділі «Обладнання».</p>' });
     }
@@ -1154,8 +1228,10 @@ var Operator = (function () {
   /* =====================================================================
      ЧЕК-ЛИСТ  #/line/:id/check/:occasion
      ===================================================================== */
-  /* оцінка відповіді — як у ядрі (addChecklist) */
-  function evalItem(it, v) {
+  /* оцінка відповіді — як у ядрі (addChecklist). «Н/З» у критичному пункті — зауваження; в обов’язковому —
+     лише з поясненням у примітці (note), без нього це пропущена перевірка — теж зауваження */
+  function isNa(it, v) { return it.type === 'check' && v === 'na'; }
+  function evalItem(it, v, note) {
     var r = { answered: false, ok: null, text: '', num: null };
     if (v === undefined || v === null || String(v).trim() === '') return r;
     if (it.type === 'check') {
@@ -1176,8 +1252,14 @@ var Operator = (function () {
     } else {
       r.answered = true; r.ok = true; r.text = String(v).trim();
     }
-    if (it.critical && r.answered && r.ok === null) r.ok = false;
+    if (r.answered && r.ok === null && (it.critical || (it.required !== false && !nz(note)))) r.ok = false;
     return r;
+  }
+  /* «Вироблено» → «Вироблено за зміну»; «Вироблено, шт» → теж (одиниця — поруч із полем) */
+  function perShiftLabel(m) {
+    var n = String(m.name || '').trim(), suf = m.unit_label ? ', ' + String(m.unit_label).trim() : '';
+    if (suf && n.length > suf.length && n.slice(-suf.length).toLowerCase() === suf.toLowerCase()) n = n.slice(0, -suf.length).trim();
+    return /за\s+зміну$/i.test(n) ? n : n + ' за зміну';
   }
   function thenFor(occ, state, q) {
     if (q === 'none') return '';
@@ -1270,7 +1352,7 @@ var Operator = (function () {
       body += '<section class="op-sec"><h2 class="op-sec-t"><span class="op-sec-n">' + icon('gauge', 18) + '</span>Лічильники<small>' + meters.length + '</small></h2>' +
         '<div class="op-item op-mtrs">' + meters.map(function (m) {
           var inc = m.mode === 'inc';
-          return UI.field.number({ name: 'mv_' + m.id, label: m.name + (inc ? ' за зміну' : ''), unit: m.unit_label,
+          return UI.field.number({ name: 'mv_' + m.id, label: inc ? perShiftLabel(m) : m.name, unit: m.unit_label,
             hint: (inc ? 'Скільки вироблено за зміну. ' : 'Показник на лічильнику зараз. ') + 'Останнє: ' + numText(m.value, m.unit_label) + (m.value_ts ? ', ' + fmt.dt(m.value_ts) : '') });
         }).join('') + '</div></section>';
     }
@@ -1294,18 +1376,26 @@ var Operator = (function () {
     function upd(id) {
       var it = itemById[id], c = card(id);
       if (!it || !c) return;
-      var r = evalItem(it, A[id]);
+      var r = evalItem(it, A[id], N[id]);
+      // «Н/З» в обов’язковому (не критичному) пункті: просимо пояснення; без нього це зауваження (як у ядрі)
+      var naAsk = isNa(it, A[id]) && !it.critical && it.required !== false, why = naAsk && !nz(N[id]);
       c.classList.toggle('is-ok', r.answered && r.ok === true);
-      c.classList.toggle('is-bad', r.answered && r.ok === false);
-      c.classList.toggle('is-na', r.answered && r.ok === null);
+      c.classList.toggle('is-bad', r.answered && r.ok === false && !why);
+      c.classList.toggle('is-na', r.answered && (r.ok === null || why));
+      c.classList.toggle('is-na-why', why);
       if (r.answered) c.classList.remove('is-missing');
       var noteBox = c.querySelector('.op-item-note');
       var need = r.answered && r.ok === false;
-      var show = need || nz(N[id]) || c.classList.contains('note-open');
+      var show = need || naAsk || nz(N[id]) || c.classList.contains('note-open');
       noteBox.hidden = !show;
       c.querySelector('[data-note-add]').hidden = show;
       var rq = c.querySelector('.op-note-req');
-      if (rq) rq.innerHTML = need && it.critical ? ' <span class="req">*</span> <span class="op-lbl-opt">обов’язково для критичного пункту</span>' : '';
+      if (rq) {
+        rq.innerHTML = need && it.critical ? ' <span class="req">*</span> <span class="op-lbl-opt">обов’язково для критичного пункту</span>' :
+          naAsk ? ' <span class="op-lbl-opt op-na-why">поясніть, чому Н/З — інакше це зауваження</span>' : '';
+      }
+      var ta = noteBox.querySelector('textarea');
+      if (ta) ta.placeholder = isNa(it, A[id]) ? 'Чому не застосовно: напр., вузол не використовується для цього формату' : 'Що саме не так, що зроблено';
       if (it.type === 'check') {
         UI.qsa('.op-tri-b', c).forEach(function (b) { var on = b.getAttribute('data-v') === A[id]; b.classList.toggle('on', on); b.setAttribute('aria-pressed', on ? 'true' : 'false'); });
       } else if (it.type === 'number') {
@@ -1322,7 +1412,7 @@ var Operator = (function () {
     function progress() {
       var done = 0, reqLeft = 0;
       items.forEach(function (it) {
-        var r = evalItem(it, A[it.id]);
+        var r = evalItem(it, A[it.id], N[it.id]);
         if (r.answered) done++;
         else if (it.required !== false) reqLeft++;
       });
@@ -1340,13 +1430,13 @@ var Operator = (function () {
       var c = b.closest('.op-item'), id = c.getAttribute('data-item'), v = b.getAttribute('data-v');
       A[id] = A[id] === v ? '' : v;
       touch(); upd(id); progress();
-      if (A[id] === 'fail') { var n = c.querySelector('textarea[name^="n_"]'); if (n) setTimeout(function () { try { n.focus({ preventScroll: true }); } catch (x) { n.focus(); } }, 30); }
+      if (A[id] === 'fail') { var n = c.querySelector('textarea[name^="n_"]'); if (n) setTimeout(function () { focusField(n); }, 30); }
     });
     UI.delegate(root, 'click', '[data-note-add]', function (e, b) {
       var c = b.closest('.op-item');
       c.classList.add('note-open');
       upd(c.getAttribute('data-item'));
-      var n = c.querySelector('textarea[name^="n_"]'); if (n) n.focus();
+      var n = c.querySelector('textarea[name^="n_"]'); if (n) focusField(n);
     });
     root.addEventListener('change', function (e) {
       var d = e.detail;
@@ -1356,7 +1446,7 @@ var Operator = (function () {
       var t = e.target, n = t && t.name;
       if (!n) return;
       if (n.indexOf('v_') === 0) { var id = n.slice(2); A[id] = t.value; upd(id); progress(); }
-      else if (n.indexOf('n_') === 0) { N[n.slice(2)] = t.value; }
+      else if (n.indexOf('n_') === 0) { N[n.slice(2)] = t.value; upd(n.slice(2)); }
       else if (n.indexOf('mv_') === 0) { MV[n.slice(3)] = t.value; }
       else if (n === 'wb_on') { /* нижче */ }
     });
@@ -1382,8 +1472,35 @@ var Operator = (function () {
       e.preventDefault();
       var all = UI.qsa('input.inp[type="text"], textarea.inp', root).filter(function (x) { return x.offsetParent !== null; });
       var nx = all[all.indexOf(e.target) + 1];
-      if (nx) { try { nx.focus({ preventScroll: false }); } catch (x) { nx.focus(); } } else e.target.blur();
+      if (nx) focusField(nx); else e.target.blur();
     });
+    /* поле введення завжди видно повністю: між верхньою панеллю і нижньою панеллю чек-листа
+       (або екранною клавіатурою — visualViewport). Браузер про липку панель знизу не знає */
+    function isEntry(n) { return !!n && (n.tagName === 'TEXTAREA' || (n.tagName === 'INPUT' && n.type === 'text')); }
+    function reveal(n) {
+      if (!n || !n.isConnected || !ctx.alive()) return;
+      var box = n.closest('.op-item-note, .op-num, .field') || n;
+      var vTop = vv ? vv.offsetTop : 0, vH = vv ? vv.height : window.innerHeight;
+      var tb = document.querySelector('.topbar'), foot = root.querySelector('.op-ck-foot');
+      var top = Math.max(vTop, tb ? tb.getBoundingClientRect().bottom : 0) + 8;
+      var bottom = Math.min(vTop + vH, foot ? foot.getBoundingClientRect().top : Infinity) - 12;
+      var r = box.getBoundingClientRect(), d = 0;
+      if (r.bottom > bottom) d = r.bottom - bottom;
+      if (r.top - d < top) d = r.top - top;          // вищий за вільне місце — показуємо початок
+      if (Math.abs(d) >= 1) window.scrollBy(0, d);
+    }
+    function focusField(n) {
+      try { n.focus({ preventScroll: true }); } catch (x) { n.focus(); }
+      reveal(n);
+    }
+    // дотик до частково закритого поля або відкриття екранної клавіатури
+    root.addEventListener('focusin', function (e) {
+      var t = e.target;
+      if (isEntry(t)) requestAnimationFrame(function () { if (document.activeElement === t) reveal(t); });
+    });
+    var vv = window.visualViewport;   // екранна клавіатура зменшує видиму область
+    function onViewport() { var a = document.activeElement; if (isEntry(a) && root.contains(a)) reveal(a); }
+    if (vv) vv.addEventListener('resize', onViewport);
     items.forEach(function (it) { upd(it.id); });
     progress();
 
@@ -1393,7 +1510,7 @@ var Operator = (function () {
       var first = null, miss = 0, bad = 0;
       UI.clearErrors(root);
       items.forEach(function (it) {
-        var c = card(it.id), r = evalItem(it, A[it.id]);
+        var c = card(it.id), r = evalItem(it, A[it.id], N[it.id]);
         if (it.type === 'number' && nz(A[it.id]) && !r.answered) { bad++; c.classList.add('is-missing'); if (!first) first = c; return; }
         if (!r.answered && it.required !== false) { miss++; c.classList.add('is-missing'); if (!first) first = c; return; }
         c.classList.remove('is-missing');
@@ -1429,12 +1546,12 @@ var Operator = (function () {
       });
     }
     function summary(op) {
-      var res = items.map(function (it) { return { it: it, r: evalItem(it, A[it.id]) }; });
+      var res = items.map(function (it) { return { it: it, r: evalItem(it, A[it.id], N[it.id]) }; });
       var failed = 0, oor = 0, na = 0, crit = false;
       res.forEach(function (x) {
         if (x.it.type === 'check' && x.r.ok === false) failed++;
         if ((x.it.type === 'number' || x.it.type === 'select') && x.r.ok === false) oor++;
-        if (x.r.answered && x.r.ok === null) na++;
+        if (isNa(x.it, A[x.it.id])) na++;          // усі «Н/З», зокрема непояснені (вони ще й у зауваженнях) — як checks.na
         if (x.it.critical && x.r.ok === false) crit = true;
       });
       var result = crit ? 'fail' : failed + oor > 0 ? 'remarks' : 'ok';
@@ -1448,7 +1565,8 @@ var Operator = (function () {
         '</b> поза нормою</span><span><b>' + na + '</b> Н/З</span></div>';
       var plist = probs.length ? '<div class="op-sum-list">' + probs.map(function (x) {
         return '<div class="op-sum-p">' + icon('alert', 18) + '<div><b>' + esc(x.it.text) + '</b><span>' + esc(x.r.text) +
-          (x.it.type === 'number' && rangeText(x.it) ? ' (норма ' + esc(rangeText(x.it)) + ')' : '') + (nz(N[x.it.id]) ? ' — ' + esc(N[x.it.id]) : '') + '</span></div>' +
+          (x.it.type === 'number' && rangeText(x.it) ? ' (норма ' + esc(rangeText(x.it)) + ')' : '') +
+          (nz(N[x.it.id]) ? ' — ' + esc(N[x.it.id]) : isNa(x.it, A[x.it.id]) ? ' — без пояснення' : '') + '</span></div>' +
           (x.it.critical ? UI.badge('критичний', 'bad') : '') + '</div>';
       }).join('') + '</div>' : '';
       var rds = meters.filter(function (m) { return nz(MV[m.id]); });
@@ -1459,7 +1577,7 @@ var Operator = (function () {
       var failStart = result === 'fail' && then === 'run';
       var html = head + counts + plist + rlist +
         UI.field.textarea({ name: 'comment', label: failStart ? 'Коментар (обов’язково, якщо запускаєте попри зауваження)' : 'Коментар', rows: 2, maxLength: 2000,
-          placeholder: 'Необов’язково: що варто знати керівнику або наступній зміні' });
+          placeholder: failStart ? 'Чому запускаєте попри зауваження — без цього запуск неможливий' : 'Необов’язково: що варто знати керівнику або наступній зміні' });
       var acts = [{ label: 'Назад', tone: 'ghost', icon: 'back', value: null }];
       var choice = function (c) { return function (mm) { return commit(op, c, mm); }; };
       if (then === 'run' && result !== 'fail') {
@@ -1525,8 +1643,10 @@ var Operator = (function () {
         c.state === 'off' ? 'Чек-лист збережено, роботу завершено' : c.state === 'repair' ? 'Чек-лист збережено, лінія в ремонті' : 'Чек-лист збережено';
       savedToast(msg, c.forced || c.state === 'repair' ? 'warn' : 'ok');
       returnToLine(l.id);
+      if (c.state === 'off') endShift(l.id, op);
       return false;
     }
+    return { dispose: function () { if (vv) vv.removeEventListener('resize', onViewport); } };
   }
 
   /* =====================================================================
@@ -1554,7 +1674,9 @@ var Operator = (function () {
         var val = nz(a.value) ? a.value : '—';
         if (a.type === 'number' && a.num_value !== null && a.num_value !== undefined) val = numText(a.num_value, a.unit_label);
         var rg = a.type === 'number' ? rangeText(a) : '';
-        return '<div class="op-an ' + cls + '"><div class="op-an-t">' + esc(a.text) + (rg ? '<small>норма ' + esc(rg) + '</small>' : '') + (a.note ? '<em>' + esc(a.note) + '</em>' : '') + '</div>' +
+        var why = !a.note && a.ok === false && a.type === 'check' && a.value === CHECK_V.na;   // непояснене «Н/З» — зауваження
+        return '<div class="op-an ' + cls + '"><div class="op-an-t">' + esc(a.text) + (rg ? '<small>норма ' + esc(rg) + '</small>' : '') +
+          (a.note ? '<em>' + esc(a.note) + '</em>' : why ? '<em>Н/З без пояснення</em>' : '') + '</div>' +
           '<div class="op-an-v">' + (a.ok === true ? icon('check', 18) : a.ok === false ? icon('alert', 18) : '') + '<b>' + esc(nz(a.value) || a.type === 'number' ? val : 'не заповнено') + '</b></div></div>';
       }).join('') + '</div>';
     }).join('');
@@ -1576,7 +1698,7 @@ var Operator = (function () {
     var p = op.params || {};
     var answers = (p.answers || []).map(function (a) {
       var it = App.item(a.item_id) || { text: a.item_id, type: 'text' };
-      var r = evalItem(it, a.value);
+      var r = evalItem(it, a.value, a.note);
       return { section: it.section, text: it.text, type: it.type, value: r.text || a.value, num_value: r.num, unit_label: it.unit_label, min: it.min, max: it.max,
         ok: r.answered ? r.ok : null, note: a.note };
     });
@@ -1604,7 +1726,7 @@ var Operator = (function () {
       ['Завершено', esc(fmt.datetime(w.ts))],
       dur ? ['Тривалість', esc(dur)] : null,
       w.downtime_min ? ['Простій лінії', esc(fmt.duration(w.downtime_min * MIN))] : null,
-      w.hours_at !== null && w.hours_at !== undefined ? ['Мотогодини лінії', esc(numText(w.hours_at))] : null,
+      w.hours_at !== null && w.hours_at !== undefined ? ['Мотогодини лінії', esc(fmt.hours(w.hours_at, 1))] : null,
       w.meter_at !== null && w.meter_at !== undefined ? ['Лічильник', esc(numText(w.meter_at))] : null,
       ['Статус', esc(UI.label('work_status', w.status || 'done'))],
       w.void ? ['Анульовано', esc(w.void_note || 'так')] : null

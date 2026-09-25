@@ -94,12 +94,37 @@ var UI = (function () {
 
   /* ------------------------------ форматування ------------------------------ */
 
-  var tz = null, dtf = {};
+  var tz = null, dtf = {}, kits = {};
   var WD = ['нд', 'пн', 'вт', 'ср', 'чт', 'пт', 'сб'];
   var MON = ['січ', 'лют', 'бер', 'кві', 'тра', 'чер', 'лип', 'сер', 'вер', 'жов', 'лис', 'гру'];
   var MON_FULL = ['січня', 'лютого', 'березня', 'квітня', 'травня', 'червня', 'липня', 'серпня', 'вересня', 'жовтня', 'листопада', 'грудня'];
   function p2(n) { return (n < 10 ? '0' : '') + n; }
-  function setTz(z) { tz = z || null; dtf = {}; }
+  function setTz(z) { tz = z || null; dtf = {}; kits = {}; }
+  /* пояс, який справді розуміє браузер: сам пояс → синонім (старі ICU не знають Europe/Kyiv) → UTC (як у parts) */
+  function workTz() {
+    if (!tz || typeof Intl === 'undefined') return null;
+    var list = [tz, tz === 'Europe/Kyiv' ? 'Europe/Kiev' : tz === 'Europe/Kiev' ? 'Europe/Kyiv' : null, 'UTC'];
+    for (var i = 0; i < list.length; i++) {
+      if (!list[i]) continue;
+      try { new Intl.DateTimeFormat('en-GB', { timeZone: list[i] }); return list[i]; } catch (e) { /* наступний */ }
+    }
+    return null;
+  }
+  /* набір функцій часу ядра (LinesCore.util.timeKit) для поясу заводу; null — пояс не задано (час пристрою) */
+  function tzKit() {
+    var key = tz || '_';
+    if (kits[key] === undefined) {
+      kits[key] = null;
+      var z = workTz();
+      if (z) { try { var k = U.timeKit(U.defaultEnv(), z); k.key(new Date()); kits[key] = k; } catch (e) { kits[key] = null; } }
+    }
+    return kits[key];
+  }
+  /* місцевий час заводу (рік, місяць 1–12, день, год, хв) → Date */
+  function localDT(y, mo, d, h, mi) {
+    var k = tzKit(), r = k ? k.local(y, mo, d, h || 0, mi || 0, 0) : new Date(y, mo - 1, d, h || 0, mi || 0);
+    return r && !isNaN(r.getTime()) ? r : null;
+  }
   /* складові дати в поясі заводу (settings.tz), інакше — у поясі пристрою */
   function parts(d) {
     d = toDate(d);
@@ -220,17 +245,21 @@ var UI = (function () {
       if (dd > 0 && dd < 7) return 'через ' + dd + ' дн.';
       return fmt.date(d);
     },
-    /* значення для <input type=datetime-local> (час пристрою) і назад → Date */
+    /* значення для <input type=datetime-local> / type=date — у поясі заводу (як і весь показ часу), і назад → Date */
     inputDT: function (d) {
-      d = toDate(d);
-      if (!d) return '';
-      return d.getFullYear() + '-' + p2(d.getMonth() + 1) + '-' + p2(d.getDate()) + 'T' + p2(d.getHours()) + ':' + p2(d.getMinutes());
+      var p = parts(d);
+      return p ? p.y + '-' + p2(p.m) + '-' + p2(p.d) + 'T' + p2(p.H) + ':' + p2(p.M) : '';
     },
     fromInputDT: function (s) {
       var m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/.exec(String(s || ''));
-      return m ? new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5]) : null;
+      return m ? localDT(+m[1], +m[2], +m[3], +m[4], +m[5]) : null;
     },
-    inputDate: function (d) { d = toDate(d); return d ? d.getFullYear() + '-' + p2(d.getMonth() + 1) + '-' + p2(d.getDate()) : ''; }
+    inputDate: function (d) { var p = parts(d); return p ? p.y + '-' + p2(p.m) + '-' + p2(p.d) : ''; },
+    /* початок дня 'YYYY-MM-DD' (північ у поясі заводу) → Date */
+    dayStart: function (key) {
+      var m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(key || ''));
+      return m ? localDT(+m[1], +m[2], +m[3], 0, 0) : null;
+    }
   };
 
   /* ------------------------------ мітки та кольори ------------------------------ */
@@ -620,6 +649,34 @@ var UI = (function () {
     }
   }
 
+  /* ------------------------------ захист від подвійного дотику ------------------------------ */
+  /* Другий дотик подвійного тапу (або друге клацання подвійного клацання) влучає в нове вікно чи екран,
+     що відкрилися під пальцем після першого, — і, напр., вибирає випадкову людину. UI.armTapGuard()
+     (викликають modal() і App при переході на інший екран) на TAP_MS ігнорує такий «відлуння»-дотик:
+     дотик / перо — у межах TAP_NEAR px від дотику, що відкрив; миша — друге клацання (detail ≥ 2). */
+  var TAP_MS = 450, TAP_NEAR = 64;
+  var lastDown = null, tapGuard = null;
+  document.addEventListener('pointerdown', function (e) {
+    lastDown = { type: e.pointerType || 'mouse', x: e.clientX, y: e.clientY, t: Date.now() };
+  }, true);
+  function armTapGuard() {
+    var d = lastDown, t = Date.now();
+    tapGuard = d && t - d.t < 1500 ? { x: d.x, y: d.y, at: t } : null;
+  }
+  function isEchoTap(e) {
+    var g = tapGuard, d = lastDown;
+    if (!g || !d || d.t < g.at || d.t - g.at > TAP_MS) return false;
+    if (d.type === 'mouse') return e.detail >= 2;
+    return Math.abs(d.x - g.x) <= TAP_NEAR && Math.abs(d.y - g.y) <= TAP_NEAR;
+  }
+  document.addEventListener('click', function (e) {
+    if (!isEchoTap(e)) return;
+    tapGuard = null;
+    e.preventDefault();
+    e.stopPropagation();
+    if (e.stopImmediatePropagation) e.stopImmediatePropagation();
+  }, true);
+
   /* ------------------------------ модальні вікна ------------------------------ */
 
   var stack = [];
@@ -721,6 +778,7 @@ var UI = (function () {
     document.body.appendChild(overlay);
     document.documentElement.classList.add('modal-open');
     stack.push(api);
+    armTapGuard();
     var f = (o.initialFocus && qs(o.initialFocus, box)) || qs('[data-autofocus]', box) || qs('[autofocus]', body) ||
       qs('input:not([type=hidden]):not([disabled]), select, textarea', body) || box;
     var focusIt = function () { try { f.focus({ preventScroll: true }); } catch (e) { f.focus(); } };
@@ -1106,7 +1164,7 @@ var UI = (function () {
     field: field, readForm: readForm, setErrors: setErrors, clearErrors: clearErrors,
     emptyState: emptyState, spinner: spinner, loading: loading, kv: kv,
     bars: bars, stackBar: stackBar, stateBar: stateBar, legend: legend, stateLegend: stateLegend,
-    tick: tick,
+    tick: tick, armTapGuard: armTapGuard,
     modal: modal, isModalOpen: isModalOpen, confirm: confirm, alert: alertBox, prompt: prompt, choose: choose,
     toast: toast, keypad: keypad, menu: menu, table: table, csv: csv, download: download
   };

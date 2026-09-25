@@ -723,11 +723,18 @@ describe('чек-лист: оцінювання', () => {
     assert.equal(r.check.missing, 1, 'NaN = без відповіді');
     r = submit(f, 'r8', with_({ I4: 'Щось інше' }));
     assert.equal(r.check.missing, 1, 'варіанту немає в списку');
-    r = submit(f, 'r9', with_({ I2: 'na' }));
-    assert.equal(r.check.result, 'ok', 'Н/З — відповідь без оцінки');
+    // «Н/З» на обовʼязковому пункті — лише з поясненням: тоді відповідь без оцінки
+    r = submit(f, 'r9', START_OK.map((a) => (a.item_id === 'I2' ? { ...a, value: 'na', note: 'Змащували вчора, наступне — у пʼятницю' } : a)));
+    assert.equal(r.check.result, 'ok', 'Н/З із поясненням — відповідь без оцінки');
+    assert.deepEqual([r.check.failed, r.check.na], [0, 1]);
     const na = f.ok(f.call('check_detail', { id: 'r9' })).answers.find((a) => a.item_id === 'I2');
     assert.equal(na.ok, null);
     assert.equal(na.value, 'Н/З');
+    // без пояснення — пропущена перевірка: зауваження
+    r = submit(f, 'r9b', with_({ I2: 'na' }));
+    assert.equal(r.check.result, 'remarks', 'Н/З без пояснення на обовʼязковому пункті');
+    assert.deepEqual([r.check.failed, r.check.na], [1, 1]);
+    assert.equal(f.ok(f.call('check_detail', { id: 'r9b' })).answers.find((a) => a.item_id === 'I2').ok, false);
     r = submit(f, 'r10', with_({ I2: false, I3: 6 }));
     assert.equal(r.check.result, 'remarks');
     r = submit(f, 'r11', [...START_OK, { item_id: 'I5', value: 'Все добре' }, { item_id: 'I7', value: 320, note: 'перевірено' }]);
@@ -790,8 +797,8 @@ describe('чек-лист + подія: позначки', () => {
     // завершення без чек-листа
     const off = f.ev('o1', '2026-09-15T09:00:00Z', 'off');
     assert.equal(off.event.flag, 'no_end_checklist');
-    // повторний запуск у межах 12 год після чек-листа — покрито
-    assert.equal(f.ev('s2', '2026-09-15T16:00:00Z', 'run').event.flag, '');
+    // повторний запуск після завершення роботи — новий початок роботи: чек-лист c1 уже «використано»
+    assert.equal(f.ev('s2', '2026-09-15T16:00:00Z', 'run').event.flag, 'no_checklist');
     // завершення через чек-лист — без позначки
     const end = f.ok(f.call('checklist', { id: 'c2', ts: '2026-09-15T16:30:00Z', line_id: 'L1', occasion: 'end',
       answers: [{ item_id: 'I6', value: 'ok' }], then_event: { state: 'off' } }));
@@ -1696,7 +1703,7 @@ describe('сповіщення та щоденний звіт', () => {
     assert.equal(d.counts.failed, 1);
     assert.equal(d.counts.repairs, 1);
     assert.equal(d.counts.uncovered, 1);
-    for (const h of ['Потрібно виконати (1)', 'Найближчі 7 дн. (1)', 'Щоденні перевірки за вчора (14.09.2026)',
+    for (const h of ['Потрібно виконати (1)', 'Скоро потрібно виконати (1)', 'Щоденні перевірки за вчора (14.09.2026)',
       'Зауваження в чек-листах за добу (1)', 'Ремонти та простої за добу', 'Стан ліній зараз']) {
       assert.ok(d.html.includes(h), h);
     }
@@ -1759,7 +1766,9 @@ describe('seedDemo', () => {
     assert.ok(items.some((i) => i.type === 'select' && i.options.some((o) => o.startsWith('!'))));
     const meters = rows('meters');
     assert.ok(meters.some((m) => m.name === 'Цикли дозатора' && m.mode === 'abs'));
-    assert.ok(meters.some((m) => m.name === 'Вироблено, шт' && m.mode === 'inc' && m.ask_on_end));
+    assert.ok(meters.some((m) => m.name === 'Вироблено' && m.unit_label === 'шт' && m.mode === 'inc' && m.ask_on_end));
+    // одиниця — лише в «Од. виміру», не в назві (інакше «Вироблено, шт: 12 шт» / «…, шт за зміну»)
+    for (const m of meters) assert.ok(!m.unit_label || !m.name.endsWith(', ' + m.unit_label), m.id + ': ' + m.name);
     assert.ok(meters.some((m) => m.name === 'Етикеток нанесено' && m.line_id === 'L3'));
     const rules = rows('rules');
     assert.ok(rules.length >= 7 && rules.length <= 10);
@@ -2258,6 +2267,64 @@ describe('рецензія: щоденні перевірки', () => {
     assert.equal(JSON.stringify(f.store.all('events')), before);
   });
 
+  test('після «Не працює» чек-лист запуску вже не чинний: наступна зміна проходить новий (статус, позначки, перерахунок)', () => {
+    const f = fixture('2026-09-15T05:00:00Z');
+    config(f);
+    const st = () => f.ok(f.call('bootstrap')).status.L1;
+    f.ok(f.call('checklist', { id: 'c1', ts: '2026-09-15T05:00:00Z', line_id: 'L1', occasion: 'start', answers: START_OK }));
+    f.setNow('2026-09-15T05:30:00Z');
+    assert.equal(st().start_check_valid, true, 'чек-лист пройдено, лінія ще не запускалася');
+    // «Зберегти без запуску», запуск пізніше — той самий чек-лист
+    assert.equal(f.ev('r1', '2026-09-15T05:30:00Z', 'run').event.flag, '');
+    f.setNow('2026-09-15T09:00:00Z');
+    f.ev('p1', '2026-09-15T08:00:00Z', 'stop', { reason: 'Перерва' });
+    assert.equal(f.ev('r2', '2026-09-15T08:30:00Z', 'run').event.flag, '', 'відновлення після простою — не запуск');
+    assert.equal(st().start_check_valid, true);
+    // завершення роботи через чек-лист завершення
+    f.ok(f.call('checklist', { id: 'e1', ts: '2026-09-15T09:00:00Z', line_id: 'L1', occasion: 'end',
+      answers: [{ item_id: 'I6', value: 'ok' }], then_event: { state: 'off' } }));
+    f.setNow('2026-09-15T10:00:00Z');
+    let s = st();
+    assert.equal(s.state, 'off');
+    assert.equal(s.start_check_valid, false, 'чек-лист 05:00 чинний лише до завершення роботи');
+    assert.equal(f.app.lineStatus('L1').start_check_valid, false);
+    // ТО після зміни, потім «Запустити» — це запуск без чек-листа
+    f.ev('m1', '2026-09-15T09:30:00Z', 'maint');
+    const r3 = f.ev('r3', '2026-09-15T10:00:00Z', 'run', { operator: 'Сергій' });
+    assert.equal(r3.event.flag, 'no_checklist');
+    assert.equal(r3.event.starts, 2);
+    const day = f.app.compliance('2026-09-15', '2026-09-15', ['L1']).L1[0];
+    assert.deepEqual([day.starts, day.covered, day.status], [2, 1, 'miss']);
+    // новий чек-лист після завершення — запуск покрито (пізніше надійшов із черги планшета)
+    f.setNow('2026-09-15T10:30:00Z');
+    f.ok(f.call('checklist', { id: 'c2', ts: '2026-09-15T09:59:00Z', line_id: 'L1', occasion: 'start', answers: START_OK }));
+    assert.equal(f.row('events', 'r3').flag, '');
+    assert.equal(st().start_check_valid, true);
+    // пізній чек-лист не покриває запуск ПІСЛЯ наступного завершення
+    f.setNow('2026-09-15T12:00:00Z');
+    f.ev('o2', '2026-09-15T11:00:00Z', 'off', { ref_id: 'x' });
+    assert.equal(f.ev('r4', '2026-09-15T11:30:00Z', 'run').event.flag, 'no_checklist');
+    f.setNow('2026-09-15T12:30:00Z');
+    f.ok(f.call('checklist', { id: 'c3', ts: '2026-09-15T10:59:00Z', line_id: 'L1', occasion: 'start', answers: START_OK }));
+    assert.equal(f.row('events', 'r4').flag, 'no_checklist', 'між чек-листом і запуском лінія завершила роботу');
+    // «Не працює», що надійшло із запізненням (офлайн-черга), знімає чинність і з уже записаного запуску
+    f.ok(f.call('checklist', { id: 'c4', ts: '2026-09-15T12:30:00Z', line_id: 'L1', occasion: 'start', answers: START_OK, then_event: { state: 'run' } }));
+    assert.equal(f.row('events', 'c4-e').flag, '');
+    f.ev('o3', '2026-09-15T11:45:00Z', 'off', { ref_id: 'x' });                  // r4 → off 11:45 → c4 12:30 → run: покрито
+    assert.equal(f.row('events', 'c4-e').flag, '');
+    f.setNow('2026-09-15T14:00:00Z');
+    f.ev('o4', '2026-09-15T13:00:00Z', 'off', { ref_id: 'x' });
+    f.ev('r5', '2026-09-15T13:30:00Z', 'run');
+    assert.equal(f.row('events', 'r5').flag, 'no_checklist');
+    // анулювання «Не працює» повертає чинність чек-листа c4
+    f.ok(f.admin('void', { table: 'events', id: 'o4', note: 'Помилково' }));
+    assert.equal(f.row('events', 'r5').flag, '', 'після анулювання r5 — продовження роботи');
+    // повний перерахунок дає те саме, що й покрокові записи
+    const before = JSON.stringify(f.store.all('events'));
+    f.app.recomputeLine('L1');
+    assert.equal(JSON.stringify(f.store.all('events')), before);
+  });
+
   test('чек-лист запуску, що прийшов після події запуску, знімає no_checklist', () => {
     const f = fixture('2026-09-15T06:00:00Z');
     config(f);
@@ -2282,10 +2349,11 @@ describe('рецензія: щоденні перевірки', () => {
     assert.match(r._notify[0].text, /Огородження справні: Н\/З/);
     const a = f.ok(f.call('check_detail', { id: 'n1' })).answers.find((x) => x.item_id === 'I1');
     assert.deepEqual([a.value, a.ok], ['Н/З', false]);
-    // некритичний «Н/З» — як і раніше, без оцінки
+    // некритичний «Н/З» із поясненням — без оцінки
     const r2 = f.ok(f.call('checklist', { id: 'n2', ts: '2026-09-15T06:00:00Z', line_id: 'L1', occasion: 'start',
-      answers: START_OK.map((a) => (a.item_id === 'I2' ? { ...a, value: 'na' } : a)) }));
+      answers: START_OK.map((a) => (a.item_id === 'I2' ? { ...a, value: 'na', note: 'Ланцюг замінено вчора, змащений' } : a)) }));
     assert.equal(r2.check.result, 'ok');
+    assert.equal(r2.check.na, 1);
   });
 });
 
@@ -2442,5 +2510,363 @@ describe('рецензія: контракт, надійність, продук
     assert.equal(hours(), 1024);
     f.ok(f.call('event', { id: 'l2a', ts: '2026-09-11T12:00:00Z', line_id: 'L2', state: 'run' }));
     assert.equal(hours(), 1036, 'далі — мотогодини нової лінії');
+  });
+});
+
+/* ================================================================== */
+/* Регресійні тести за другою рецензією (вимоги замовника, продуктивність Apps Script) */
+
+describe('рецензія 2: сповіщення, чек-листи, відліки, звіт', () => {
+  test('отримувачі листів: email керівників і механіків / електриків / контролю якості з «Персонал» (за лініями)', () => {
+    const f = utilisationFixture();
+    f.setting({ manager_emails: '' });
+    f.save('staff', { id: 'B1', name: 'Головний механік', role: 'manager', email: 'Boss@Zavod.ua' });
+    f.save('staff', { id: 'B2', name: 'Майстер лінії 2', role: 'Керівник', line_ids: 'L2', email: 'm2@zavod.ua' });
+    f.save('staff', { id: 'B3', name: 'Механік лінії 1', role: 'mechanic', line_ids: 'L1', email: 'mech1@zavod.ua' });
+    f.save('staff', { id: 'B4', name: 'Електрик', role: 'electrician', email: 'el@zavod.ua' });
+    f.save('staff', { id: 'B5', name: 'Технолог', role: 'qa', email: 'qa@zavod.ua' });
+    f.save('staff', { id: 'B6', name: 'Колишній керівник', role: 'manager', email: 'old@zavod.ua' });
+    f.ok(f.admin('remove', { table: 'staff', id: 'B6' }));
+    // S1 (оператор) теж має email — операторам листи не надсилаються
+    const due = f.app.dueAlerts(null, []);
+    assert.deepEqual(due.map((a) => a.key), ['due:RX:2026-09-01']);
+    assert.deepEqual(due[0].to, ['boss@zavod.ua', 'mech1@zavod.ua', 'el@zavod.ua', 'mech@example.com', 'boss@example.com']);
+    assert.deepEqual(f.app.buildDigest().to, ['boss@zavod.ua', 'm2@zavod.ua'], 'звіт — усім керівникам');
+    assert.deepEqual(f.ok(f.admin('digest_preview')).to, ['boss@zavod.ua', 'm2@zavod.ua']);
+    const r1 = f.ev('rp1', '2026-09-14T23:00:00Z', 'repair', { reason: 'Обрив ланцюга' });
+    assert.deepEqual(r1._notify[0].to, ['boss@zavod.ua', 'mech1@zavod.ua', 'el@zavod.ua']);
+    const r2 = f.ok(f.call('event', { id: 'rp2', ts: '2026-09-14T23:00:00Z', line_id: 'L2', state: 'repair' }));
+    assert.deepEqual(r2._notify[0].to, ['boss@zavod.ua', 'm2@zavod.ua', 'el@zavod.ua'], 'механік лише своєї лінії');
+    const c = f.ok(f.call('checklist', { id: 'cr', ts: '2026-09-14T23:30:00Z', line_id: 'L1', occasion: 'start',
+      answers: START_OK.map((a) => (a.item_id === 'I2' ? { ...a, value: 'fail', note: 'Сухий ланцюг' } : a)) }));
+    assert.deepEqual(c._notify[0].to, ['boss@zavod.ua', 'qa@zavod.ua']);
+    // разом із «Email керівництва» — без повторів (регістр не важливий)
+    f.setting({ manager_emails: 'director@zavod.ua, BOSS@zavod.ua' });
+    assert.deepEqual(f.app.buildDigest().to, ['director@zavod.ua', 'boss@zavod.ua', 'm2@zavod.ua']);
+  });
+
+  test('«Н/З» на обовʼязкових пунктах без пояснення — зауваження; кількість «Н/З» видно керівнику', () => {
+    const f = fixture('2026-09-15T18:00:00Z');
+    config(f);
+    f.setting({ manager_emails: 'boss@example.com' });
+    f.save('items', { id: 'I9', line_id: 'L1', occasions: 'start', section: 'Огляд', text: 'Датчик рівня протерто', type: 'check', required: false });
+    const answers = [{ item_id: 'I1', value: 'ok' }, { item_id: 'I2', value: 'Н/З' }, { item_id: 'I3', value: '6,2' },
+      { item_id: 'I4', value: 'Міцний' }, { item_id: 'I9', value: 'na' }];
+    const r = f.ok(f.call('checklist', { id: 'k1', ts: '2026-09-15T05:00:00Z', line_id: 'L1', occasion: 'start', operator: 'Ігор',
+      answers, then_event: { state: 'run' } }));
+    assert.equal(r.check.result, 'remarks', 'не «Норма»: змащування пропущено без пояснення');
+    assert.deepEqual([r.check.failed, r.check.na, r.check.missing], [1, 2, 0]);
+    assert.equal(SCHEMA.checks.cols.find((c) => c.k === 'na').t, 'Н/З');
+    assert.equal(f.row('checks', 'k1').na, 2, 'стовпець «Н/З» у журналі чек-листів');
+    const n = r._notify.find((x) => x.kind === 'checklist');
+    assert.match(n.text, /Ланцюг змащено: Н\/З \(без пояснення\)/);
+    assert.ok(!/Датчик рівня/.test(n.text), 'необовʼязковий пункт «Н/З» — не зауваження');
+    const det = f.ok(f.call('check_detail', { id: 'k1' })).answers;
+    assert.deepEqual(det.filter((a) => a.value === 'Н/З').map((a) => [a.item_id, a.ok]), [['I2', false], ['I9', null]]);
+    const day = f.app.compliance('2026-09-15', '2026-09-15', ['L1']).L1[0];
+    assert.equal(day.status, 'warn', 'у матриці щоденних перевірок — «Із зауваженнями», а не ✓');
+    assert.equal(day.checks[0].na, 2);
+    assert.equal(f.app.stats('2026-09-15', '2026-09-15', ['L1']).L1.checks_na, 2);
+    assert.ok(f.ok(f.call('dashboard', { days: 1 })).issues.some((i) => i.item_id === 'I2' && i.value === 'Н/З'));
+    f.setNow('2026-09-15T20:00:00Z');
+    const dg = f.app.buildDigest();
+    assert.equal(dg.counts.failed, 1);
+    assert.match(dg.text, /Ланцюг змащено: Н\/З \(без пояснення\)/);
+    // той самий чек-лист із поясненням — «Норма», але «Н/З» пораховано
+    const ok = f.ok(f.call('checklist', { id: 'k2', ts: '2026-09-15T19:00:00Z', line_id: 'L1', occasion: 'start',
+      answers: answers.map((a) => (a.item_id === 'I2' ? { ...a, note: 'Ланцюг замінено вчора, змащений' } : a)) }));
+    assert.deepEqual([ok.check.result, ok.check.failed, ok.check.na], ['ok', 0, 2]);
+  });
+
+  test('«Востаннє виконано» без напрацювання: відлік — з журналу на ту дату (як і для рядка з таблиці)', () => {
+    const f = utilisationFixture();
+    // журнал: 05.09–14.09 щодня 5 год роботи; M1: 1000 (01.09), 1200 (06.09), 1600 (10.09), 2000 (14.09); зараз 15.09
+    const r = f.save('rules', { id: 'T1', line_id: 'L1', title: 'Заміна ременя', interval_days: 60, interval_hours: 100,
+      meter_id: 'M1', interval_meter: 5000, last_done_date: '10.09.2026' });
+    assert.equal(r.base_hours, f.app.lineCumAt('L1', new Date('2026-09-09T21:00:00Z')));
+    assert.deepEqual([r.base_hours, r.base_meter], [25, 1200]);
+    const d = f.app.computeDue('T1');
+    assert.equal(d.criteria.find((c) => c.kind === 'hours').used, 25, 'напрацювання з журналу, а не 0');
+    assert.equal(d.criteria.find((c) => c.kind === 'meter').used, 800);
+    assert.match(d.summary, /75 мотогод/);
+    f.store.insert('rules', [{ id: 'T1S', line_id: 'L1', title: 'Заміна ременя', interval_days: 60, interval_hours: 100,
+      meter_id: 'M1', interval_meter: 5000, base_date: '10.09.2026' }]);
+    const s = f.app.dueAll().find((x) => x.rule_id === 'T1S');
+    assert.deepEqual(s.criteria.map((c) => c.used), d.criteria.map((c) => c.used), 'застосунок і таблиця збігаються');
+    // дата до початку обліку: мотогодини — усі облікові; лічильник — від першого показника (1000), а не від 0
+    const r2 = f.save('rules', { id: 'T2', line_id: 'L1', title: 'Давно', interval_hours: 1000, meter_id: 'M1',
+      interval_meter: 5000, last_done_date: '01.08.2026' });
+    assert.deepEqual([r2.base_hours, r2.base_meter], [0, 1000]);
+    assert.deepEqual(f.app.computeDue('T2').criteria.map((c) => c.used), [50, 1000]);
+    f.store.insert('rules', [{ id: 'T2S', line_id: 'L1', title: 'Давно', interval_hours: 1000, meter_id: 'M1', interval_meter: 5000, base_date: '01.08.2026' }]);
+    f.app.dueAll();
+    assert.equal(f.row('rules', 'T2S').base_meter, 1000);
+    // напрацювання, вказане вручну, — загальне з того часу (для робіт до початку обліку)
+    const r3 = f.save('rules', { id: 'T3', line_id: 'L1', title: 'Вручну', interval_hours: 1000, meter_id: 'M1', interval_meter: 5000,
+      last_done_date: '01.08.2026', used_hours: 120, used_meter: 300 });
+    assert.deepEqual([r3.base_hours, r3.base_meter], [50 - 120, 1700]);
+  });
+
+  test('агрегат, доданий прямо в таблиці: напрацювання — з моменту додавання, а не вся історія лінії', () => {
+    const f = fixture('2026-09-01T00:00:00Z');
+    config(f);
+    f.setNow('2026-09-10T00:00:00Z');
+    f.ev('a', '2026-09-01T01:00:00Z', 'run');
+    f.ev('b', '2026-09-09T09:00:00Z', 'off', { ref_id: 'x' });                      // 200 мотогод
+    f.store.insert('units', [
+      { id: 'U15', line_id: 'L1', name: 'Додано в таблиці', hours_offset: 0 },
+      { id: 'U16', line_id: 'L1', name: 'Із датою створення', hours_offset: 10, created: '05.09.2026' }]);
+    const hours = (id) => f.ok(f.admin('bootstrap')).units.find((u) => u.id === id).hours;
+    assert.equal(hours('U15'), 0, 'не 200 год історії лінії');
+    assert.equal(hours('U16'), 10 + 200 - 92, 'від «Створено» (05.09 00:00 за Києвом = 92 год лінії)');
+    assert.equal(f.row('units', 'U15').base_cum, null, 'READ-дія нічого не пише');
+    f.app.dueAlerts(null, []);                                                        // задача хоста фіксує відлік
+    assert.equal(f.row('units', 'U15').base_cum, 200);
+    assert.equal(isoOf(f.row('units', 'U15').created), '2026-09-10T00:00:00.000Z');
+    assert.equal(f.save('units', { id: 'U17', line_id: 'L1', name: 'Через застосунок' }).base_cum, 200, 'як у застосунку');
+    f.setNow('2026-09-12T00:00:00Z');
+    f.ev('c', '2026-09-10T00:00:00Z', 'run');
+    f.ev('d', '2026-09-11T00:00:00Z', 'off', { ref_id: 'x' });
+    assert.deepEqual(['U15', 'U16', 'U17'].map(hours), [24, 142, 24]);
+    // рядок із таблиці, одразу перенесений на іншу лінію, — зберігає лише власне напрацювання
+    f.store.insert('units', [{ id: 'U18', line_id: 'L1', name: 'Перенесуть', hours_offset: 5 }]);
+    assert.equal(f.save('units', { id: 'U18', line_id: 'L2' }).hours_offset, 5);
+  });
+
+  test('щоденний звіт: «скоро» без хибних «N днів»; одна поломка — один ремонт', () => {
+    const f = utilisationFixture();
+    f.store.insert('rules', [{ id: 'Y1', line_id: 'L1', title: 'Повірка ваг', interval_days: 365, warn_days: 30, base_date: '10.10.2025' }]);
+    f.setNow('2026-09-15T12:00:00Z');
+    f.ev('r0', '2026-09-15T05:00:00Z', 'run');
+    f.ev('rp', '2026-09-15T08:00:00Z', 'repair', { reason: 'Підтікає клапан' });
+    f.ok(f.call('work', { id: 'wr', ts: '2026-09-15T08:40:00Z', started: '2026-09-15T08:00:00Z', line_id: 'L1', work_type: 'repair', title: 'Замінено клапан' }));
+    f.ev('rn', '2026-09-15T08:41:00Z', 'run');
+    let d = f.app.buildDigest();
+    const soon = f.app.dueAll().filter((x) => x.status === 'soon');
+    assert.ok(soon.some((x) => x.rule_id === 'Y1' && (x.due_date - f.now) / DAY > 20), 'Y1 «скоро» за власним порогом 30 дн.');
+    assert.ok(d.html.includes('Скоро потрібно виконати (' + soon.length + ')'));
+    assert.ok(!/Найближчі \d+ дн/.test(d.html + d.text));
+    assert.equal(d.counts.repairs, 1, 'подія «Ремонт» і робота «Ремонт» — одна поломка');
+    assert.equal(f.app.stats('2026-09-15', '2026-09-15', ['L1']).L1.repairs, 1, 'так само, як KPI на панелі');
+    assert.ok(d.html.includes('Замінено клапан') && d.html.includes('Підтікає клапан'), 'у листі — обидва рядки');
+    // ремонт, записаний без стану «Ремонт», — окремий випадок
+    f.ok(f.call('work', { id: 'wr2', ts: '2026-09-15T11:00:00Z', line_id: 'L1', work_type: 'repair', title: 'Підтягнуто кріплення датчика' }));
+    assert.equal(f.app.buildDigest().counts.repairs, 2);
+    // робота, на яку посилається подія завершення ремонту, — не окремий випадок
+    f.ev('rp2', '2026-09-15T11:10:00Z', 'repair');
+    f.ev('rn2', '2026-09-15T11:20:00Z', 'run', { ref_id: 'wr3' });
+    f.ok(f.call('work', { id: 'wr3', ts: '2026-09-15T11:30:00Z', line_id: 'L1', work_type: 'repair', title: 'Замінено запобіжник' }));
+    assert.equal(f.app.buildDigest().counts.repairs, 3);
+  });
+});
+
+describe('рецензія 2: анулювання і перегляд чек-листа без читання всієї історії', () => {
+  /* 120 днів: щодня чек-лист запуску → простій → робота → чек-лист завершення; ТО за регламентом раз на 10 днів */
+  function history() {
+    const f = fixture('2026-05-01T00:00:00Z');
+    config(f, { rules: [{ id: 'RQ', line_id: 'L1', title: 'Заміна ножа', work_type: 'replace', meter_id: 'M1', interval_meter: 5000 }] });
+    for (let d = 0; d < 120; d++) {
+      const day = new Date(ms('2026-05-01T00:00:00Z') + d * DAY).toISOString().slice(0, 10);
+      f.setNow(`${day}T16:00:00Z`);
+      f.ok(f.call('checklist', { id: 'cs' + d, ts: `${day}T05:00:00Z`, line_id: 'L1', occasion: 'start', answers: START_OK, then_event: { state: 'run' } }));
+      f.ev('st' + d, `${day}T09:00:00Z`, 'stop', { reason: 'Перерва' });
+      f.ev('rn' + d, `${day}T09:30:00Z`, 'run');
+      if (d % 10 === 5) f.ok(f.call('work', { id: 'wk' + d, ts: `${day}T12:00:00Z`, line_id: 'L1', rule_id: 'RQ', meter_value: 1000 * d }));
+      f.ok(f.call('checklist', { id: 'ce' + d, ts: `${day}T15:00:00Z`, line_id: 'L1', occasion: 'end', answers: [{ item_id: 'I6', value: 'ok' }], then_event: { state: 'off' } }));
+    }
+    f.setNow('2026-08-29T00:00:00Z');
+    return f;
+  }
+  function spy(f) {
+    const log = { all: [], since: {}, findBy: [] };
+    const oa = f.store.all.bind(f.store), os = f.store.since.bind(f.store), of = f.store.findBy;
+    f.store.all = (t) => { log.all.push(t); return oa(t); };
+    if (typeof of === 'function') f.store.findBy = (t, c, v) => { log.findBy.push(t + '.' + c); return of.call(f.store, t, c, v); };
+    f.store.since = (t, d) => { const x = new Date(d).getTime(); log.since[t] = Math.min(log.since[t] ?? Infinity, x); return os(t, d); };
+    return log;
+  }
+  const LOGS = ['events', 'checks', 'answers', 'works', 'readings'];
+  function sameAsFull(f) {
+    const before = JSON.stringify(f.store.all('events'));
+    f.app.recomputeLine('L1');
+    assert.equal(JSON.stringify(f.store.all('events')), before, 'той самий результат, що й повний перерахунок');
+  }
+
+  test('сховище без findBy: запис знаходиться за ts з клієнта, перерахунок — від опорної події у вікні', () => {
+    const f = history();
+    f.store.findBy = null;
+    const st = f.row('events', 'st118'), cs = f.row('checks', 'cs119'), c10 = f.row('checks', 'cs10');
+    let log = spy(f);
+    f.ok(f.admin('void', { table: 'events', id: 'st118', ts: st.ts.toISOString(), note: 'Помилково' }));
+    assert.deepEqual(log.all.filter((t) => LOGS.includes(t)), [], 'жодного читання всього журналу');
+    assert.ok(log.since.events >= st.ts.getTime() - 46 * DAY, 'лише вікно перед записом');
+    assert.equal(f.row('events', 'rn118').prev_state, 'run');
+    assert.equal(f.row('events', 'rn118').cum_h, f.row('events', 'cs118-e').cum_h + 4.5);
+    sameAsFull(f);
+    // чек-лист запуску: відповіді й позначка запуску — теж без усієї історії
+    log = spy(f);
+    f.ok(f.admin('void', { table: 'checks', id: 'cs119', ts: cs.ts.toISOString() }));
+    assert.deepEqual(log.all.filter((t) => LOGS.includes(t)), []);
+    assert.ok(log.since.answers >= cs.ts.getTime() - DAY && log.since.checks >= cs.ts.getTime() - 47 * DAY);
+    assert.ok(f.rows('answers').filter((a) => a.check_id === 'cs119').every((a) => a.void));
+    assert.equal(f.row('events', 'cs119-e').flag, 'no_checklist');
+    sameAsFull(f);
+    // перегляд чек-листа за ts — відповіді лише з доби навколо нього
+    log = spy(f);
+    assert.equal(f.ok(f.call('check_detail', { id: 'cs10', ts: c10.ts.toISOString() })).answers.length, 4);
+    assert.deepEqual(log.all.filter((t) => LOGS.includes(t)), []);
+    assert.ok(log.since.answers >= c10.ts.getTime() - DAY);
+  });
+
+  test('сховище з findBy: давні записи — без читання всього журналу й без відповідей за весь період', () => {
+    const f = history();
+    const c119 = f.row('checks', 'cs119');
+    let log = spy(f);
+    const d = f.ok(f.call('check_detail', { id: 'cs3' }));
+    assert.equal(d.answers.length, 4);
+    assert.deepEqual(log.all.filter((t) => LOGS.includes(t)), []);
+    assert.equal(log.since.answers, undefined, 'відповіді — через findBy за ID чек-листа');
+    assert.deepEqual(log.findBy, ['checks.id', 'answers.check_id']);
+    // свіжий запис з відомим ts — вікном від ts (знизу аркуша це дешевше за пошук по всьому стовпцю)
+    delete f.store.all; delete f.store.since; delete f.store.findBy;
+    log = spy(f);
+    assert.equal(f.ok(f.call('check_detail', { id: 'cs119', ts: c119.ts.toISOString() })).answers.length, 4);
+    assert.deepEqual(log.findBy, []);
+    assert.ok(log.since.answers >= c119.ts.getTime() - DAY);
+    delete f.store.all; delete f.store.since; delete f.store.findBy;
+    log = spy(f);
+    f.ok(f.admin('void', { table: 'checks', id: 'cs3' }));
+    assert.deepEqual(log.all.filter((t) => LOGS.includes(t)), []);
+    assert.equal(log.since.answers, undefined);
+    assert.ok(f.rows('answers').filter((a) => a.check_id === 'cs3').every((a) => a.void));
+    assert.equal(f.row('events', 'cs3-e').flag, 'no_checklist');
+    sameAsFull(f);
+    // робота за регламентом з показником: запис — через findBy, повʼязаний показник — у вікні біля роботи
+    log = spy(f);
+    f.ok(f.admin('void', { table: 'works', id: 'wk115' }));
+    assert.deepEqual(log.all.filter((t) => ['events', 'checks', 'answers'].includes(t)), []);
+    assert.equal(f.row('rules', 'RQ').last_work_id, 'wk105');
+    assert.equal(f.row('rules', 'RQ').last_meter, 105000);
+    assert.equal(f.row('readings', 'wk115-m').void, true);
+    assert.equal(f.row('meters', 'M1').cur_value, 105000);
+    // стара подія: перерахунок від опорної події, а не з початку історії
+    const st20 = f.row('events', 'st20');
+    log = spy(f);
+    f.ok(f.admin('void', { table: 'events', id: 'st20' }));
+    assert.deepEqual(log.all.filter((t) => LOGS.includes(t)), []);
+    assert.ok(log.since.events >= st20.ts.getTime() - 46 * DAY);
+    sameAsFull(f);
+    assert.equal(f.call('void', { table: 'events', id: 'nope' }, { admin: true }).error, 'NOT_FOUND');
+  });
+});
+
+describe('рецензія 3: PIN персоналу, ran_since_off, період панелі', () => {
+  test('PIN персоналу з таблиці не з 4–8 цифр → config_issues «bad_pin»; апостроф перед PIN відкидається', () => {
+    const f = fixture();
+    config(f);
+    f.store.insert('staff', [
+      { id: 'S3', name: 'Петро', role: 'operator', pin: 427 },          // клітинка втратила текстовий формат і нуль
+      { id: 'S4', name: 'Іван', role: 'operator', pin: 'ab12' },
+      { id: 'S5', name: 'Марія', role: 'operator', pin: '0427' },
+      { id: 'S6', name: 'Олег', role: 'operator', pin: "'0427" }         // апостроф, набраний у текстовій клітинці
+    ]);
+    assert.equal(norm('staff', { pin: "'0427" }).pin, '0427');
+    assert.equal(norm('staff', { name: "'Олег" }).name, "'Олег", 'лише для PIN');
+    const a = f.ok(f.admin('bootstrap'));
+    assert.deepEqual(a.config_issues.map((x) => [x.table, x.sheet, x.id, x.name, x.problem]), [
+      ['staff', SCHEMA.staff.sheet, 'S3', 'Петро', 'bad_pin'], ['staff', SCHEMA.staff.sheet, 'S4', 'Іван', 'bad_pin']]);
+    assert.equal(findKey(a, 'pin'), null, 'PIN не передається навіть у config_issues');
+    const b = f.ok(f.call('bootstrap'));
+    assert.equal(b.config_issues, undefined);
+    const hash = (id) => b.staff.find((s) => s.id === id).pin_hash;
+    assert.equal(hash('S5'), LinesCore.sha256('S5:0427'));
+    assert.equal(hash('S6'), LinesCore.sha256('S6:0427'));
+    assert.ok(hash('S3'), 'працівник лишається у списку');
+    // PIN, заданий через застосунок, — коректний
+    f.save('staff', { id: 'S3', pin: '0427' });
+    f.save('staff', { id: 'S4', clear_pin: true });
+    assert.deepEqual(f.ok(f.admin('bootstrap')).config_issues, []);
+    assert.equal(f.ok(f.call('bootstrap')).staff.find((s) => s.id === 'S3').pin_hash, LinesCore.sha256('S3:0427'));
+  });
+
+  test('status.ran_since_off збігається з тим, чи буде наступне «Працює» запуском (addEvent)', () => {
+    const f = fixture('2026-09-15T04:00:00Z');
+    config(f);
+    const st = () => f.ok(f.call('bootstrap')).status.L1;
+    assert.equal(st().ran_since_off, false, 'подій ще немає');
+    const step = (id, iso, state) => { f.setNow(iso); return f.ev(id, iso, state); };
+    assert.equal(step('a', '2026-09-15T05:00:00Z', 'setup').status.ran_since_off, false, 'налаштування перед запуском');
+    let r = step('b', '2026-09-15T06:00:00Z', 'run');
+    assert.equal(r.event.starts, 1);
+    assert.equal(r.status.ran_since_off, true);
+    assert.equal(step('c', '2026-09-15T07:00:00Z', 'clean').status.ran_since_off, true, 'миття посеред зміни');
+    assert.equal(st().ran_since_off, true);
+    assert.equal(step('d', '2026-09-15T07:30:00Z', 'run').event.starts, 1, 'повернення після миття — не запуск');
+    assert.equal(step('e', '2026-09-15T08:00:00Z', 'stop').status.ran_since_off, true);
+    assert.equal(step('f', '2026-09-15T12:00:00Z', 'off').status.ran_since_off, false);
+    assert.equal(step('g', '2026-09-15T13:00:00Z', 'maint').status.ran_since_off, false, 'ТО після завершення зміни');
+    assert.equal(st().ran_since_off, false);
+    assert.equal(step('h', '2026-09-15T14:00:00Z', 'run').event.starts, 2, 'після ТО — новий запуск');
+    // ремонт довший за вікно подій статусу: відповідь шукається глибше в журналі
+    step('i', '2026-09-15T15:00:00Z', 'repair');
+    f.setNow('2026-10-05T10:00:00Z');
+    assert.equal(st().ran_since_off, true);
+    assert.equal(f.ok(f.call('dashboard', { days: 1 })).status.L1.ran_since_off, true);
+    assert.equal(f.app.lineStatus('L1').ran_since_off, true);
+    assert.equal(f.ev('j', '2026-10-05T10:00:00Z', 'run').event.starts, 2, 'після ремонту — не запуск');
+  });
+
+  describe('dashboard {from, to}: минулий період', () => {
+    const NOW = new Date('2026-09-25T10:00:00Z');
+    const store = new MemoryStore();
+    LinesCore.seedDemo(store, {}, { now: NOW });
+    const app = createApp(store, { now: () => NOW });
+    const dash = (p) => { const r = app.handle({ action: 'dashboard', ...p }, { device: 'Тест' }); assert.equal(r.ok, true, JSON.stringify(r).slice(0, 300)); return r; };
+    const range = (d) => [d.days[0], d.days[d.days.length - 1], d.days.length];
+
+    test('тиждень у минулому: лише його дні, повні доби, межа — початок наступного дня', () => {
+      const d = dash({ from: '2026-09-14', to: '2026-09-20' });
+      assert.deepEqual(range(d), ['2026-09-14', '2026-09-20', 7]);
+      assert.equal(d.from, '2026-09-13T21:00:00.000Z');
+      assert.equal(d.to, '2026-09-20T21:00:00.000Z');
+      const A = ms(d.from), B = ms(d.to);
+      for (const id of ['L1', 'L2', 'L3']) {
+        const s = d.stats[id];
+        assert.equal(Math.round(Object.values(s.hours).reduce((x, y) => x + y, 0) * 1e3) / 1e3, 168, id + ': 7 × 24 год');
+        assert.equal(Math.round(s.total_h * 1e3) / 1e3, 168);
+        assert.equal(d.daily[id].length, 7);
+        assert.ok(d.daily[id].every((x) => Math.abs(Object.values(x.hours).reduce((a, b) => a + b, 0) - 24) < 1e-3), id + ': доба — 24 год');
+        assert.deepEqual(d.compliance[id].map((x) => x.day), d.days);
+        assert.equal(d.compliance[id].reduce((n, x) => n + x.starts, 0), s.starts, id + ': запуски в межах періоду');
+      }
+      assert.ok(d.stats.L1.starts > 0 && d.stats.L1.checks > 0, 'демо-дані в періоді є');
+      assert.ok(d.issues.every((x) => ms(x.ts) >= A && ms(x.ts) < B), 'проблеми лише за період');
+      // стан ліній і план ТО — поточні
+      assert.equal(d.status.L1.state, 'run');
+      assert.deepEqual(d.status, dash({ days: 14 }).status);
+      assert.deepEqual(d.due, dash({}).due);
+    });
+
+    test('період довший за 62 дні обрізається до 62 днів, що закінчуються в «to»', () => {
+      const d = dash({ from: '2026-05-01', to: '2026-08-31' });
+      assert.deepEqual(range(d), ['2026-07-01', '2026-08-31', 62]);
+      assert.equal(d.to, '2026-08-31T21:00:00.000Z');
+    });
+
+    test('«to» у майбутньому → до сьогодні (to = now); лише from / лише to; недійсні дати ігноруються', () => {
+      let d = dash({ from: '2026-09-20', to: '2026-12-31' });
+      assert.deepEqual(range(d), ['2026-09-20', '2026-09-25', 6]);
+      assert.equal(d.to, NOW.toISOString());
+      assert.deepEqual(range(dash({ from: '2026-09-01' })), ['2026-09-01', '2026-09-25', 25]);
+      assert.deepEqual(range(dash({ to: '2026-09-20', days: 7 })), ['2026-09-14', '2026-09-20', 7]);
+      assert.deepEqual(range(dash({ to: '2026-09-20' })), ['2026-09-07', '2026-09-20', 14]);
+      assert.deepEqual(range(dash({ from: '2026-09-20', to: '2026-09-10', days: 3 })), ['2026-09-08', '2026-09-10', 3], 'from пізніше за to — діє days');
+      assert.deepEqual(range(dash({ from: '2026-10-01' })), ['2026-09-12', '2026-09-25', 14], 'from у майбутньому');
+      const plain = dash({ days: 14 });
+      assert.deepEqual(range(plain), ['2026-09-12', '2026-09-25', 14]);
+      assert.equal(plain.to, NOW.toISOString());
+      assert.deepEqual(dash({ days: 14, from: '2026-02-30', to: 'вчора' }), plain);
+      assert.deepEqual(dash({ days: 14, from: ' 2026-09-12 ', to: '2026-09-25' }), plain);
+    });
   });
 });

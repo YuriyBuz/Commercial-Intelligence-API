@@ -109,6 +109,44 @@ describe('gas-mock: семантика Apps Script', () => {
     assert.equal(sh.getLastRow(), 4);
   });
 
+  test('дата-час — «настінний» час поясу таблиці: зміна поясу зсуває записані моменти (як у Sheets)', () => {
+    const { globals: g, inspect: I } = createGasMock({ now: NOW });
+    const ss = g.SpreadsheetApp.getActiveSpreadsheet(), sh = ss.getSheets()[0];
+    const d = new Date('2026-09-25T04:25:00Z');                          // 07:25 за Києвом
+    sh.getRange(1, 1, 1, 2).setValues([[d, '25.09.2026 07:25']]);
+    assert.deepEqual(sh.getRange(1, 1, 1, 2).getValues()[0].map((x) => x.toISOString()), [d.toISOString(), d.toISOString()]);
+    ss.setSpreadsheetTimeZone('Europe/Warsaw');                          // 07:25 тепер — за Варшавою
+    assert.deepEqual(sh.getRange(1, 1, 1, 2).getValues()[0].map((x) => x.toISOString()), ['2026-09-25T05:25:00.000Z', '2026-09-25T05:25:00.000Z']);
+    assert.equal(I.sheet('Аркуш1').cell(1, 1).toISOString(), '2026-09-25T05:25:00.000Z');
+  });
+
+  test('формат «Звичайний текст» (@): рядок — буквально; ліміт клітинок; create / deleteColumns', () => {
+    const { globals: g, inspect: I } = createGasMock({ now: NOW, cellLimit: 60000 });
+    const ss = g.SpreadsheetApp.getActiveSpreadsheet(), sh = ss.getSheets()[0];
+    sh.getRange(2, 1, 10, 1).setNumberFormat('@');
+    sh.getRange(2, 1, 1, 2).setValues([['0427', '0427']]);
+    sh.getRange(3, 1).setValue('=1+1');
+    sh.getRange(4, 1).setValue('\'0042');
+    I.sheet('Аркуш1').type(5, 1, '007');
+    assert.deepEqual(sh.getRange(2, 1, 4, 1).getValues().map((r) => r[0]), ['0427', '=1+1', '\'0042', '007']);
+    assert.equal(sh.getRange(2, 2).getValue(), 427, 'без формату — число');
+    assert.deepEqual(I.formulas, []);
+    // ліміт: 1000×26 = 26 000 на аркуш
+    ss.insertSheet('Другий');
+    assert.equal(I.spreadsheet.cells(), 52000);
+    assert.throws(() => ss.insertSheet('Третій'), /above the limit of 60000 cells/);
+    assert.throws(() => sh.insertRowsAfter(1000, 400), /above the limit/);
+    sh.deleteColumns(9, 18);
+    assert.equal(sh.getMaxColumns(), 8);
+    assert.throws(() => sh.deleteColumns(1, 8), /all the columns/);
+    assert.equal(I.spreadsheet.cells(), 34000);
+    sh.insertRowsAfter(1000, 400);
+    const nb = g.SpreadsheetApp.create('Архів', 10, 3);
+    assert.equal(nb.getSheets()[0].getMaxColumns(), 3);
+    assert.equal(I.spreadsheets()[0].name, 'Архів');
+    assert.equal(g.SpreadsheetApp.openById(nb.getId()).getName(), 'Архів');
+  });
+
   test('Utilities, Cache, Lock, тригери, годинник', () => {
     const { globals: g, inspect: I } = createGasMock({ now: NOW });
     const U = g.Utilities;
@@ -216,6 +254,43 @@ describe('setup()', () => {
     TABLES.forEach((t) => assert.equal(P.sheet(t).header().length, SCHEMA[t].cols.length, t));
   });
 
+  test('сітка аркушів — під ширину схеми; порожні стовпці старих аркушів прибирає повторний setup', () => {
+    const P = ready();
+    for (const t of TABLES) assert.equal(P.sheet(t).maxColumns, SCHEMA[t].cols.length, t);
+    const total = TABLES.reduce((n, t) => n + P.sheet(t).maxRows * P.sheet(t).maxColumns, 0);
+    assert.equal(P.I.spreadsheet.cells(), total);
+    // аркуш зі старої версії (26 стовпців) і власний стовпець керівника з даними
+    const L = P.sheet('lines'), w = SCHEMA.lines.cols.length;
+    P.store().sheet_('lines').insertColumnsAfter(w, 11);
+    L.type(1, w + 2, 'Коментар керівника');
+    L.type(2, w + 2, 'перевірити датчик');
+    assert.equal(L.maxColumns, w + 11);
+    P.G.setup();
+    assert.equal(L.maxColumns, w + 2, 'порожні стовпці праворуч видалено, стовпець із даними лишився');
+    assert.equal(L.cell(2, w + 2), 'перевірити датчик');
+  });
+
+  test('повідомлення setup: наступні кроки — адреса /exec і manager_emails (доки не задані)', () => {
+    const P = project({ ui: true });
+    let r = J(P.G.setup());
+    assert.match(r.message, /Вказати адресу веб-застосунку \(\/exec\)/);
+    assert.match(r.message, /manager_emails/);
+    assert.match(r.message, /листи-нагадування не надсилаються/);
+    assert.match(r.message, /Показати токен і PIN/);
+    P.ok(P.admin('settings_save', { values: { manager_emails: 'boss@example.com' } }));
+    P.I.ui.reply('https://script.google.com/macros/s/AKfycbx1/exec');
+    P.G.setApiUrl();
+    r = J(P.G.setup());
+    assert.doesNotMatch(r.message, /manager_emails/);
+    assert.doesNotMatch(r.message, /Вказати адресу/);
+    assert.equal(r.cells, P.I.spreadsheet.cells());
+    // інструкція в заголовку Server.gs: екран «неперевірений застосунок», Code.gs, manager_emails
+    assert.match(SERVER_SRC, /Google не перевірив цей застосунок/);
+    assert.match(SERVER_SRC, /«Додатково» \(Advanced\) → «Перейти до/);
+    assert.match(SERVER_SRC, /«Code\.gs»/);
+    assert.match(SERVER_SRC, /«manager_emails»/);
+  });
+
   test('меню onOpen і повідомлення в UI', () => {
     const P = project({ ui: true });
     P.G.onOpen({});
@@ -223,14 +298,51 @@ describe('setup()', () => {
     assert.equal(m.caption, 'Облік ліній');
     const items = m.items.filter((x) => !x.separator);
     assert.deepEqual(items.map((x) => x.caption), ['Початкове налаштування', 'Заповнити демо-даними', 'Надіслати звіт зараз',
-      'Перевірити строки ТО зараз', 'Оновити «План ППР»', 'Перерахувати мотогодини', 'Показати токен і PIN']);
+      'Перевірити строки ТО зараз', 'Оновити «План ППР»', 'Перерахувати мотогодини', 'Архівувати старі чек-листи',
+      'Вказати адресу веб-застосунку (/exec)', 'Показати токен і PIN']);
     items.forEach((x) => assert.equal(typeof P.G[x.fn], 'function', x.fn));
     P.G.setup();
     assert.equal(P.I.ui.alerts[0].title, 'Початкове налаштування');
     const s = J(P.G.showSecrets());
     assert.equal(s.token, P.token);
     assert.ok(P.I.ui.alerts[1].prompt.includes(P.token) && P.I.ui.alerts[1].prompt.includes(P.pin));
-    assert.ok(P.I.ui.alerts[1].prompt.includes('https://script.google.com/'));
+    // з меню getUrl() дає тестову …/dev — її не показуємо як адресу API; пояснюємо, де взяти …/exec
+    assert.equal(s.url, '');
+    assert.ok(!P.I.ui.alerts[1].prompt.includes('MOCK_HEAD_DEPLOYMENT'), 'адресу …/dev не показано');
+    assert.match(P.I.ui.alerts[1].prompt, /\/dev, — тестова/);
+    assert.match(P.I.ui.alerts[1].prompt, /Вказати адресу веб-застосунку/);
+    // власник вставляє …/exec (з пробілами й параметрами — обрізаються)
+    const exec = 'https://script.google.com/macros/s/AKfycbxREAL_deploy-1/exec';
+    P.I.ui.reply('  ' + exec + '?x=1 ');
+    let u = J(P.G.setApiUrl());
+    assert.equal(u.ok, true);
+    assert.equal(P.I.properties().API_URL, exec);
+    assert.equal(P.I.ui.prompts.at(-1).buttons, 'OK_CANCEL');
+    const s2 = J(P.G.showSecrets());
+    assert.equal(s2.url, exec);
+    assert.ok(P.I.ui.alerts.at(-1).prompt.includes(exec));
+    // …/dev, чужа адреса, «Скасувати» — не зберігаються
+    P.I.ui.reply('https://script.google.com/macros/s/AKfycbxHEAD/dev');
+    u = J(P.G.setApiUrl());
+    assert.equal(u.ok, false);
+    assert.match(u.message, /тестова адреса \(\/dev\)/);
+    P.I.ui.reply('https://evil.example/macros/s/x/exec');
+    assert.equal(J(P.G.setApiUrl()).ok, false);
+    P.I.ui.reply(exec.replace('REAL', 'OTHER'), 'CANCEL');
+    assert.equal(J(P.G.setApiUrl()).cancelled, true);
+    assert.equal(P.I.properties().API_URL, exec);
+    // Google Workspace: …/a/macros/<домен>/s/<id>/exec
+    const ws = 'https://script.google.com/a/macros/foodline.ua/s/AKfycbxWS/exec';
+    assert.equal(J(P.G.setApiUrl(ws)).ok, true);
+    assert.equal(P.I.properties().API_URL, ws);
+  });
+
+  test('getService().getUrl(): …/exec лише у веб-запиті; така адреса — і в «Показати токен і PIN»', () => {
+    const P = ready();
+    assert.match(P.G.ScriptApp.getService().getUrl(), /\/dev$/, 'поза doGet/doPost — …/dev');
+    assert.match(P.I.webRequest(() => P.G.ScriptApp.getService().getUrl()), /\/exec$/);
+    assert.equal(J(P.G.showSecrets()).url, '');
+    assert.equal(J(P.I.webRequest(() => P.G.showSecrets())).url, 'https://script.google.com/macros/s/MOCK_DEPLOYMENT/exec');
   });
 
   test('onOpen без UI не кидає; showSecrets до налаштування', () => {
@@ -579,6 +691,38 @@ describe('правки керівника прямо в таблиці', () => {
     assert.equal(rec[2]['Назва'], 'Лінія без ID');
   });
 
+  test('PIN працівника: стовпець «Звичайний текст» — «0427» з таблиці й із застосунку лишається з нулем', () => {
+    const P = ready();
+    configure(P);
+    const ST = P.sheet('staff'), pc = ST.col('PIN');
+    assert.equal(ST.formatAt(2, pc), '@');
+    assert.equal(ST.formatAt(ST.maxRows, pc), '@');
+    assert.match(ST.noteAt(1, pc), /Звичайний текст/);
+    // керівник вводить PIN прямо в таблиці
+    ST.type(2, pc, '0427');
+    assert.equal(ST.cell(2, pc), '0427');
+    let b = P.ok(P.admin('bootstrap'));
+    assert.equal(b.staff.find((s) => s.id === 'S1').pin_hash, LinesCore.pinHash('S1', '0427'));
+    // PIN із застосунку: новий і змінений — без апострофа (у клітинці '@' він зберігся б буквально)
+    P.save('staff', { id: 'S2', name: 'Іван Петренко', role: 'operator', pin: '0042' });
+    P.save('staff', { id: 'S1', pin: '0099' });
+    assert.equal(P.row('staff', 'S2').PIN, '0042');
+    assert.equal(P.row('staff', 'S1').PIN, '0099');
+    b = P.ok(P.call('bootstrap'));
+    assert.equal(b.staff.find((s) => s.id === 'S2').pin_hash, LinesCore.pinHash('S2', '0042'));
+    assert.equal(b.staff.find((s) => s.id === 'S1').pin_hash, LinesCore.pinHash('S1', '0099'));
+    // формат стовпця хтось змінив (або аркуш зі старої версії) — запис із застосунку все одно текстом
+    P.store().sheet_('staff').getRange(2, pc, ST.maxRows - 1, 1).setNumberFormat('0');
+    P.save('staff', { id: 'S3', name: 'Марія Шевчук', role: 'operator', pin: '0007' });
+    P.save('staff', { id: 'S2', pin: '0555' });
+    assert.equal(P.row('staff', 'S3').PIN, '0007');
+    assert.equal(P.row('staff', 'S2').PIN, '0555');
+    // повторний setup повертає формат усьому стовпцю
+    P.G.setup();
+    ST.type(5, pc, '0123');
+    assert.equal(ST.cell(5, pc), '0123');
+  });
+
   test('налаштування, змінені в таблиці: «так»/«ні», 90%, невідомий пояс', () => {
     const P = ready();
     const S = P.sheet('settings');
@@ -750,29 +894,88 @@ describe('задачі за розкладом', () => {
   test('hourlyJob: кожне сповіщення про строк ТО — один раз; отримувачі з регламенту', () => {
     const P = ready();
     withDue(P);
+    const dueMails = () => P.I.mails.filter((m) => /^Настав строк ТО/.test(m.subject));
+    const digests = () => P.I.mails.filter((m) => /^Облік ліній — звіт за /.test(m.subject));
     let r = J(P.G.hourlyJob());
     assert.equal(r.due, 1);
     assert.equal(r.sent, 1);
-    assert.equal(P.I.mails.length, 1);
+    assert.equal(dueMails().length, 1);
     assert.equal(P.I.mails[0].to, 'boss@example.com,mech@example.com');
     assert.match(P.I.mails[0].subject, /^Настав строк ТО: Змащення ланцюга конвеєра/);
     assert.match(P.rows('notices')[0]['Ключ'], /^due:R2:/);
     assert.equal(P.rows('notices')[0]['Тип'], 'Настав строк ТО');
+    // setup — о 09:00, уже після години звіту (07:00): сьогоднішній звіт надолужено цією ж задачею
+    assert.equal(r.daily.digest, 'sent');
+    assert.equal(digests().length, 1);
     r = J(P.G.hourlyJob());
     assert.equal(r.sent, 0);
+    assert.equal(r.daily, undefined);
     P.advance(HOUR);
     r = J(P.G.hourlyJob());
     assert.equal(r.sent, 0);
-    assert.equal(P.I.mails.length, 1);
+    assert.equal(dueMails().length, 1);
+    assert.equal(P.I.mails.length, 2);
     // робота за регламентом → новий відлік; коли знову настане строк — новий лист
     P.ok(P.call('work', { id: 'wl', ts: P.iso(), line_id: 'L1', rule_id: 'R2' }));
     P.advance(8 * DAY);
     r = J(P.G.hourlyJob());
     assert.equal(r.sent, 1);
-    assert.equal(P.I.mails.length, 2);
+    assert.equal(dueMails().length, 2);
+    // щоденні звіти за ці 8 діб не запускались (у mock тригери самі не спрацьовують) — щогодинна задача надолужила сьогоднішній
+    assert.equal(r.daily.digest, 'sent');
+    assert.equal(digests().length, 2);
+    assert.equal(digests().at(-1).subject, 'Облік ліній — звіт за 03.10.2026');
     // «Перевірити строки ТО зараз» з меню
     const c = J(P.G.checkDueNow());
     assert.match(c.message, /Прострочених робіт: 1/);
+  });
+
+  test('отримувачі без manager_emails: працівники з email на аркуші «Персонал»; підказки називають обидва місця', () => {
+    const P = project({ ui: true });
+    const where = /«manager_emails» на аркуші «Налаштування» або «Email» працівника з посадою «Керівник» на аркуші «Персонал»/;
+    // setup перевіряє тих самих отримувачів, що й щоденний звіт (без побудови звіту)
+    const digestTo = () => {
+      const st = P.store(), app = P.G.LinesCore.createApp(st, P.G.gasEnv_());
+      const to = J(P.G.digestTo_(st, app.settings()));
+      assert.equal(to.length > 0, J(app.buildDigest()).to.length > 0, 'digestTo_ = buildDigest().to: ' + to.join(', '));
+      return to;
+    };
+    let r = J(P.G.setup());
+    assert.match(r.message, /manager_emails/);
+    assert.match(r.message, /«Email» працівника з посадою «Керівник» на аркуші «Персонал»/);
+    configure(P);
+    P.save('lines', { id: 'L2', name: 'Етикетувальна лінія №2' });
+    P.save('rules', { id: 'R2', line_id: 'L1', title: 'Змащення', interval_days: 7, last_done_date: P.iso(-10 * DAY) });
+    assert.deepEqual(digestTo(), []);
+    let h = J(P.G.hourlyJob());
+    assert.equal(h.sent, 0);
+    assert.match(h.errors[0], where);
+    assert.match(P.rows('notices').at(-1)['Помилка'], where);
+    r = J(P.G.sendDigestNow());
+    assert.equal(r.ok, false);
+    assert.match(r.message, where);
+    // механік з email: листи про строки ТО — йому; звіт керівництву — усе ще нікому
+    P.save('staff', { id: 'S7', name: 'Петро Механік', role: 'mechanic', email: 'mech@zavod.ua' });
+    P.save('staff', { id: 'S8', name: 'Колишній керівник', role: 'manager', email: 'old@zavod.ua', active: false });
+    assert.deepEqual(digestTo(), []);
+    assert.match(J(P.G.setup()).message, /manager_emails/);
+    P.advance(HOUR);
+    h = J(P.G.hourlyJob());
+    assert.equal(h.sent, 1);
+    assert.deepEqual(P.I.mails.map((m) => m.to), ['mech@zavod.ua']);
+    // керівник з email (без manager_emails) — отримувач звіту й сповіщень; setup більше не нагадує
+    P.save('staff', { id: 'S9', name: 'Головний інженер', role: 'manager', line_ids: 'L2', email: 'Boss@Zavod.ua' });
+    assert.deepEqual(digestTo(), ['boss@zavod.ua']);
+    r = J(P.G.setup());
+    assert.doesNotMatch(r.message, /manager_emails/);
+    r = J(P.G.sendDigestNow());
+    assert.equal(r.ok, true, r.message);
+    assert.deepEqual(r.to, ['boss@zavod.ua']);
+    P.save('rules', { id: 'R3', line_id: 'L1', title: 'Перевірка датчиків', interval_days: 7, last_done_date: P.iso(-10 * DAY) });
+    P.advance(HOUR);
+    h = J(P.G.hourlyJob());
+    assert.equal(h.sent, 1);
+    assert.equal(P.I.mails.at(-1).to, 'mech@zavod.ua', 'керівник лінії L2 не отримує листів про L1');
   });
 
   test('hourlyJob без отримувачів: помилка в журналі один раз; тригер звіту — за digest_hour', () => {
@@ -781,9 +984,12 @@ describe('задачі за розкладом', () => {
     P.save('rules', { id: 'R2', line_id: 'L1', title: 'Змащення', interval_days: 7, last_done_date: P.iso(-10 * DAY) });
     J(P.G.hourlyJob());
     J(P.G.hourlyJob());
-    const n = P.rows('notices');
+    const n = P.rows('notices').filter((x) => x['Тип'] === 'Настав строк ТО');
     assert.equal(n.length, 1);
     assert.equal(n[0]['Статус'], 'error');
+    const d = P.rows('notices').filter((x) => /^digest:/.test(x['Ключ']));
+    assert.equal(d.length, 1, 'надолужений звіт без отримувачів — одна помилка в журналі');
+    assert.match(d[0]['Помилка'], /Немає отримувачів/);
     // зміна години звіту в застосунку переставляє тригер
     P.ok(P.admin('settings_save', { values: { digest_hour: 18 } }));
     let daily = P.I.triggers().filter((t) => t.handler === 'dailyJob');
@@ -797,6 +1003,102 @@ describe('задачі за розкладом', () => {
     assert.equal(daily.length, 1);
     assert.equal(daily[0].atHour, 6);
     assert.equal(P.I.triggers().filter((t) => t.handler === 'hourlyJob').length, 1);
+  });
+
+  test('dailyJob не вдався (LOCKED) → щогодинна задача надолужує звіт і «План ППР» того ж дня, один раз', () => {
+    const P = ready();                                   // 25.09 09:00 за Києвом, звіт о 07:00
+    configure(P);
+    P.ok(P.admin('settings_save', { values: { manager_emails: 'boss@example.com', digest_mode: 'always' } }));
+    const digests = () => P.I.mails.filter((m) => /звіт за/.test(m.subject));
+    // setup о 09:00 — тригер звіту спрацює лише завтра; сьогоднішній звіт і «План ППР» надолужує щогодинна задача
+    assert.equal(P.I.properties().LAST_DAILY, undefined);
+    assert.equal(J(P.G.hourlyJob()).daily.digest, 'sent');
+    assert.equal(P.I.properties().LAST_DAILY, '2026-09-25');
+    assert.equal(digests().length, 1);
+    assert.equal(J(P.G.hourlyJob()).daily, undefined);
+    P.advance(22 * HOUR);                                // 26.09 07:00
+    P.I.lock.hold();
+    assert.equal(J(P.G.dailyJob()).error, 'LOCKED');
+    P.I.lock.release();
+    P.store().replace('plan', []);                       // «План ППР» застарів / порожній
+    P.advance(HOUR);                                     // 08:00
+    let r = J(P.G.hourlyJob());
+    assert.equal(r.daily.digest, 'sent');
+    assert.ok(r.daily.plan > 0);
+    assert.equal(P.rows('plan').length, r.daily.plan);
+    assert.equal(digests().length, 2);
+    assert.equal(digests()[1].subject, 'Облік ліній — звіт за 26.09.2026');
+    assert.equal(P.I.properties().LAST_DAILY, '2026-09-26');
+    P.advance(HOUR);
+    r = J(P.G.hourlyJob());
+    assert.equal(r.daily, undefined, 'уже надолужено');
+    assert.equal(digests().length, 2);
+    // уночі — не надолужує (звіт завжди «за сьогодні»: завчасний лист «з'їв» би вчасний); вчасний dailyJob —
+    // і щогодинна вже не потрібна
+    P.advance(19 * HOUR);                                // 27.09 04:00
+    assert.equal(J(P.G.hourlyJob()).daily, undefined);
+    P.advance(3 * HOUR);
+    assert.equal(J(P.G.dailyJob()).digest, 'sent');
+    P.advance(HOUR);
+    assert.equal(J(P.G.hourlyJob()).daily, undefined);
+    assert.equal(digests().length, 3);
+    // ручна зміна години звіту на пізнішу того ж дня — повторного звіту немає
+    P.ok(P.admin('settings_save', { values: { digest_hour: 9 } }));
+    P.advance(2 * HOUR);
+    J(P.G.hourlyJob());
+    assert.equal(digests().length, 3);
+    // пропущено цілу добу (усі спроби зайняті): уночі не надсилає, о годині звіту — лише сьогоднішній
+    P.advance(DAY + 16 * HOUR);                          // 29.09 02:00, LAST_DAILY = 27.09
+    assert.equal(J(P.G.hourlyJob()).daily, undefined);
+    P.advance(7 * HOUR);                                 // 09:00 — година звіту (змінена на 9)
+    assert.equal(J(P.G.hourlyJob()).daily.digest, 'sent');
+    assert.equal(digests().at(-1).subject, 'Облік ліній — звіт за 29.09.2026');
+  });
+
+  test('таблиця заповнена на 70 % → попередження в щоденному звіті (навіть у «тихий» день)', () => {
+    const P = ready();
+    configure(P);
+    P.ok(P.admin('settings_save', { values: { manager_emails: 'boss@example.com' } }));
+    let r = J(P.G.dailyJob());
+    assert.equal(r.digest, 'none', 'тихий день, if_any');
+    assert.equal(r.warning, undefined);
+    assert.ok(r.cells > 0 && r.cells < 1e6);
+    // сітка росте (напр. роки журналів): +6,9 млн клітинок
+    const sh = P.store().sheet_('plan');
+    sh.insertRowsAfter(sh.getMaxRows(), Math.ceil(7e6 / sh.getMaxColumns()));
+    P.advance(DAY);
+    r = J(P.G.dailyJob());
+    assert.ok(r.cells >= 7e6);
+    assert.equal(r.digest, 'sent');
+    assert.match(r.warning, /заповнена на 7\d%/);
+    const m = P.I.mails.at(-1);
+    assert.match(m.htmlBody, /<body[^>]*><div[^>]*><b>Увага\.<\/b> Google-таблиця заповнена/);
+    assert.match(m.htmlBody, /Архівувати старі чек-листи/);
+    assert.match(m.body, /^УВАГА\. Google-таблиця заповнена/);
+  });
+
+  test('ліміт клітинок досягнуто: запис — зрозуміла помилка; запас рядків не вміщається — лише потрібні', () => {
+    const P = ready({ cellLimit: 400000 });
+    configure(P);
+    const E = P.sheet('events'), w = E.maxColumns;
+    const fill = P.store().sheet_('plan');
+    // лишається місця рівно на 10 рядків журналу стану (запасу в 500 — немає)
+    fill.insertRowsAfter(fill.getMaxRows(), Math.floor((400000 - P.I.spreadsheet.cells() - 10 * w) / fill.getMaxColumns()));
+    const free = 400000 - P.I.spreadsheet.cells();
+    assert.ok(free >= 10 * w && free < 500 * w, String(free));
+    const st = P.store();
+    st.insert('events', Array.from({ length: E.maxRows - 1 }, (_, i) => ({ id: 'f' + i, ts: new Date(Date.parse(NOW) - (2000 - i) * MIN), line_id: 'L1', state: 'Працює' })));
+    P.ok(P.call('event', { id: 'k1', ts: P.iso(), line_id: 'L1', state: 'stop' }));
+    assert.equal(P.row('events', 'k1')['Стан'], 'Простій', 'рядок додано без запасу');
+    // далі місця немає
+    fill.insertRowsAfter(fill.getMaxRows(), Math.floor((400000 - P.I.spreadsheet.cells()) / fill.getMaxColumns()));
+    for (let i = 0; i < 20; i++) P.call('event', { id: 'k' + (i + 2), ts: P.iso((i + 1) * MIN), line_id: 'L1', state: i % 2 ? 'stop' : 'run' });
+    const bad = P.call('event', { id: 'kx', ts: P.iso(30 * MIN), line_id: 'L1', state: 'run' });
+    assert.equal(bad.ok, false);
+    assert.equal(bad.error, 'SERVER_ERROR');
+    assert.match(bad.message, /ліміт — 10 млн клітинок/);
+    assert.match(bad.message, /Архівувати старі чек-листи/);
+    assert.equal(P.I.lock.held(), false);
   });
 
   test('seedDemoData: небагато записів у таблицю; відмова, якщо дані вже є', () => {
@@ -889,7 +1191,11 @@ describe('SheetStore', () => {
     assert.equal(fresh.since('events', new Date(t0 - 10 * DAY)).length, 2099);
     P.I.resetCalls();
     assert.deepEqual(J(fresh.since('events', new Date(Date.parse(NOW) + DAY))).map((r) => r.id), ['ev1798']);
-    assert.equal(P.I.calls.getValues, 2);
+    assert.equal(P.I.calls.getValues || 0, 0, 'той самий SheetStore: журнал уже прочитано — без читань');
+    const other = P.store();
+    P.I.resetCalls();
+    assert.deepEqual(J(other.since('events', new Date(Date.parse(NOW) + DAY))).map((r) => r.id), ['ev1798']);
+    assert.equal(P.I.calls.getValues, 3, 'новий SheetStore: заголовок і дві порції (у нижній — текстовий час)');
     // ядро поверх since: history за 2 доби бачить лише свіжі події
     const h = P.ok(P.call('history', { types: 'events', from: P.iso(-2 * DAY), limit: 5000 }));
     assert.ok(h.events.length > 0 && h.events.every((e) => Date.parse(e.ts) >= Date.parse(P.iso(-2 * DAY))));
@@ -941,6 +1247,135 @@ describe('SheetStore', () => {
     assert.equal(fresh.update('events', []), 0);
   });
 
+  test('кеш хвоста журналу: insert / update / since в одному виконанні = свіже читання аркуша', () => {
+    const P = ready();
+    const t0 = Date.parse(NOW) - 1200 * HOUR;
+    P.store().insert('events', eventRows(1200, t0, HOUR));
+    const st = P.store();
+    const b1 = new Date(t0 + 1100 * HOUR);
+    assert.equal(st.since('events', b1).length, 100);
+    const top = st.tail_.events.top;
+    assert.ok(top > 2, 'прочитано лише низ');
+    P.I.resetCalls();
+    // рядок у хвості — без читання стовпця ID; рядок вище хвоста — читання ID лише над хвостом
+    st.update('events', [{ id: 'ev1190', cum_h: 99, flag: 'Запуск без чек-листа' }]);
+    assert.equal(P.I.calls.getValues || 0, 0);
+    st.update('events', [{ id: 'ev10', void: true, void_note: 'x' }, { id: 'ev1195', note: '=1+1' }]);
+    assert.equal(P.I.calls.cellsRead, top - 2, 'стовпець ID над хвостом');
+    st.insert('events', eventRows(3, Date.parse(NOW), MIN).map((r) => ({ ...r, id: 'n' + r.id })));
+    st.update('events', [{ id: 'nev1', state: 'Простій', ts: new Date(Date.parse(NOW) - 3 * DAY) }]);
+    const bounds = [b1, new Date(t0 + 1190 * HOUR), new Date(t0 + 500 * HOUR), new Date(t0 - DAY), new Date(Date.parse(NOW) - 4 * DAY)];
+    for (const b of bounds) {
+      const fresh = P.store();
+      const a = J(st.since('events', b)).filter((r) => Date.parse(r.ts) >= b.getTime());
+      const f = J(fresh.since('events', b)).filter((r) => Date.parse(r.ts) >= b.getTime());
+      assert.deepEqual(a, f, b.toISOString());
+    }
+    assert.deepEqual(J(st.all('events')), J(P.store().all('events')));
+    assert.equal(J(st.since('events', b1)).find((r) => r.id === 'ev1190').cum_h, 99);
+    assert.equal(J(st.all('events')).find((r) => r.id === 'ev10').void, true);
+  });
+
+  test('since(): давня межа — кілька читань (порція за щільністю журналу), результат як із повного читання', () => {
+    const P = ready();
+    const t0 = Date.parse(NOW) - 20000 * 20 * MIN;
+    P.store().insert('events', eventRows(20000, t0, 20 * MIN));
+    for (const back of [900, 6000, 15000, 19990, 25000]) {
+      const b = new Date(t0 + (20000 - back) * 20 * MIN);
+      const st = P.store();
+      P.I.resetCalls();
+      const got = J(st.since('events', b)).map((r) => r.id);
+      const reads = P.I.calls.getValues, cells = P.I.calls.cellsRead;
+      const expect = J(P.store().all('events')).filter((r) => Date.parse(r.ts) >= b.getTime()).map((r) => r.id);
+      assert.deepEqual(got, expect, 'межа ' + back + ' рядків від низу');
+      // заголовок + перша порція + порція до межі (+ за потреби ще одна); без межі за даними — зайвого не більше ~20 % + порції
+      assert.ok(reads <= 4, back + ': getValues ' + reads);
+      const width = SCHEMA.events.cols.length;
+      assert.ok(cells <= width * (1 + Math.min(20000, Math.ceil(back * 1.25) + 1500)), back + ': cellsRead ' + cells);
+    }
+  });
+
+  test('findBy(): стовпець пошуку й лише знайдені рядки; порядок аркуша; кеш низу; null — немає аркуша / стовпця', () => {
+    const P = ready();
+    const t0 = Date.parse(NOW) - 1200 * HOUR;
+    P.store().insert('events', eventRows(1200, t0, HOUR));
+    const ans = [];
+    for (let c = 0; c < 300; c++) {
+      for (let k = 1; k <= 4; k++) {
+        ans.push({ id: 'c' + c + '-' + k, check_id: 'c' + c, ts: new Date(t0 + c * 4 * HOUR), line_id: 'L1', item_id: 'I' + k, value: 'ok', ok: true, void: false });
+      }
+    }
+    // той самий чек-лист далеко внизу; у клітинці — пробіли по краях
+    ans.push({ id: 'c7-9', check_id: ' c7 ', ts: new Date(t0 + 28 * HOUR), line_id: 'L1', item_id: 'I9', value: 'ok', ok: true, void: false });
+    P.store().insert('answers', ans);
+    const EW = SCHEMA.events.cols.length, AW = SCHEMA.answers.cols.length;
+    let st = P.store();
+    P.I.resetCalls();
+    let got = J(st.findBy('events', 'id', 'ev700'));
+    assert.deepEqual(got.map((r) => [r.id, r.cum_h]), [['ev700', 700]]);
+    assert.equal(P.I.calls.getValues, 3, 'заголовок, стовпець ID, знайдений рядок');
+    assert.equal(P.I.calls.cellsRead, EW + 1200 + EW);
+    P.I.resetCalls();
+    got = J(st.findBy('answers', 'check_id', 'c7'));
+    assert.deepEqual(got.map((r) => r.id), ['c7-1', 'c7-2', 'c7-3', 'c7-4', 'c7-9'], 'у порядку аркуша');
+    assert.equal(P.I.calls.getValues, 4, 'заголовок, стовпець, суміжні рядки — одним діапазоном, далекий — окремо');
+    assert.equal(P.I.calls.cellsRead, AW + 1201 + 4 * AW + AW);
+    assert.deepEqual(J(st.findBy('events', 'id', 'nope')), []);
+    // число в стовпці ID (введено вручну) — як текст
+    P.sheet('events').raw(12, 1, 4242);
+    assert.deepEqual(J(P.store().findBy('events', 'id', '4242')).map((r) => r.id), [4242]);
+    assert.equal(st.findBy('events', 'nosuch', 'x'), null, 'немає стовпця');
+    assert.equal(st.findBy('events', 'id', '  '), null, 'порожнє значення');
+    assert.equal(project().store().findBy('events', 'id', 'ev1'), null, 'немає аркуша');
+    // прочитаний низ журналу (since) — з кешу: стовпець лише над ним; рядки, додані в цьому виконанні, — теж знайдено
+    st = P.store();
+    st.since('events', new Date(t0 + 1100 * HOUR));
+    const top = st.tail_.events.top;
+    st.insert('events', [{ id: 'n1', ts: new Date(Date.parse(NOW)), line_id: 'L1', state: 'Працює', void: false }]);
+    P.I.resetCalls();
+    assert.deepEqual(J(st.findBy('events', 'id', 'ev1150')).map((r) => r.id), ['ev1150']);
+    assert.deepEqual(J(st.findBy('events', 'id', 'n1')).map((r) => r.id), ['n1']);
+    assert.equal(P.I.calls.getValues, 2);
+    assert.equal(P.I.calls.cellsRead, 2 * (top - 2), 'стовпець ID над низом, без рядків');
+    P.I.resetCalls();
+    assert.deepEqual(J(st.findBy('events', 'id', 'ev5')).map((r) => r.id), ['ev5']);
+    assert.equal(P.I.calls.cellsRead, top - 2 + EW);
+  });
+
+  test('findBy(): знайдені рядки — update() без повторного пошуку; перший рядок із ключем; блокування забуває', () => {
+    const P = ready();
+    const t0 = Date.parse(NOW) - 1200 * HOUR;
+    P.store().insert('events', eventRows(1200, t0, HOUR));
+    const ans = [];
+    for (let c = 0; c < 100; c++) for (let k = 1; k <= 3; k++) ans.push({ id: 'c' + c + '-' + k, check_id: 'c' + c, ts: new Date(t0 + c * HOUR), line_id: 'L1', void: false });
+    P.store().insert('answers', ans);
+    let st = P.store();
+    st.findBy('events', 'id', 'ev10');
+    st.findBy('answers', 'check_id', 'c7');
+    P.I.resetCalls();
+    assert.equal(st.update('events', [{ id: 'ev10', void: true, void_note: 'тест' }]), 1);
+    assert.equal(st.update('answers', [{ id: 'c7-1', void: true }, { id: 'c7-3', void: true }]), 2);
+    assert.equal(P.I.calls.getValues || 0, 0, 'без читання стовпця ID');
+    assert.equal(P.row('events', 'ev10')['Анульовано'], true);
+    assert.equal(P.row('events', 'ev10')['Причина анулювання'], 'тест');
+    assert.deepEqual(P.rows('answers').filter((r) => r['ID чек-листа'] === 'c7').map((r) => r['Анульовано']), [true, false, true]);
+    assert.equal(P.row('answers', 'c8-1')['Анульовано'], false);
+    // дубль ID унизу (скопійовано вручну): оновлюється перший рядок, навіть коли низ уже прочитано
+    P.store().insert('events', [{ id: 'ev20', ts: new Date(Date.parse(NOW)), line_id: 'L1', state: 'Працює', void: false }]);
+    st = P.store();
+    st.since('events', new Date(Date.parse(NOW) - HOUR));
+    assert.equal(st.findBy('events', 'id', 'ev20').length, 2);
+    st.update('events', [{ id: 'ev20', note: 'перший' }]);
+    assert.deepEqual(P.rows('events').filter((r) => r.ID === 'ev20').map((r) => r['Примітка']), ['перший', '']);
+    // на вході в блокування знайдене забувається (аркуш міг змінитися) — рядок шукається знову
+    st = P.store();
+    st.findBy('events', 'id', 'ev30');
+    P.I.resetCalls();
+    st.lock(() => st.update('events', [{ id: 'ev30', note: 'x' }]));
+    assert.equal(P.I.calls.getValues, 1, 'стовпець ID');
+    assert.equal(P.row('events', 'ev30')['Примітка'], 'x');
+  });
+
   test('чужий порядок стовпців і відсутній стовпець: запис за заголовками, стовпець дописується', () => {
     const P = ready();
     const U = P.sheet('units');
@@ -990,6 +1425,317 @@ describe('SheetStore', () => {
     assert.ok(P.I.calls.getLastRow <= 10, 'getLastRow: ' + P.I.calls.getLastRow);
     assert.equal(P.row('lines', 'L1')['ID останньої події'], 'q19');
     assert.equal(P.row('lines', 'L1')['Поточний стан'], 'Простій');
+  });
+});
+
+/* ================================================================== часовий пояс таблиці */
+
+describe('часовий пояс заводу змінено → пояс таблиці, моменти часу записів ті самі', () => {
+  test('settings_save {tz}: журнали, службові й ручні дати не зсуваються; формула й текст у стовпці дат цілі', () => {
+    const P = ready();
+    configure(P);
+    P.ok(P.call('event', { id: 'e1', ts: P.iso(-95 * MIN), line_id: 'L1', state: 'run' }));
+    P.ok(P.call('checklist', { id: 'c1', ts: P.iso(-60 * MIN), started: P.iso(-70 * MIN), line_id: 'L1', occasion: 'changeover', answers: START_OK }));
+    P.ok(P.call('work', { id: 'w1', ts: P.iso(-30 * MIN), line_id: 'L1', rule_id: 'R1' }));
+    const RL = P.sheet('rules');
+    RL.type(2, RL.col('Відлік від дати'), '01.09.2026');                 // дата, введена людиною (північ за Києвом)
+    const E = P.sheet('events');
+    P.ok(P.call('event', { id: 'e2', ts: P.iso(-20 * MIN), line_id: 'L1', state: 'stop' }));
+    E.type(4, E.col('Час'), 'вчора ввечері');                            // текст у стовпці дат
+    E.type(5, E.col('Час'), '=NOW()');                                   // формула
+    const snap = () => {
+      const b = P.ok(P.admin('bootstrap'));
+      return JSON.stringify({ status: b.status.L1, rules: b.rules, ev: P.rows('events').slice(0, 2), ch: P.rows('checks'),
+        wk: P.rows('works'), ln: P.rows('lines'), rl: P.rows('rules') });
+    };
+    const before = snap();
+    const cur = P.row('lines', 'L1')['Стан з'].toISOString();
+    P.ok(P.admin('settings_save', { values: { tz: 'Europe/Warsaw' } }));
+    assert.equal(P.I.spreadsheet.timeZone(), 'Europe/Warsaw');
+    assert.equal(P.row('lines', 'L1')['Стан з'].toISOString(), cur);
+    assert.equal(P.row('rules', 'R1')['Відлік від дати'].toISOString(), '2026-08-31T21:00:00.000Z');
+    assert.equal(P.row('events', 'e1')['Час'].toISOString(), P.iso(-95 * MIN));
+    assert.equal(P.row('checks', 'c1')['Розпочато'].toISOString(), P.iso(-70 * MIN));
+    assert.equal(E.cell(4, E.col('Час')), 'вчора ввечері');
+    assert.deepEqual(E.formulas(), [{ row: 5, col: E.col('Час'), formula: '=NOW()' }]);
+    const after = JSON.parse(snap()), was = JSON.parse(before);
+    assert.deepEqual(after.ev, was.ev);
+    assert.deepEqual(after.ch, was.ch);
+    assert.deepEqual(after.wk, was.wk);
+    assert.deepEqual(after.status, was.status);
+    // повтор того самого значення (клієнт повторив запит) — нічого не перезаписується
+    P.I.resetCalls();
+    P.ok(P.admin('settings_save', { values: { tz: 'Europe/Warsaw' } }));
+    assert.equal(P.I.calls['setValues:' + SCHEMA.events.sheet] || 0, 0);
+    // нові записи після зміни поясу — теж без зсуву
+    P.ok(P.call('event', { id: 'e3', ts: P.iso(), line_id: 'L1', state: 'run' }));
+    assert.equal(P.row('events', 'e3')['Час'].toISOString(), P.iso());
+  });
+});
+
+/* ================================================================== архів */
+
+describe('архівування старих чек-листів', () => {
+  function withOld(P) {
+    configure(P);
+    const st = P.store(), t0 = Date.parse(NOW);
+    const checks = [], answers = [];
+    // 40 старих чек-листів (15…14 місяців тому) і 3 свіжі — у порядку журналу
+    for (let i = 0; i < 43; i++) {
+      const ts = new Date(i < 40 ? t0 - 450 * DAY + i * DAY : t0 - (43 - i) * HOUR);
+      const id = (i < 40 ? 'old' : 'new') + i;
+      checks.push({ id, ts, started: new Date(ts.getTime() - 10 * MIN), line_id: 'L1', occasion: 'Запуск', operator: '007', result: 'Норма', total: 1, void: false });
+      answers.push({ id: 'a' + i, check_id: id, ts, line_id: 'L1', item_id: 'I1', text: 'Огородження', type: 'Так / ні', value: '0012', ok: true, void: false });
+    }
+    st.insert('checks', checks);
+    st.insert('answers', answers);
+    return { checks, answers };
+  }
+
+  test('старші за N місяців → нова таблиця-архів (значення, дати, текст «007»), з робочої — видалено', () => {
+    const P = ready();
+    withOld(P);
+    P.ok(P.call('event', { id: 'e1', ts: P.iso(), line_id: 'L1', state: 'run' }));
+    const C = P.sheet('checks'), A = P.sheet('answers');
+    const cells0 = P.I.spreadsheet.cells();
+    const r = J(P.G.archiveLogs(12));
+    assert.equal(r.ok, true, r.message);
+    assert.deepEqual(r.moved, { checks: 40, answers: 40 });
+    assert.equal(r.until, '25.09.2025');
+    assert.deepEqual(C.records().map((x) => x.ID), ['new40', 'new41', 'new42']);
+    assert.deepEqual(A.records().map((x) => x.ID), ['a40', 'a41', 'a42']);
+    assert.ok(P.I.spreadsheet.cells() < cells0, 'сітка зменшилась');
+    assert.ok(r.cells < cells0);
+    // архів
+    const arc = P.I.spreadsheets();
+    assert.equal(arc.length, 1);
+    assert.equal(arc[0].name, 'Облік ліній — архів чек-листів до 25.09.2025');
+    assert.equal(arc[0].timeZone(), 'Europe/Kyiv');
+    assert.equal(r.url, arc[0].url);
+    assert.match(r.message, /чек-листів — 40, відповідей — 40/);
+    assert.deepEqual(arc[0].sheetNames(), [SCHEMA.checks.sheet, SCHEMA.answers.sheet]);
+    const ac = arc[0].sheet(SCHEMA.checks.sheet), aa = arc[0].sheet(SCHEMA.answers.sheet);
+    assert.deepEqual(ac.header(), C.header());
+    assert.equal(ac.records().length, 40);
+    assert.equal(ac.maxRows, 42, 'сітка архіву — під дані');
+    assert.equal(ac.maxColumns, C.lastColumn);
+    assert.equal(ac.records()[0].ID, 'old0');
+    assert.equal(ac.records()[0]['Оператор'], '007', 'текст лишився текстом');
+    assert.equal(aa.records()[5]['Значення'], '0012');
+    assert.equal(ac.records()[0]['Завершено'].toISOString(), new Date(Date.parse(NOW) - 450 * DAY).toISOString());
+    assert.equal(ac.formatAt(2, 2), 'dd.MM.yyyy HH:mm');
+    // застосунок працює далі: свіжі чек-листи, новий запис — у кінець журналу
+    const b = P.ok(P.call('bootstrap'));
+    assert.equal(b.status.L1.state, 'run');
+    assert.equal(P.ok(P.call('check_detail', { id: 'new41' })).answers.length, 1);
+    P.ok(P.call('checklist', { id: 'c9', ts: P.iso(), line_id: 'L1', occasion: 'changeover', answers: START_OK }));
+    assert.equal(C.records().at(-1).ID, 'c9');
+    // повторний запуск — нічого старого немає, нової таблиці не створює
+    const again = J(P.G.archiveLogs(12));
+    assert.deepEqual(again.moved, { checks: 0, answers: 0 });
+    assert.match(again.message, /Немає чек-листів, старших за/);
+    assert.equal(P.I.spreadsheets().length, 1);
+    assert.equal(P.I.lock.held(), false);
+  });
+
+  test('з меню: запит кількості місяців, «Скасувати», мінімум; усе журнал старий і аркуш без запасних рядків', () => {
+    const P = ready({ ui: true });
+    const { checks } = withOld(P);
+    // без вікна (редактор / тригер) і без явної кількості місяців — нічого не робить
+    P.I.ui.enable(false);
+    assert.match(J(P.G.archiveLogs()).message, /Запустіть з меню таблиці/);
+    P.I.ui.enable(true);
+    P.I.ui.reply('', 'CANCEL');
+    assert.equal(J(P.G.archiveLogs()).cancelled, true);
+    P.I.ui.reply('3');
+    assert.match(J(P.G.archiveLogs()).message, /не менше 6/);
+    assert.equal(P.I.spreadsheets().length, 0);
+    // усі 43 — старі; аркуш «Чек-листи» — рівно під дані (без запасних рядків)
+    const sh = P.store().sheet_('checks');
+    sh.deleteRows(checks.length + 2, sh.getMaxRows() - checks.length - 1);
+    assert.equal(sh.getMaxRows(), checks.length + 1);
+    P.advance(400 * DAY);
+    P.I.ui.reply('');                                     // порожньо — 12 місяців
+    const r = J(P.G.archiveLogs());
+    assert.equal(r.ok, true, r.message);
+    assert.deepEqual(r.moved, { checks: 43, answers: 43 });
+    assert.match(P.I.ui.prompts.at(-1).prompt, /старші за скільки місяців/i);
+    const C = P.sheet('checks');
+    assert.equal(C.lastRow, 1);
+    assert.equal(C.maxRows, 2, 'під заголовком лишився один очищений рядок');
+    assert.equal(C.formatAt(2, C.col('Завершено')), 'dd.MM.yyyy HH:mm', 'його оформлення збережено');
+    P.ok(P.call('checklist', { id: 'c9', ts: P.iso(), line_id: 'L1', occasion: 'changeover', answers: START_OK }));
+    assert.deepEqual(C.records().map((x) => x.ID), ['c9']);
+    assert.equal(C.validationAt(2, C.col('Анульовано')).type, 'CHECKBOX');
+  });
+});
+
+/* ================================================================== пакет: читання хвоста журналу */
+
+describe('пакет записів: хвіст журналу читається раз на виконання', () => {
+  function bigLog(P, n = 3000) {
+    configure(P);
+    P.save('lines', { id: 'L2', name: 'Етикетувальна лінія №2' });
+    const st = P.store(), t0 = Date.parse(NOW) - n * 10 * MIN, rows = [];
+    for (let i = 0; i < n; i++) {
+      rows.push({ id: 'h' + i, ts: new Date(t0 + i * 10 * MIN), line_id: i % 2 ? 'L1' : 'L2', state: i % 3 ? 'Працює' : 'Простій',
+        prev_state: i % 3 === 1 ? 'Простій' : 'Працює', cum_h: i / 6, starts: i, void: false, created: new Date(t0 + i * 10 * MIN) });
+    }
+    st.insert('events', rows);
+    P.ok(P.admin('recompute'));
+  }
+  const evOps = (P, from, n, pref) => Array.from({ length: n }, (_, i) => ({ op_id: pref + i, action: 'event', id: pref + i,
+    ts: P.iso((from + i) * MIN), line_id: i % 3 ? 'L1' : 'L2', state: ['run', 'stop', 'setup'][i % 3], reason: 'Перерва' }));
+
+  test('20 подій (як черга планшета): кількість читань не залежить від кількості операцій', () => {
+    const P = ready();
+    bigLog(P);
+    P.I.resetCalls();
+    const r1 = P.ok(P.call('batch', { ops: evOps(P, 1, 1, 'x') }));
+    assert.ok(r1.results[0].ok);
+    const ev = SCHEMA.events.sheet;
+    const one = P.I.calls.getValues, oneCells = P.I.calls.cellsRead, oneEv = P.I.calls['getValues:' + ev];
+    P.advance(30 * MIN);
+    P.I.resetCalls();
+    const r = P.ok(P.call('batch', { ops: evOps(P, -25, 20, 'y') }));
+    assert.ok(r.results.every((x) => x.ok), JSON.stringify(r.results.filter((x) => !x.ok)));
+    // заголовок і порції за тиждень (вікно ядра) — один раз на виконання, а не на кожну операцію
+    assert.ok(P.I.calls['getValues:' + ev] <= Math.min(oneEv + 1, 6), ev + ': ' + P.I.calls['getValues:' + ev] + ' (одна операція: ' + oneEv + ')');
+    assert.ok(P.I.calls.getValues <= one + 6, 'getValues: ' + P.I.calls.getValues + ' (одна операція: ' + one + ')');
+    assert.ok(P.I.calls.cellsRead <= oneCells * 2, 'cellsRead: ' + P.I.calls.cellsRead + ' (одна операція: ' + oneCells + ')');
+    assert.ok(P.I.calls.validation <= 3, 'перевірки даних (прапорці): ' + P.I.calls.validation);
+    assert.equal(P.sheet('events').validationAt(P.sheet('events').lastRow, P.sheet('events').col('Анульовано')).type, 'CHECKBOX');
+    assert.equal(P.row('events', 'y19')['Анульовано'], false);
+  });
+
+  test('результат пакета з кешем хвоста = результат без кешу (події з минулого, чек-листи, роботи, анулювання)', () => {
+    const mk = (cached) => {
+      const P = ready();
+      bigLog(P, 1500);
+      if (!cached) {
+        // контроль: кожне since() / all() читає аркуш заново (як до кешу)
+        const S = P.G.SheetStore.prototype, since = S.since, all = S.all;
+        S.since = function (t, d) { delete this.tail_[t]; try { return since.call(this, t, d); } finally { delete this.tail_[t]; } };
+        S.all = function (t) { delete this.tail_[t]; try { return all.call(this, t); } finally { delete this.tail_[t]; } };
+      }
+      P.advance(10 * MIN);
+      const ops = evOps(P, 1, 6, 'f')                               // по черзі
+        .concat(evOps(P, -95, 9, 'p'))                               // із минулого — перерахунок наступних подій
+        .concat([
+          { op_id: 'k1', action: 'checklist', id: 'k1', ts: P.iso(-50 * MIN), line_id: 'L1', occasion: 'changeover', answers: START_OK,
+            then_event: { id: 'k1e', state: 'run' } },
+          { op_id: 'w1', action: 'work', id: 'w1', ts: P.iso(-40 * MIN), line_id: 'L1', rule_id: 'R1', work_type: 'to' },
+          { op_id: 'r1', action: 'reading', id: 'r1', meter_id: 'M1', value: 120, ts: P.iso(-35 * MIN) },
+          { op_id: 'd1', action: 'event', id: 'f2', ts: P.iso(2 * MIN), line_id: 'L1', state: 'stop' },  // дублікат
+          // анулювання в тому ж виконанні: перераховує рядки, щойно змінені попередніми операціями
+          { op_id: 'v1', action: 'void', table: 'events', id: 'p3', note: 'помилка' },
+          { op_id: 'v2', action: 'void', table: 'events', id: 'p4', note: 'помилка' },
+          { op_id: 'p9', action: 'event', id: 'p9', ts: P.iso(-93 * MIN), line_id: 'L1', state: 'run' },
+          { op_id: 'v3', action: 'void', table: 'events', id: 'f1', note: 'помилка' },
+          { op_id: 'v4', action: 'void', table: 'works', id: 'w1', note: 'помилка' }
+        ]);
+      const res = P.ok(P.admin('batch', { ops }));
+      P.ok(P.admin('void', { table: 'events', id: 'p6', note: 'помилка' }));
+      P.ok(P.admin('void', { table: 'events', id: 'h1497', note: 'стара' }));
+      const b = P.ok(P.admin('bootstrap'));
+      const strip = (rows) => rows.map((x) => { const o = { ...x }; delete o.ID; return o; });
+      return {
+        res: res.results.map((x) => [x.op_id, x.ok, !!x.duplicate, x.error || '']),
+        status: b.status, due: b.due, units: b.units, meters: b.meters,
+        events: P.rows('events'), lines: P.rows('lines'), checks: P.rows('checks'), works: P.rows('works'),
+        rules: P.rows('rules'), readings: P.rows('readings'), answers: strip(P.rows('answers'))
+      };
+    };
+    const a = J(mk(true)), b = J(mk(false));
+    assert.ok(a.res.every((x) => x[1]), JSON.stringify(a.res));
+    for (const k of Object.keys(b)) assert.deepEqual(a[k], b[k], k);
+  });
+});
+
+/* ================================================================== давні записи */
+
+describe('давні записи журналів: перегляд і анулювання без читання всього журналу (findBy)', () => {
+  // days днів історії двох ліній (як у журналах — за часом): події, чек-листи з відповідями
+  function history(P, days) {
+    configure(P);
+    P.save('lines', { id: 'L2', name: 'Етикетувальна лінія №2' });
+    const st = P.store(), end = Date.parse(NOW) - DAY, ev = [], ch = [], an = [];
+    const S = LABELS.state;
+    for (let d = days; d >= 1; d--) {
+      const day = end - d * DAY;
+      ['L1', 'L2'].forEach((L, li) => {
+        const cts = new Date(day + li * MIN), cid = 'c' + d + L;
+        ch.push({ id: cid, ts: cts, started: cts, line_id: L, occasion: LABELS.occasion[d % 2 ? 'start' : 'end'], operator: 'Олена',
+          result: LABELS.check_result.ok, total: 6, failed: 0, void: false, created: cts });
+        for (let k = 1; k <= 6; k++) {
+          an.push({ id: cid + '-' + k, check_id: cid, ts: cts, line_id: L, item_id: 'I' + k, text: 'Пункт ' + k, type: LABELS.item_type.check,
+            value: 'ok', ok: true, void: false });
+        }
+      });
+      [[1, S.run], [4, S.stop], [5, S.run], [9, S.off]].forEach(([h, state], k) => ['L1', 'L2'].forEach((L, li) => {
+        const ts = new Date(day + h * HOUR + li * MIN);
+        ev.push({ id: 'e' + d + L + k, ts, line_id: L, state, void: false, created: ts });
+      }));
+    }
+    st.insert('checks', ch);
+    st.insert('answers', an);
+    st.insert('events', ev);
+    P.ok(P.admin('recompute'));
+  }
+  function measure(P, fn) {
+    P.I.resetCalls();
+    const r = fn();
+    return { r, reads: P.I.calls.getValues || 0, cells: P.I.calls.cellsRead || 0 };
+  }
+  const AGES = [30, 150, 390];
+  // перегляд і анулювання давніх записів; withFind = false — сховище без findBy (ядро читає вікно / весь журнал)
+  function scenario(withFind) {
+    const P = ready();
+    history(P, 400);
+    if (!withFind) P.G.SheetStore.prototype.findBy = undefined;
+    const m = {};
+    for (const d of AGES) {
+      const id = 'c' + d + 'L1', ts = P.row('checks', id)['Завершено'].toISOString();
+      for (const [k, extra] of [['detail', {}], ['detail+ts', { ts }]]) {
+        m[k + d] = measure(P, () => P.ok(P.admin('check_detail', { id, ...extra })));
+        assert.equal(m[k + d].r.check.id, id);
+        assert.deepEqual(m[k + d].r.answers.map((a) => a.id), [1, 2, 3, 4, 5, 6].map((n) => id + '-' + n));
+      }
+      // «Завершення» (без перерахунку) і «Запуск» (перерахунок позначок запусків після нього); подія «Простій»
+      m['void end' + d] = measure(P, () => P.ok(P.admin('void', { table: 'checks', id, note: 'помилка' })));
+      m['void start' + d] = measure(P, () => P.ok(P.admin('void', { table: 'checks', id: 'c' + (d + 1) + 'L1', note: 'помилка' })));
+      m['void event' + d] = measure(P, () => P.ok(P.admin('void', { table: 'events', id: 'e' + d + 'L11', note: 'помилка' })));
+    }
+    const sheets = {};
+    for (const t of ['lines', 'events', 'checks', 'answers', 'rules', 'units']) sheets[t] = P.rows(t);
+    return { P, m, sheets: J(sheets) };
+  }
+
+  test('check_detail і анулювання давнього чек-листа / події: кількість читань не залежить від віку запису', () => {
+    const a = scenario(true), b = scenario(false);
+    // результат той самий, що й без findBy
+    for (const t of Object.keys(b.sheets)) assert.deepEqual(a.sheets[t], b.sheets[t], t);
+    const P = a.P, rows = (t) => P.sheet(t).lastRow - 1;
+    assert.equal(rows('answers'), 4800);
+    const d0 = AGES[0];
+    for (const k of ['detail', 'detail+ts', 'void end', 'void start', 'void event']) {
+      const reads = AGES.map((d) => a.m[k + d].reads);
+      assert.ok(reads.every((x) => x === reads[0]), k + ': getValues ' + reads.join(' / ') + ' за віку ' + AGES.join(' / ') + ' дн.');
+      assert.ok(reads[0] <= 18, k + ': getValues ' + reads[0]);
+    }
+    for (const d of AGES) {
+      // перегляд і анулювання без перерахунку: стовпці пошуку (ID чек-листа, ID) + кілька рядків, а не журнали
+      for (const k of ['detail', 'detail+ts', 'void end']) {
+        const c = a.m[k + d].cells;
+        assert.ok(c <= rows('answers') + rows('checks') + 400, k + d + ': cellsRead ' + c);
+      }
+      assert.ok(a.m['void end' + d].reads <= a.m['detail' + d].reads, 'позначки анулювання — без пошуку рядків');
+    }
+    // контроль: без findBy давній запис коштує в рази більше клітинок
+    const last = AGES[AGES.length - 1];
+    assert.ok(b.m['detail+ts' + last].cells > 5 * a.m['detail+ts' + last].cells,
+      b.m['detail+ts' + last].cells + ' vs ' + a.m['detail+ts' + last].cells);
+    assert.ok(b.m['detail' + d0].cells > 4 * a.m['detail' + d0].cells, 'без ts — увесь журнал відповідей');
   });
 });
 
@@ -1049,7 +1795,7 @@ describe('Server.gs: вихідний код', () => {
     assert.ok(!/\?\.|\?\?/.test(code), 'без optional chaining / nullish');
   });
 
-  test('appsscript.json: пояс, V8, веб-застосунок, мінімальні дозволи', () => {
+  test('appsscript.json: пояс, V8, веб-застосунок, дозволи (spreadsheets — для таблиці-архіву)', () => {
     const m = JSON.parse(readFileSync(fileURLToPath(new URL('../apps-script/appsscript.json', import.meta.url)), 'utf8'));
     assert.equal(m.timeZone, 'Europe/Kyiv');
     assert.equal(m.runtimeVersion, 'V8');
@@ -1059,7 +1805,10 @@ describe('Server.gs: вихідний код', () => {
       'https://www.googleapis.com/auth/script.container.ui',
       'https://www.googleapis.com/auth/script.scriptapp',
       'https://www.googleapis.com/auth/script.send_mail',
-      'https://www.googleapis.com/auth/spreadsheets.currentonly'
+      'https://www.googleapis.com/auth/spreadsheets'
     ]);
+    // SpreadsheetApp.create — лише в архівуванні (з меню); чужі таблиці не відкриваються
+    const code = SERVER_SRC.replace(/\/\*[\s\S]*?\*\//g, '');
+    assert.deepEqual(code.match(/SpreadsheetApp\.create\(/g), ['SpreadsheetApp.create(']);
   });
 });

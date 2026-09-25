@@ -6,6 +6,7 @@
     "test": "node --test tests/core.test.mjs tests/server.test.mjs",
     "test:core": "node --test tests/core.test.mjs",
     "test:e2e": "node --test tests/e2e.test.mjs",
-    "dev": "node tools/dev-server.mjs"
+    "test:all": "npm test && npm run test:e2e",
+    "dev": "node tools/dev-server.mjs --seed"
   }
 }
