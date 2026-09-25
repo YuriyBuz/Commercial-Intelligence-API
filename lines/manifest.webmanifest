@@ -1,0 +1,26 @@
+{
+  "name": "Foodline · Лінії",
+  "short_name": "Лінії",
+  "description": "Облік роботи виробничих ліній: чек-листи запуску, простої, ремонти, ТО і план ППР.",
+  "lang": "uk",
+  "dir": "ltr",
+  "id": "./",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#12100E",
+  "theme_color": "#12100E",
+  "categories": ["business", "productivity", "utilities"],
+  "icons": [
+    { "src": "assets/icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "assets/icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "assets/icons/maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" },
+    { "src": "assets/icons/apple-touch-icon.png", "sizes": "180x180", "type": "image/png", "purpose": "any" },
+    { "src": "assets/icons/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+  ],
+  "shortcuts": [
+    { "name": "Керівництво", "short_name": "Керівництво", "description": "Огляд, ТО і ППР, журнал, обладнання", "url": "./#/m" },
+    { "name": "Налаштування пристрою", "short_name": "Пристрій", "description": "Підключення, черга синхронізації, тема", "url": "./#/device" }
+  ]
+}

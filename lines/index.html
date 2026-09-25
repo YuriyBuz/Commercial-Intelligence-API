@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="uk" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#12100E">
+<meta name="color-scheme" content="dark light">
+<title>Foodline · Лінії</title>
+<meta name="description" content="Облік роботи виробничих ліній: чек-листи запуску, простої, ремонти, ТО і план ППР.">
+<script>
+/* тема — до першого малювання, щоб не блимало */
+(function () {
+  var t = 'dark';
+  try { var c = JSON.parse(localStorage.getItem('fl_lines_v1') || '{}'); if (c && c.theme === 'light') t = 'light'; } catch (e) { /* пропуск */ }
+  document.documentElement.setAttribute('data-theme', t);
+  if (t === 'light') document.querySelector('meta[name=theme-color]').setAttribute('content', '#FFFFFF');
+})();
+</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans+Condensed:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="assets/icons/favicon-32.png" sizes="32x32" type="image/png">
+<link rel="icon" href="assets/icons/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="assets/icons/apple-touch-icon.png">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Лінії">
+<link rel="stylesheet" href="assets/styles.css?v=1">
+<link rel="stylesheet" href="assets/operator.css?v=1">
+<link rel="stylesheet" href="assets/manager.css?v=1">
+</head>
+<body>
+<button type="button" class="skip" onclick="document.getElementById('view').focus()">До вмісту</button>
+
+<header class="topbar">
+  <a class="brand" href="#/" aria-label="FOODLINE · Лінії — до списку ліній"><i aria-hidden="true"></i><b>FOODLINE</b><span>· Лінії</span></a>
+  <div class="tb-clock" id="tbClock"></div>
+  <div class="tb-spacer"></div>
+  <button type="button" class="tb-btn tb-net" id="tbNet" aria-label="Синхронізація"></button>
+  <button type="button" class="tb-btn tb-op none" id="tbOp" aria-label="Оператор"></button>
+  <button type="button" class="tb-btn icon-only" id="tbMenu" aria-label="Меню" aria-haspopup="menu" aria-expanded="false">
+    <svg class="ic" viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M3 6h18M3 12h18M3 18h18"/></svg>
+  </button>
+</header>
+<div class="banners" id="banners" aria-live="polite"></div>
+
+<main class="view" id="view" tabindex="-1"></main>
+
+<div class="toast-host" id="toasts" aria-live="polite"></div>
+
+<noscript><div class="empty"><h3>Потрібен JavaScript</h3><p>Увімкніть JavaScript у браузері, щоб користуватися застосунком.</p></div></noscript>
+
+<script src="assets/core.js?v=1"></script>
+<script src="assets/local-store.js?v=1"></script>
+<script src="assets/api.js?v=1"></script>
+<script src="assets/ui.js?v=1"></script>
+<script src="assets/app.js?v=1"></script>
+<script src="assets/operator.js?v=1"></script>
+<script src="assets/manager.js?v=1"></script>
+</body>
+</html>
