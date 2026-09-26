@@ -187,7 +187,8 @@
     return '<button type="button" class="btn' + (o.tone ? ' ' + o.tone : '') + (o.sm !== false ? ' sm' : '') + '" data-m="' + esc(action) + '"' +
       (o.title ? ' title="' + esc(o.title) + '"' : '') + '>' + (ic ? icon(ic, 18) : '') + '<span>' + esc(label) + '</span></button>';
   }
-  function freshSub(at) { var S = App.state && App.state.settings || {}; return esc(S.company || '') + (at ? ' · дані на ' + esc(fmt.time(new Date(at))) : ''); }
+  /* at — час пристрою (Date.now() у мить отримання); «дані на» — за годинником сервера, як шапка й App.now() */
+  function freshSub(at) { var S = App.state && App.state.settings || {}; return esc(S.company || '') + (at ? ' · дані на ' + esc(fmt.time(new Date(at + Api.skew()))) : ''); }
 
   App.on('net', function () { UI.qsa('.m-off').forEach(function (b) { b.hidden = !isOffline(); }); });
   document.addEventListener('click', function (e) {
@@ -228,10 +229,11 @@
   var CST = {
     ok: { label: 'Виконано', glyph: '✓', text: 'усі запуски з чек-листом' },
     warn: { label: 'Із зауваженнями', glyph: '!', text: 'зауваження в чек-листі або запуск попри них' },
-    miss: { label: 'Без чек-листа', glyph: '✕', text: 'запуск або завершення без чек-листа' },
+    miss: { label: 'Без чек-листа', glyph: '✕', text: 'запуск або завершення без чек-листа, або робота без завершення довше за допустиме' },
     cont: { label: 'Робота без запуску', glyph: '→', text: 'лінія працювала з попередньої доби' },
     idle: { label: 'Не працювала', glyph: '', text: 'роботи не було' }
   };
+  function longRunH() { var S = App.state && App.state.settings || {}; return fmt.num(S.long_run_hours || 16); }
   /* «Н/З» (не застосовується) у чек-листах: сума за списком / текст для рядка */
   function naSum(list) { var n = 0; (list || []).forEach(function (c) { n += +c.na || 0; }); return n; }
   function naText(c) { return c && +c.na > 0 ? 'Н/З: ' + c.na : ''; }
@@ -240,6 +242,7 @@
     var s = l.name + ' · ' + fmt.dayLabel(x.day) + ' — ' + m.label + '.';
     if (x.starts) s += ' Запусків: ' + x.starts + ' (з чек-листом ' + x.covered + ').';
     if (x.uncovered) s += ' Без чек-листа: ' + x.uncovered + '.';
+    if (x.long_runs) s += ' Без завершення понад ' + longRunH() + ' год: ' + x.long_runs + '.';
     if (x.forced) s += ' Запуск попри зауваження: ' + x.forced + '.';
     if (x.checks && x.checks.length) s += ' Чек-листів: ' + x.checks.length + '.';
     var na = naSum(x.checks);
@@ -287,6 +290,7 @@
         ['Запусків', esc(String(x.starts || 0))],
         ['З чек-листом', esc(String(x.covered || 0))],
         x.uncovered ? ['Без чек-листа', '<b class="c-bad">' + esc(String(x.uncovered)) + '</b> (запуск чи завершення)'] : null,
+        x.long_runs ? ['Без завершення', '<b class="c-bad">' + esc(String(x.long_runs)) + '</b> (робота, що почалася цього дня, тривала понад ' + esc(String(longRunH())) + ' год без завершення зміни)'] : null,
         x.forced ? ['Попри зауваження', '<b class="c-warn">' + esc(String(x.forced)) + '</b>'] : null,
         ['Робота', esc(x.run_h ? fmt.hm(x.run_h) : 'не працювала')]
       ]) +
@@ -497,7 +501,8 @@
       UI.field.number({ name: 'duration_min', label: 'Тривалість', unit: 'хв' }) +
       UI.field.number({ name: 'downtime_min', label: 'Простій лінії', unit: 'хв' }) +
       (meter ? UI.field.number({ name: 'meter_value', label: meter.name + ' — показник', unit: meter.unit_label || '', className: 'span-2',
-        hint: meter.value !== null && meter.value !== undefined ? 'Останній показник: ' + nf(meter.value) + ' ' + (meter.unit_label || '') + (meter.value_ts ? ' (' + fmt.dt(meter.value_ts) + ')' : '') : 'Показника ще немає' }) : '') +
+        hint: meter.value !== null && meter.value !== undefined ? 'Останній показник: ' + nf(meter.value) + ' ' + (meter.unit_label || '') + (meter.value_ts ? ' (' + fmt.dt(meter.value_ts) + ')' : '') : 'Показника ще немає' }) +
+        UI.field.check({ name: 'meter_reset', label: 'Лічильник скинуто / замінено', value: false, className: 'span-2', hint: 'Показник, менший за попередній, приймається лише з цією позначкою: напрацювання для строків ТО продовжиться від нового показника' }) : '') +
       '</div>';
     var md = UI.modal({
       title: 'Позначити виконаним', size: 'md', className: 'm-modal', body: body,
@@ -510,13 +515,16 @@
         if (!v.performer) errs.performer = 'Хто виконував роботу?';
         if (!v.title) errs.title = 'Опишіть коротко, що зроблено';
         numErrs(mm.body, v, errs, { duration_min: { min: 0 }, downtime_min: { min: 0 }, meter_value: { min: 0 } });
+        if (meter && !v.meter_reset && meter.mode !== 'inc' && typeof v.meter_value === 'number' && typeof meter.value === 'number' && v.meter_value < meter.value) {
+          errs.meter_value = 'Менше за попередній (' + nf(meter.value) + '). Перевірте число або позначте «Лічильник скинуто / замінено»';
+        }
         if (UI.setErrors(mm.body, errs)) return false;
         var st = App.staffFor(o.line_id).filter(function (s) { return s.name === v.performer; })[0];
         var p = { line_id: o.line_id, unit_id: o.unit_id || '', rule_id: o.rule_id || '', work_type: v.work_type, title: v.title, description: v.description,
           parts: v.parts, performer: v.performer, staff_id: st ? st.id : '', ts: new Date(ts).toISOString(), status: 'done',
           duration_min: v.duration_min, downtime_min: v.downtime_min };
         if (v.duration_min > 0) p.started = new Date(ts - v.duration_min * 60000).toISOString();
-        if (meter && v.meter_value !== null && v.meter_value !== undefined) p.meter_value = v.meter_value;
+        if (meter && v.meter_value !== null && v.meter_value !== undefined) { p.meter_value = v.meter_value; if (v.meter_reset) p.meter_reset = true; }
         return Api.write('work', p, { wait: 6000 }).then(function (r) {
           // пам’ять пристрою переповнена: запис прийнято в чергу вкладки й надішлеться — це не відмова
           // (попередження показує App); повторне «Записати» створило б дубль
@@ -576,7 +584,8 @@
     var why = {
       no_id: 'рядок без ID — застосунок його пропускає; задайте унікальний ID або видаліть порожній рядок',
       duplicate: 'повторений ID — діє лише перший рядок з цим ID; задайте іншому рядку унікальний ID',
-      bad_pin: 'PIN некоректний (має бути 4–8 цифр) — вхід за PIN не працює; введіть PIN у стовпець «PIN» ще раз (формат «Звичайний текст», напр. 0427) або задайте його в розділі «Персонал»'
+      bad_pin: 'PIN некоректний (має бути 4–8 цифр) — вхід за PIN не працює; введіть PIN у стовпець «PIN» ще раз (формат «Звичайний текст», напр. 0427) або задайте його в розділі «Персонал»',
+      no_occasion: 'порожнє або невідоме значення «Коли» — пункт не потрапляє в жоден чек-лист; впишіть «Запуск», «Переналаштування» та/або «Завершення» (через кому)'
     };
     return '<div class="box err m-issues" role="alert">' + icon('alert') + '<div><b>У Google-таблиці є рядки довідників, які потребують виправлення (' + issues.length + ').</b>' +
       '<ul>' + issues.slice(0, 12).map(function (x) {
@@ -1943,8 +1952,9 @@
         UI.field.text({ name: 'name', label: 'Назва', value: m ? m.name : '', required: true, className: 'span-2', maxLength: 200, placeholder: 'Напр., Цикли дозатора' }) +
         UI.field.select({ name: 'unit_id', label: 'Агрегат', value: m ? m.unit_id : '', options: [{ value: '', label: 'Лінія загалом' }].concat(units.map(function (u) { return { value: u.id, label: u.name }; })) }) +
         UI.field.text({ name: 'unit_label', label: 'Одиниця', value: m ? m.unit_label : '', datalist: ['шт', 'цикл.', 'м', 'кг', 'л', 'уп.'], maxLength: 20 }) +
-        UI.field.chips({ name: 'mode', label: 'Як вносять показник', value: m ? m.mode : 'abs', className: 'span-2', options: [{ value: 'abs', label: 'Показник табло (лише зростає)' }, { value: 'inc', label: 'Приріст за зміну' }] }) +
-        '<p class="span-2 dim small m-formhint">«Показник табло» — число з лічильника агрегату, як є. «Приріст за зміну» — скільки додалося за зміну (напр., вироблено штук); застосунок сам підсумовує.</p>' +
+        UI.field.chips({ name: 'mode', label: 'Тип обліку', value: m ? m.mode : 'abs', className: 'span-2', options: [{ value: 'abs', label: lbl('meter_mode', 'abs') }, { value: 'inc', label: lbl('meter_mode', 'inc') }] }) +
+        '<p class="span-2 dim small m-formhint">«' + esc(lbl('meter_mode', 'abs')) + '» — число з табло лічильника агрегату, як є (лише зростає; якщо лічильник замінили або скинули, оператор позначає це під час внесення). «' +
+          esc(lbl('meter_mode', 'inc')) + '» — скільки додалося за зміну (напр., вироблено штук); застосунок сам підсумовує. Ті самі назви — у стовпці «Тип обліку» Google-таблиці.</p>' +
         UI.field.check({ name: 'ask_on_end', label: 'Питати при завершенні роботи', value: m ? !!m.ask_on_end : false, className: 'span-2', hint: 'Оператор внесе показник у чек-листі завершення' }) +
         sortField(m) + '<div></div>' + activeField(m) + '</div>';
       formModal({

@@ -12,7 +12,7 @@
    ===================================================================== */
 'use strict';
 
-var VERSION = 'v2';
+var VERSION = 'v3';
 var PREFIX = 'fl-lines-';
 var SHELL = PREFIX + 'shell-' + VERSION;
 var FONTS = PREFIX + 'fonts-v1';
@@ -21,16 +21,16 @@ var SHELL_FILES = [
   './',
   './index.html',
   './manifest.webmanifest',
-  './assets/styles.css?v=2',
-  './assets/operator.css?v=2',
-  './assets/manager.css?v=2',
-  './assets/core.js?v=2',
-  './assets/local-store.js?v=2',
-  './assets/api.js?v=2',
-  './assets/ui.js?v=2',
-  './assets/app.js?v=2',
-  './assets/operator.js?v=2',
-  './assets/manager.js?v=2',
+  './assets/styles.css?v=3',
+  './assets/operator.css?v=3',
+  './assets/manager.css?v=3',
+  './assets/core.js?v=3',
+  './assets/local-store.js?v=3',
+  './assets/api.js?v=3',
+  './assets/ui.js?v=3',
+  './assets/app.js?v=3',
+  './assets/operator.js?v=3',
+  './assets/manager.js?v=3',
   './assets/icons/icon.svg',
   './assets/icons/favicon-32.png',
   './assets/icons/icon-192.png',

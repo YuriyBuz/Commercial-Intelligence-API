@@ -835,5 +835,112 @@ if (skip) {
       assert.equal(ev[0]['Анульовано'], true);
       assert.equal(ev[0]['Причина анулювання'], 'Помилковий запис (e2e)');
     }));
+
+    test('миття перед запуском не «витрачає» чек-лист і не знімає оператора; показник менший за попередній — лише «скинуто / замінено»', T, () => run({
+      seed: true, config: (srv) => H.remoteConfig(srv.endpoint, srv.token, { device: 'Планшет лінії 2', operator: H.operatorFor('S2', 'Ігор Мельник') })
+    }, async ({ page, srv }) => {
+      await page.goto(srv.url + '#/line/L2');
+      await page.waitForSelector('.op-status.st-off', { timeout: 20000 });
+      await page.click('[data-act=start]');
+      if (await page.waitForSelector('.modal-operator', { timeout: 1500 }).catch(() => null)) await page.click('.modal-operator [data-staff="S2"]');
+      await page.waitForSelector('.op-ck');
+      await H.fillChecklist(page);
+      await page.click('[data-ck=go]');
+      await page.waitForSelector('.op-sum-modal');
+      await page.click('.op-sum-modal .modal-foot button:has-text("Зберегти без запуску")');
+      await page.waitForSelector('.op-status.st-off');
+      await H.waitQueueEmpty(page);
+      await page.waitForSelector('[data-act=run-direct]');
+      // миття (підготовка) → «Миття завершено» → «Не працює»
+      await page.click('[data-act=clean]');
+      await page.click('.modal-foot .btn.primary');
+      await H.waitState(page, 'L2', 'clean');
+      await page.waitForSelector('[data-act=clean-done]');
+      await page.click('[data-act=clean-done]');
+      await page.waitForSelector('.op-wf-modal');
+      await page.click('.op-wf-modal .modal-foot .btn.primary');
+      await H.waitState(page, 'L2', 'off', { settled: true });
+      await H.waitQueueEmpty(page);
+      await page.evaluate(() => App.refresh());
+      await page.waitForFunction(() => App.lineStatus('L2').start_check_valid === true && !App.lineStatus('L2').pending);
+      assert.equal(await page.evaluate(() => (App.operator() || {}).name), 'Ігор Мельник', 'оператор лишається на планшеті');
+      await page.waitForSelector('[data-act=run-direct]', { timeout: 10000 });
+      await page.click('[data-act=run-direct]');
+      const s = await H.waitState(page, 'L2', 'run', { settled: true });
+      await H.waitQueueEmpty(page);
+      const ev = byId((await H.sheet(srv, 'Журнал стану')).rows, s.event_id);
+      assert.equal(ev[0]['Попередній стан'], 'Не працює');
+      assert.equal(ev[0]['Позначка'], '', 'запуск покрито чек-листом, пройденим до миття');
+
+      // лічильник: 5 замість ~684 тис.
+      await afterDirectWrite(page);
+      await page.click('[data-act=meters]');
+      await page.waitForSelector('.op-meters');
+      await page.fill('input[name=m_M3]', '5');
+      await page.click('.modal-foot .btn.primary');
+      await page.waitForSelector('.modal-confirm');
+      assert.match(await page.textContent('.modal-confirm'), /Цикли дозатора.*5 цикл\..*а попередній/s);
+      await page.click('.modal-confirm .modal-foot .btn.ghost');                    // «Виправити число»
+      await page.waitForSelector('.modal-confirm', { state: 'detached' });
+      assert.match(await page.textContent('.op-meters'), /Менше за попередній/);
+      await page.click('.modal-foot .btn.primary');
+      await page.waitForSelector('.modal-confirm');
+      await page.click('.modal-confirm .modal-foot .btn.primary');                  // «Лічильник скинуто / замінено»
+      await page.waitForSelector('.op-meters', { state: 'detached' });
+      await H.waitQueueEmpty(page);
+      const rd = (await H.sheet(srv, 'Показники лічильників')).rows.filter((r) => r['ID лічильника'] === 'M3').at(-1);
+      assert.equal(rd['Значення'], 5);
+      assert.equal(rd['Лічильник скинуто / замінено'], true);
+      const m3 = (await H.sheet(srv, 'Лічильники')).rows.find((r) => r.ID === 'M3');
+      assert.equal(m3['Поточне значення'], 5);
+      assert.ok(m3['Останнє скидання'], 'лічильник знає момент скидання');
+      assert.deepEqual(await page.evaluate(() => Api.rejected().length), 0, 'сервер прийняв запис');
+      // без позначки сервер такий показник не приймає
+      const r = await (await fetch(srv.endpoint, { method: 'POST', headers: { 'Content-Type': 'text/plain' },
+        body: JSON.stringify({ action: 'reading', token: srv.token, meter_id: 'M3', value: 1 }) })).json();
+      assert.equal(r.error, 'BAD_REQUEST');
+      assert.match(r.message, /менший за попередній/);
+    }));
+
+    test('давній чек-лист запуску, простій і відновлення — без хибного «без чек-листа»; «дані на» — за годинником сервера', T, () => run({
+      seed: true, config: (srv) => H.remoteConfig(srv.endpoint, srv.token, { device: 'Планшет лінії 2' })
+    }, async ({ page, srv }) => {
+      const clock = srv.project.inspect.clock, MIN = 60e3;
+      const api = async (action, params = {}) => {
+        const j = await (await fetch(srv.endpoint, { method: 'POST', headers: { 'Content-Type': 'text/plain' },
+          body: JSON.stringify({ action, token: srv.token, device: 'e2e', ...params }) })).json();
+        assert.equal(j.ok, true, action + ': ' + JSON.stringify(j).slice(0, 300));
+        return j;
+      };
+      const b0 = await api('bootstrap');
+      assert.equal(b0.status.L2.state, 'off');
+      const answers = b0.items.filter((it) => it.line_id === 'L2' && it.occasions.includes('start')).map((it) => ({ item_id: it.id,
+        value: it.type === 'check' ? 'ok' : it.type === 'number' ? String(it.target ?? it.min ?? 1) : it.type === 'select' ? it.options.find((o) => !o.startsWith('!')) : 'ok' }));
+      const at = () => clock.now().toISOString();
+      clock.advance(MIN);
+      await api('checklist', { id: 'e2e-c1', ts: at(), line_id: 'L2', occasion: 'start', answers, operator: 'Ігор Мельник' });  // «Зберегти без запуску»
+      clock.advance(30 * MIN);
+      assert.equal((await api('event', { id: 'e2e-r1', ts: at(), line_id: 'L2', state: 'run' })).event.flag, '');
+      clock.advance(40 * MIN);
+      await api('event', { id: 'e2e-p1', ts: at(), line_id: 'L2', state: 'stop', reason: 'Перерва' });
+      clock.advance(60 * MIN);
+      assert.equal((await api('event', { id: 'e2e-r2', ts: at(), line_id: 'L2', state: 'run' })).event.flag, '');
+      clock.advance(600 * MIN);             // чек-лист — 12 год 11 хв тому, робота почалася 11 год 41 хв тому
+      const st = (await api('bootstrap')).status.L2;
+      assert.deepEqual([st.state, st.start_check_valid, st.start_uncovered], ['run', false, false]);
+
+      await page.goto(srv.url + '#/');
+      await page.waitForSelector('.ltile[data-line="L2"].st-run', { timeout: 20000 });
+      await page.waitForFunction(() => Math.abs(Api.skew()) > 3600e3, null, { timeout: 15000 });
+      assert.doesNotMatch(await page.textContent('.ltile[data-line="L2"]'), /без чек-листа/);
+      assert.equal(await page.evaluate(() => App.checkMissing(App.lineStatus('L2'))), false);
+      // «дані на» — за годинником сервера (як App.now()), а не пристрою (різниця тут ≈ 12 год)
+      const [sub, srvT, devT] = await page.evaluate(() => [document.querySelector('.page-head').textContent, UI.fmt.time(App.now()), UI.fmt.time(new Date())]);
+      assert.notEqual(srvT, devT);
+      assert.match(sub, new RegExp('дані на ' + srvT.replace(':', ':')));
+      await page.goto(srv.url + '#/line/L2');
+      await page.waitForSelector('.op-status.st-run');
+      assert.equal(await page.$('.op-warn.bad [data-act=late-check]'), null, 'на екрані лінії немає «Лінія працює без чек-листа»');
+    }));
   });
 }

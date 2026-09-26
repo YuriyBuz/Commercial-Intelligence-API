@@ -43,6 +43,15 @@ var Operator = (function () {
     if (n === null || n === undefined || isNaN(n)) return '—';
     return fmt.num(n, Math.abs(n) >= 1000 ? 0 : 3) + (unit ? ' ' + unit : '');
   }
+  /* накопичувальний показник, менший за останній відомий: помилка вводу або лічильник скинули / замінили */
+  function lowerThanLast(m, x) { return !!m && m.mode !== 'inc' && typeof m.value === 'number' && typeof x === 'number' && x < m.value; }
+  /* list [{m, v}] → Promise<true — «лічильник скинуто / замінено» (новий відлік), false — виправити число>.
+     Без позначки сервер такий показник не прийме: інакше строк ТО «за лічильником» мовчки став би «У нормі» */
+  function askReset(list) {
+    return UI.confirm({ title: 'Показник менший за попередній', cancel: 'Виправити число', ok: 'Лічильник скинуто / замінено',
+      html: '<p>' + list.map(function (x) { return '<b>' + esc(x.m.name) + '</b>: ' + esc(numText(x.v, x.m.unit_label)) + ' — а попередній ' + esc(numText(x.m.value, x.m.unit_label)); }).join('<br>') +
+        '.</p><p class="dim">Якщо це помилка — виправте число. Якщо лічильник замінили або скинули — позначте це: для строків ТО напрацювання продовжиться від нового показника.</p>' });
+  }
   function rangeText(it) {
     var u = it.unit_label ? ' ' + it.unit_label : '';
     var lo = it.min !== null && it.min !== undefined, hi = it.max !== null && it.max !== undefined;
@@ -714,9 +723,9 @@ var Operator = (function () {
             return openWorkForm({ line_id: l.id, mode: 'setup', operator: op, requireOperator: false, started: s.since, product: s.product,
               title: 'Налаштування без запуску', heading: 'Запис про налаштування', submitLabel: 'Зберегти і зупинити лінію' }).then(function (res) {
               if (!res) return;
+              // лінія не працювала: це ще підготовка — чек-лист запуску лишається чинним, оператор — на планшеті
               writeEvent(l.id, op, { state: 'off', ref_id: res.ids[0] });
               savedToast('Налаштування записано, лінія не працює');
-              endShift(l.id, op);
             });
           }
         }
@@ -848,9 +857,10 @@ var Operator = (function () {
         heading: 'Миття завершено', submitLabel: ran ? 'Зберегти і завершити роботу' : 'Зберегти і зупинити лінію' }).then(function (res) {
         if (!res) return;
         if (ran === true) { goCheck(l.id, 'end'); return; }
+        // миття перед запуском (лінія не працювала) — підготовка, а не завершення роботи:
+        // чек-лист запуску лишається чинним, оператор — на планшеті
         writeEvent(l.id, op, { state: 'off', ref_id: res.ids[0] });
         savedToast('Миття записано, лінія не працює');
-        endShift(l.id, op);
       });
     });
   }
@@ -1082,9 +1092,15 @@ var Operator = (function () {
         else mvals[k.slice(3)] = v[k];
       });
       if (UI.setErrors(root, e)) return Promise.resolve(false);
-      var lower = Object.keys(mvals).filter(function (id) { var m = App.meter(id); return m && m.mode !== 'inc' && typeof m.value === 'number' && mvals[id] < m.value; });
-      var confirmLower = lower.length ? UI.confirm({ title: 'Показник менший за попередній', ok: 'Так, зберегти',
-        text: lower.map(function (id) { var m = App.meter(id); return m.name + ': ' + numText(mvals[id]) + ' < ' + numText(m.value); }).join('; ') + '. Можливо, лічильник замінили або скинули. Зберегти?' }) : Promise.resolve(true);
+      var lower = Object.keys(mvals).filter(function (id) { return lowerThanLast(App.meter(id), mvals[id]); });
+      var resetIds = {};
+      var confirmLower = lower.length ? askReset(lower.map(function (id) { return { m: App.meter(id), v: mvals[id] }; })).then(function (yes) {
+        if (yes) { lower.forEach(function (id) { resetIds[id] = 1; }); return true; }
+        var le = {};
+        lower.forEach(function (id) { le['mv_' + id] = 'Менше за попередній (' + numText(App.meter(id).value) + ') — виправте число'; });
+        UI.setErrors(root, le);
+        return false;
+      }) : Promise.resolve(true);
       var needOp = o.requireOperator === false ? Promise.resolve(op || { name: v.performer, staff_id: staffIdByName(v.performer) }) : App.requireOperator(l.id);
       return confirmLower.then(function (yes) {
         if (!yes) return false;
@@ -1105,7 +1121,8 @@ var Operator = (function () {
               var r = App.rule(id);
               if (!r) return;
               works.push(mk({ rule_id: r.id, work_type: many ? r.work_type : (v.work_type || r.work_type), unit_id: many ? r.unit_id : (v.unit_id || r.unit_id), title: many ? r.title : v.title,
-                downtime_min: i === 0 ? v.downtime_min : null, meter_value: r.meter_id && mvals[r.meter_id] !== undefined ? mvals[r.meter_id] : undefined }));
+                downtime_min: i === 0 ? v.downtime_min : null, meter_value: r.meter_id && mvals[r.meter_id] !== undefined ? mvals[r.meter_id] : undefined,
+                meter_reset: r.meter_id && resetIds[r.meter_id] ? true : undefined }));
             });
           } else {
             works.push(mk({ work_type: v.work_type, unit_id: v.unit_id, title: v.title, downtime_min: v.downtime_min }));
@@ -1210,12 +1227,20 @@ var Operator = (function () {
           });
           if (UI.setErrors(box, e)) return false;
           if (!vals.length) { mm.setError('Введіть хоча б один показник'); return false; }
-          var lower = vals.filter(function (x) { return x.m.mode !== 'inc' && typeof x.m.value === 'number' && x.v < x.m.value; });
-          var ok = lower.length ? UI.confirm({ title: 'Показник менший за попередній', ok: 'Так, зберегти',
-            text: lower.map(function (x) { return x.m.name + ': ' + numText(x.v) + ' < ' + numText(x.m.value); }).join('; ') + '. Можливо, лічильник замінили або скинули. Зберегти?' }) : Promise.resolve(true);
+          var lower = vals.filter(function (x) { return lowerThanLast(x.m, x.v); });
+          var ok = lower.length ? askReset(lower) : Promise.resolve(true);
           return ok.then(function (yes) {
-            if (!yes) return false;
-            vals.forEach(function (x) { write('reading', { line_id: lineId, meter_id: x.m.id, value: x.v, mode: x.m.mode || 'abs', operator: op.name, note: v.note }); });
+            if (!yes) {
+              var le = {};
+              lower.forEach(function (x) { le['m_' + x.m.id] = 'Менше за попередній (' + numText(x.m.value) + ') — виправте число'; });
+              UI.setErrors(box, le);
+              return false;
+            }
+            vals.forEach(function (x) {
+              var p = { line_id: lineId, meter_id: x.m.id, value: x.v, mode: x.m.mode || 'abs', operator: op.name, note: v.note };
+              if (lowerThanLast(x.m, x.v)) p.reset = true;
+              write('reading', p);
+            });
             savedToast(vals.length > 1 ? 'Показники збережено' : 'Показник збережено');
             return true;
           });
@@ -1317,7 +1342,7 @@ var Operator = (function () {
     var then = thenFor(occ, s.state, p.then);
     var workBlock = s.state === 'setup' && occ !== 'end' && then === 'run';
     var started = now().toISOString();
-    var A = {}, N = {}, MV = {};
+    var A = {}, N = {}, MV = {}, MR = {};     // MR — «лічильник скинуто / замінено» (підтверджено для поточного числа)
     var itemById = {};
     items.forEach(function (it) { itemById[it.id] = it; });
     var reqItems = items.filter(function (it) { return it.required !== false; });
@@ -1447,7 +1472,7 @@ var Operator = (function () {
       if (!n) return;
       if (n.indexOf('v_') === 0) { var id = n.slice(2); A[id] = t.value; upd(id); progress(); }
       else if (n.indexOf('n_') === 0) { N[n.slice(2)] = t.value; upd(n.slice(2)); }
-      else if (n.indexOf('mv_') === 0) { MV[n.slice(3)] = t.value; }
+      else if (n.indexOf('mv_') === 0) { MV[n.slice(3)] = t.value; delete MR[n.slice(3)]; }
       else if (n === 'wb_on') { /* нижче */ }
     });
     root.addEventListener('change', function (e) {
@@ -1539,10 +1564,22 @@ var Operator = (function () {
     }
     function submit() {
       if (!validate()) return;
-      App.requireOperator(l.id).then(function (op) {
-        if (!op || !ctx.alive()) return;
-        root.querySelector('#ckWho').textContent = op.name;
-        summary(op);
+      var low = meters.filter(function (m) { return nz(MV[m.id]) && !MR[m.id] && lowerThanLast(m, UI.num(MV[m.id])); });
+      (low.length ? askReset(low.map(function (m) { return { m: m, v: UI.num(MV[m.id]) }; })) : Promise.resolve(true)).then(function (yes) {
+        if (!ctx.alive()) return;
+        if (!yes) {
+          var me = {};
+          low.forEach(function (m) { me['mv_' + m.id] = 'Менше за попередній (' + numText(m.value) + ') — виправте число'; });
+          UI.setErrors(root.querySelector('.op-mtrs'), me);
+          flash(root.querySelector('.op-mtrs'));
+          return;
+        }
+        low.forEach(function (m) { MR[m.id] = true; });
+        App.requireOperator(l.id).then(function (op) {
+          if (!op || !ctx.alive()) return;
+          root.querySelector('#ckWho').textContent = op.name;
+          summary(op);
+        });
       });
     }
     function summary(op) {
@@ -1556,7 +1593,10 @@ var Operator = (function () {
       });
       var result = crit ? 'fail' : failed + oor > 0 ? 'remarks' : 'ok';
       var probs = res.filter(function (x) { return x.r.ok === false; });
-      var head = result === 'ok' ? '<div class="op-sum-res ok">' + icon('check', 30) + '<div><b>Усе в нормі</b><span>Зауважень немає</span></div></div>' :
+      var resets = meters.filter(function (m) { return nz(MV[m.id]) && MR[m.id] && lowerThanLast(m, UI.num(MV[m.id])); });
+      var head = result === 'ok' && resets.length ? '<div class="op-sum-res soon">' + icon('alert', 30) + '<div><b>Пункти в нормі · лічильник скинуто</b><span>' +
+          esc(resets.map(function (m) { return m.name; }).join(', ')) + ': показник менший за попередній — позначено «скинуто / замінено». Перевірте число.</span></div></div>' :
+        result === 'ok' ? '<div class="op-sum-res ok">' + icon('check', 30) + '<div><b>Усе в нормі</b><span>Зауважень немає</span></div></div>' :
         result === 'remarks' ? '<div class="op-sum-res soon">' + icon('alert', 30) + '<div><b>Є зауваження</b><span>' + (failed ? failed + ' ' + fmt.plural(failed, ['зауваження', 'зауваження', 'зауважень']) : '') +
           (failed && oor ? ' · ' : '') + (oor ? oor + ' поза нормою' : '') + '. Керівництво побачить їх у звіті.</span></div></div>' :
           '<div class="op-sum-res bad">' + icon('alert', 30) + '<div><b>Чек-лист не пройдено</b><span>Зауваження в критичних пунктах. Запуск — лише під відповідальність оператора.</span></div></div>';
@@ -1571,8 +1611,9 @@ var Operator = (function () {
       }).join('') + '</div>' : '';
       var rds = meters.filter(function (m) { return nz(MV[m.id]); });
       var rlist = rds.length ? '<div class="op-sum-rd">' + rds.map(function (m) {
-        var x = UI.num(MV[m.id]), low = m.mode !== 'inc' && typeof m.value === 'number' && x < m.value;
-        return '<div>' + icon('gauge', 18) + esc(m.name) + ': <b>' + esc(numText(x, m.unit_label)) + '</b>' + (low ? ' <span class="c-warn">(менше за попередній ' + esc(numText(m.value)) + ')</span>' : '') + '</div>';
+        var x = UI.num(MV[m.id]), low = lowerThanLast(m, x);
+        return '<div>' + icon('gauge', 18) + esc(m.name) + ': <b>' + esc(numText(x, m.unit_label)) + '</b>' +
+          (low ? ' <span class="c-warn">(лічильник скинуто / замінено; попередній ' + esc(numText(m.value)) + ')</span>' : '') + '</div>';
       }).join('') + '</div>' : (meters.length ? '<div class="op-sum-rd dim">Показники лічильників не внесено.</div>' : '');
       var failStart = result === 'fail' && then === 'run';
       var html = head + counts + plist + rlist +
@@ -1609,7 +1650,9 @@ var Operator = (function () {
         return { item_id: it.id, value: nz(A[it.id]) ? String(A[it.id]).trim() : '', note: nz(N[it.id]) ? N[it.id].trim() : '' };
       });
       var readings = meters.filter(function (m) { return nz(MV[m.id]) && UI.num(MV[m.id]) !== null; }).map(function (m) {
-        return { id: Api.newId(), meter_id: m.id, value: UI.num(MV[m.id]), mode: m.mode || 'abs' };
+        var rd = { id: Api.newId(), meter_id: m.id, value: UI.num(MV[m.id]), mode: m.mode || 'abs' };
+        if (MR[m.id] && lowerThanLast(m, rd.value)) rd.reset = true;
+        return rd;
       });
       var cur = App.lineStatus(l.id);
       // робота з налаштування / переналаштування (як у журналі робіт)

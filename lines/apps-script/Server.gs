@@ -14,13 +14,16 @@
    3. Налаштування проєкту (⚙) → увімкніть «Показувати файл маніфесту appsscript.json у редакторі»,
       відкрийте appsscript.json і замініть його вміст на lines/apps-script/appsscript.json.
       (Якщо редактор не приймає пояс «Europe/Kyiv», вкажіть «Europe/Kiev».)
-   4. Оберіть функцію setup → «Виконати» (або оновіть таблицю й скористайтеся меню
-      «Облік ліній → Початкове налаштування») і надайте дозволи:
-        «Перевірити дозволи» → оберіть свій обліковий запис. Google покаже попередження
+   4. Відкрийте файл Server.gs (список функцій над кодом показує функції лише відкритого файлу:
+      у Core.gs і appsscript.json функції setup немає), оберіть функцію setup → «Виконати» (або оновіть
+      таблицю й скористайтеся меню «Облік ліній → Початкове налаштування») і надайте дозволи:
+        «Перевірити дозволи» (з меню таблиці — «Потрібна авторизація» → «Продовжити») → оберіть свій
+        обліковий запис. Google покаже попередження
         «Google не перевірив цей застосунок» (Google hasn't verified this app) — це нормально для
         власного скрипту: натисніть «Додатково» (Advanced) → «Перейти до <назва проєкту> (небезпечно)»
         → «Дозволити». Буде створено аркуші, налаштування, токен доступу, PIN керівника й тригери
-        (щоденний звіт, щогодинна перевірка строків ТО).
+        (щоденний звіт, щогодинна перевірка строків ТО). Підсумок: із меню — у вікні таблиці; з редактора —
+        у «Журналі виконання» внизу редактора (вікна там немає).
    5. Розгорнути → Нове розгортання → тип «Веб-застосунок»:
         Виконувати від імені: «Я» (Me)   ·   Хто має доступ: «Будь-хто» (Anyone).
       Скопіюйте URL веб-застосунку — він закінчується на /exec — і вставте його в меню
@@ -32,7 +35,8 @@
       про зауваження в чек-листах (якщо задано «Лінії» — лише про ці лінії). Без жодної адреси
       листи-нагадування НЕ надсилаються. Перевірка — меню «Облік ліній → Надіслати звіт зараз».
    7. Меню «Облік ліній → Показати токен і PIN» — введіть адресу (/exec) і токен на планшетах
-      («Налаштування пристрою» → робота з Google-таблицею). PIN — для розділу «Керівництво».
+      (застосунок → «Google-таблиця підприємства» → «Далі» → «Адреса веб-застосунку (/exec)» і «Токен доступу»
+      → «Перевірити зв’язок»). PIN — для розділу «Керівництво» (4–8 цифр).
    8. (Необовʼязково) «Облік ліній → Заповнити демо-даними» — лише в порожню таблицю.
    ОНОВЛЕННЯ КОДУ: замініть Core.gs / Server.gs (і appsscript.json, якщо змінився) → знову
    «Облік ліній → Початкове налаштування» (дані не зачіпає; підтвердить нові дозволи) → Розгорнути →
@@ -54,13 +58,15 @@
    Без окремих дозволів: LockService, CacheService, PropertiesService, ContentService, Utilities,
    Session.getScriptTimeZone, Logger / console.
 
-   Властивості скрипту (Script Properties): API_TOKEN, ADMIN_PIN (створює setup), API_URL (адреса
+   Властивості скрипту (Script Properties): API_TOKEN, ADMIN_PIN (створює setup; лише 4–8 цифр — інший
+   на планшеті не ввести, setup і «Показати токен і PIN» про це попередять), API_URL (адреса
    …/exec — меню «Вказати адресу веб-застосунку»); службові: DAILY_TRIGGER (година й пояс
-   тригера звіту), LAST_DAILY (день останнього щоденного звіту — для надолуження пропущеного).
+   тригера звіту), LAST_DAILY (день, за який щоденний звіт уже надіслано або не потрібен; невдале
+   надсилання за наявності отримувачів — ліміт чи збій пошти — щогодинна задача повторює до кінця дня).
    Лише оголошення var / function на верхньому рівні (порядок завантаження файлів не важливий).
    ===================================================================== */
 
-var SERVER_VERSION = '1.0.0';
+var SERVER_VERSION = '1.1.0';
 var LOCK_WAIT_MS = 25000;               // скільки чекати блокування перед відповіддю LOCKED
 var CHUNK_ROWS = 500;                   // since(): читання журналу знизу вгору порціями
 var UPDATE_GAP_ROWS = 50;               // update(): рядки ближче за це — одна група
@@ -149,6 +155,7 @@ function jsonpOut_(cb, o) {
 
 /* =====================================================================
    Обробка запиту: токен → PIN керівника → дія ядра (запис — під блокуванням) → листи
+   (читання — без блокування; лише якщо воно знайшло рядки таблиці без відліку — persistInit_)
    ===================================================================== */
 function handleRequest_(req) {
   try {
@@ -182,6 +189,7 @@ function handleRequest_(req) {
       res = app.handle(req, ctx);
       takeNotify_(res);
       if (action === 'ping' && res && res.ok) res.server = SERVER_VERSION;
+      persistInit_(store, app);
     }
     return res;
   } catch (e) {
@@ -190,6 +198,15 @@ function handleRequest_(req) {
     }
     return LinesCore.util.errorResponse(e);
   }
+}
+
+/* READ-дія знайшла рядки регламенту / агрегатів, додані прямо в таблиці без відліку («Відлік від дати» /
+   «Створено»): ядро обчислило відлік лише в пам'яті. Записуємо його одразу під коротким блокуванням —
+   інакше до найближчого запису чи щогодинної задачі кожне оновлення планшета брало б відлік «зараз»
+   (0 % інтервалу). Зайнято — не чекаємо: наступний запит спробує ще раз */
+function persistInit_(store, app) {
+  if (!app.pendingInit || !app.pendingInit()) return;
+  try { store.lock(function () { app.initSheetRows(); }, 3000); } catch (e) { console.warn('Відлік рядків таблиці не записано: ' + errText_(e)); }
 }
 
 function errOut_(code, message) {
@@ -205,7 +222,7 @@ function adminAuth_(req, props) {
   var dk = 'fl_adm_' + LinesCore.sha256('dev:' + str_(req.device)).slice(0, 32), gk = 'fl_adm_all';
   var d = failGet_(cache, dk), g = failGet_(cache, gk);
   if (d.n >= ADMIN_FAILS_PER_DEVICE || g.n >= ADMIN_FAILS_GLOBAL) return { admin: false, limited: true };
-  var pin = props.getProperty('ADMIN_PIN') || '';
+  var pin = str_(props.getProperty('ADMIN_PIN'));
   if (pin && safeEq_(given, pin)) return { admin: true, limited: false };
   var h = LinesCore.sha256('pin:' + given).slice(0, 16);
   if (d.last !== h) {
@@ -795,13 +812,13 @@ SheetStore.prototype.replace = function (t, rows) {
 };
 
 /* виключне виконання (LockService); вкладені виклики — без повторного блокування */
-SheetStore.prototype.lock = function (fn) {
+SheetStore.prototype.lock = function (fn, waitMs) {
   if (this.depth_ > 0) {
     this.depth_++;
     try { return fn(); } finally { this.depth_--; }
   }
   var lk = LockService.getScriptLock();
-  if (!lk.tryLock(LOCK_WAIT_MS)) throw LinesCore.util.AppError('LOCKED');
+  if (!lk.tryLock(waitMs || LOCK_WAIT_MS)) throw LinesCore.util.AppError('LOCKED');
   this.depth_ = 1;
   this.forget_();                        // прочитане до блокування могло застаріти
   try {
@@ -1040,7 +1057,8 @@ function runJob_(name, fn) {
 function dailyJob() {
   return runJob_('dailyJob', function (store, app) { return dailyWork_(store, app, new Date()); });
 }
-/* тіло щоденної задачі; успіх позначається днем у LAST_DAILY (ключ 'digest:<день>' не дасть другого листа) */
+/* тіло щоденної задачі; успіх (або звіт не потрібен / немає отримувачів) позначається днем у LAST_DAILY
+   (ключ 'digest:<день>' не дасть другого листа); невдале надсилання — ні, його повторить hourlyJob */
 function dailyWork_(store, app, now) {
   var S = app.settings(), res = { ok: true, digest: 'none', plan: 0 };
   var d = app.buildDigest(now);
@@ -1056,7 +1074,10 @@ function dailyWork_(store, app, now) {
     if (r.error) res.error = r.error;
   }
   res.plan = app.refreshPlan().count;
-  PropertiesService.getScriptProperties().setProperty('LAST_DAILY', app.timeKit().key(now));
+  // отримувачі є, а лист не пішов (ліміт Gmail, збій пошти) — день не позначаємо: щогодинна задача повторить
+  // (той самий ключ 'digest:<день>' не дасть другого листа після успіху). Без отримувачів повтор марний.
+  res.retry = res.digest === 'error' && !!(res.to && res.to.length);
+  if (!res.retry) PropertiesService.getScriptProperties().setProperty('LAST_DAILY', app.timeKit().key(now));
   return res;
 }
 function digestHour_(S) { return Math.max(0, Math.min(23, Math.round(+S.digest_hour || 0))); }
@@ -1154,8 +1175,9 @@ function setup() {
         '\nНалаштувань додано: ' + add.length + '.' +
         (gen.length ? '\nЗгенеровано: ' + gen.join(' і ') + '.' : '') +
         '\nТригери: щоденний звіт о ' + S.digest_hour + ':00 (' + S.tz + '), щогодинна перевірка строків ТО.' +
-        (scriptTz && scriptTz !== S.tz ? '\nУвага: пояс скрипту (' + scriptTz + ') відрізняється від поясу заводу (' + S.tz +
+        (scriptTz && !sameTz_(scriptTz, S.tz) ? '\nУвага: пояс скрипту (' + scriptTz + ') відрізняється від поясу заводу (' + S.tz +
           '). Змініть timeZone в appsscript.json.' : '') +
+        (pinOk_(props.getProperty('ADMIN_PIN')) ? '' : '\nУвага: ' + pinWarn_()) +
         (tzNote ? '\nПояс таблиці не змінено: ' + tzNote : '') +
         (full ? '\nУвага: ' + full : '') +
         '\n\nДалі:\n' + steps.map(function (s, i) { return (i + 1) + '. ' + s; }).join('\n');
@@ -1248,8 +1270,9 @@ function showSecrets() {
   var msg = !token ? 'Спершу виконайте «' + MENU_TITLE + ' → Початкове налаштування».'
     : 'Адреса API (URL веб-застосунку, …/exec):\n' + addr +
       '\n\nТокен доступу: ' + token + '\nPIN керівника: ' + pin +
-      '\n\nНа планшеті: «Налаштування пристрою» → робота з Google-таблицею → вставте адресу й токен. ' +
-      'PIN — для розділу «Керівництво». Не передавайте токен і PIN стороннім.';
+      '\n\nНа планшеті: відкрийте застосунок → «Google-таблиця підприємства» → «Далі» → вставте «Адреса веб-застосунку (/exec)» ' +
+      'і «Токен доступу» → «Перевірити зв’язок». PIN — для розділу «Керівництво». Не передавайте токен і PIN стороннім.' +
+      (pin && !pinOk_(pin) ? '\n\n' + pinWarn_() : '');
   say_('Токен і PIN', msg);
   return { ok: !!token, token: token, pin: pin, url: url, message: msg };
 }
@@ -1477,6 +1500,18 @@ function newToken_() {
     randomBytes_(32).forEach(function (b) { if (s.length < 24 && b < 228) s += abc.charAt(b % 57); });
   }
   return s;
+}
+/* PIN керівника: вводиться на планшеті цифровою клавіатурою — лише 4–8 цифр */
+function pinOk_(pin) { return /^\d{4,8}$/.test(str_(pin)); }
+function pinWarn_() {
+  return 'PIN керівника (властивість скрипту ADMIN_PIN) має складатися з 4–8 цифр — інакше на планшеті його не ввести. ' +
+    'Змініть його: ⚙ Налаштування проєкту → Властивості скрипту → ADMIN_PIN (або видаліть властивість і знову виконайте ' +
+    '«' + MENU_TITLE + ' → Початкове налаштування» — буде згенеровано новий).';
+}
+/* той самий часовий пояс (Europe/Kyiv і його давня назва Europe/Kiev — один пояс) */
+function sameTz_(a, b) {
+  var n = function (z) { z = str_(z); return z === 'Europe/Kiev' ? 'Europe/Kyiv' : z; };
+  return n(a) === n(b);
 }
 function newPin_() {
   var s = '';

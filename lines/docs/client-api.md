@@ -10,7 +10,7 @@
 
 ## 0. Загальні правила
 
-* Порядок скриптів (`index.html`, усі з однаковою версією `?v=N`, зараз `?v=2`): `core.js` → `local-store.js` → `api.js` → `ui.js` →
+* Порядок скриптів (`index.html`, усі з однаковою версією `?v=N`, зараз `?v=3`): `core.js` → `local-store.js` → `api.js` → `ui.js` →
   `app.js` → `operator.js` → `manager.js`. Стилі: `styles.css` → `operator.css` → `manager.css`.
 * Збірки немає. Клієнтський код — ES2017 (`const`/`let`, стрілки, шаблонні рядки дозволені;
   **без** `?.`, `??`, `import/export`). Кожен файл — IIFE або один глобал.
@@ -112,7 +112,7 @@ App.route(pattern, handler, opts?)
 
 | id | Розділ | Query |
 |---|---|---|
-| `overview` | Огляд: KPI, стан ліній, матриця чек-листів, години за станами, причини простоїв | — |
+| `overview` | Огляд: KPI, стан ліній, матриця чек-листів, години за станами, причини простоїв, звіт по роботах і агрегатах, CSV | `days=7\|14\|30\|62` або `from`/`to=YYYY-MM-DD` (свій період, ≤ 62 дні, не пізніше сьогодні) |
 | `maintenance` | ТО і ППР (псевдоніми **`maint`**, `plan` — лише для сумісності) | `tab=due\|plan\|year`, `status=due\|soon\|ok\|none`, `line=<id>` |
 | `journal` | Журнал (псевдонім `history`) | `period=today\|7\|30\|90`, `from`/`to=YYYY-MM-DD`, `line`, `unit`, `types=events,checks,works,readings`, `work_type`, `q` |
 | `checks` | Чек-листи | `line=<id>` |
@@ -152,9 +152,9 @@ App.route(pattern, handler, opts?)
 | `App.staffFor(lineId)` | персонал, допущений до лінії (`line_ids` порожній = усі) |
 | `App.lineStatus(lineId)` | статус лінії **з оптимістичним накладанням черги** (нижче) |
 | `App.dueFor(lineId)` | due-обʼєкти лінії з `state.due` (відсортовані: due, soon, ok, none) |
-| `App.now()` | `Date` з поправкою годинника (= `Api.now()`) |
+| `App.now()` | `Date` з поправкою годинника (= `Api.now()`). Моменти, запамʼятані як `Date.now()` пристрою (напр. `Api.net().boot_at`), для показу переводьте в час сервера: `+ Api.skew()` («дані на …» так і робить) |
 | `App.liveTodayHours(status)` | години роботи за СЬОГОДНІ (день заводу): `today_h` + робота після моменту bootstrap; bootstrap учорашній (офлайн через північ) → рахується від півночі |
-| `App.checkMissing(status)` | лінія працює без чек-листа запуску — одне правило для плитки, екрана лінії й таблиці керівника: запуск позначено «без чек-листа» (або невідомо, а робота почалася в межах `checklist_valid_hours`) і відтоді чинного чек-листа запуску не пройдено. Звичайна довга зміна після чек-листа — не порушення (є `long_run`) |
+| `App.checkMissing(status)` | лінія працює без чек-листа запуску — одне правило для плитки, екрана лінії й таблиці керівника: `status.start_uncovered` (запуск ЦІЄЇ роботи позначено «без чек-листа» і відтоді чек-листа запуску не пройдено; пізній чек-лист закриває питання). Не за часом від `work_since`: запуск із чек-листом, що вже минув (довга підготовка, простій і відновлення), — не порушення; довга зміна — окремо `long_run`. Сервер старішої версії (без поля) — лише `flag` поточної події |
 | `App.refresh()` | надіслати чергу + свіжий bootstrap → `Promise<відповідь>` |
 | `App.mode()` | `'local'` \| `'remote'` \| `''` |
 
@@ -163,20 +163,25 @@ App.route(pattern, handler, opts?)
 ```
 { line_id, state, since /*ISO*/, product, operator, staff_id, event_id, reason, note, flag,
   cum_h /*мотогодини на момент as_of*/, starts, today_h, last_check:{id,ts,occasion,result}|null,
-  start_check_valid /*є чек-лист запуску в межах checklist_valid_hours, новіший за останній перехід лінії в «Не працює»*/,
-  long_run, work_since,
+  start_check_valid /*є чек-лист запуску в межах checklist_valid_hours, новіший за останнє завершення роботи лінії*/,
+  long_run /*робота (не «Не працює») триває ≥ long_run_hours*/, work_since /*ISO: початок поточної роботи (вихід із «Не працює»)*/,
+  ran_since_off /*лінія була в «Працює» / «Простій» після останнього «Не працює»: наступне «Працює» — НЕ запуск*/,
+  start_uncovered /*запуск поточної роботи — «без чек-листа», і чек-листа запуску відтоді не було (App.checkMissing)*/,
   as_of /*ISO: коли пораховано (boot.now)*/, pending /*к-сть неnадісланих операцій цієї лінії*/ }
 ```
 
-`start_check_valid`: чек-лист запуску «витрачається» першим переходом лінії в «Не працює» (з іншого стану) після нього —
-нова зміна потребує нового чек-листа, навіть якщо `checklist_valid_hours` ще не минули.
+`start_check_valid`: чек-лист запуску «витрачається» **завершенням роботи** — першим переходом у «Не працює» після
+того, як лінія працювала («Працює» / «Простій») — нова зміна потребує нового чек-листа, навіть якщо
+`checklist_valid_hours` ще не минули. Миття / налаштування / ТО без запуску → «Не працює» чек-лист не витрачають
+(підготовка до роботи). `ran_since_off` потрібен клієнту, щоб так само вирішити для подій черги.
 
 Накладання: кожна операція черги `event` змінює `state/since/product/operator/staff_id/reason/note/
-event_id/flag/work_since`; `checklist` — `last_check` (`result:null, pending:true`),
-`start_check_valid=true` для `start`, і `then_event` як подію. `flag:'no_checklist'` — як у ядрі, лише для
+event_id/flag/work_since/start_uncovered`; `checklist` — `last_check` (`result:null, pending:true`),
+`start_check_valid=true` і `start_uncovered=false` для `start`, і `then_event` як подію. `flag:'no_checklist'` — як у ядрі, лише для
 ЗАПУСКУ (перше «Працює» після «Не працює» без чинного чек-листа, коли `require_start_checklist`), а не для
-повернення в роботу після налаштування / ремонту; подія черги, що переводить лінію в «Не працює» з іншого стану
-(напр., офлайн «Завершити роботу»), скидає `start_check_valid` у `false` (повторне «Не працює» — ні); порядок черги (FIFO)
+повернення в роботу після налаштування / ремонту; подія черги, що переводить у «Не працює» лінію, яка працювала
+(`ran_since_off`; напр., офлайн «Завершити роботу»), скидає `start_check_valid` у `false` (повторне «Не працює»
+чи «Не працює» після миття / налаштування без запуску — ні); порядок черги (FIFO)
 дає правильну відповідь і для «завершити → чек-лист запуску» в одній черзі. Після підтвердження сервер
 повертає справжній `status`, і він одразу потрапляє в `App.state` (подія `boot`, `meta.source:'ack'`).
 
@@ -184,6 +189,11 @@ Due-обʼєкт (ядро): `{rule_id, line_id, unit_id, title, work_type, part
 pct /*частка, 1 = 100 %*/, due_date, forecast, due_basis, ref_date, ref_hours, ref_meter, driver,
 criteria:[{kind:'days'|'hours'|'meter', interval, used, left, pct, due_date, unit_label, forecast}],
 summary /*«залишилось 5 дн. · 38 мотогод»*/, overdue_days, last_date, last_work_id}`.
+`summary` для календаря — різниця **календарних днів** заводу («строк настав сьогодні», «прострочено на 1 дн.» —
+уже наступного дня після строку). Перевищений інтервал за мотогодинами / лічильником: `due_date` — момент, коли поріг
+справді перейшли (журнал стану / інтерполяція між двома показниками), `forecast:false`. Напрацювання лічильника
+(`used`) ніколи не відʼємне: після показника з `reset` («лічильник скинуто / замінено») рахунок іде з нового числа
+й додається до вже набраного; зниження без позначки (напр., внесене в таблиці) — нова база без приросту.
 
 ---
 
@@ -233,18 +243,25 @@ summary /*«залишилось 5 дн. · 38 мотогод»*/, overdue_days,
 Корисні дії для екранів (відповіді — SPEC §3.4 + нотатки ядра):
 `line {line_id, days≤62}` → `{events, checks, works, readings, timeline:[{state,from,to,hours,product,reason}], days:[{day, hours:{state:h}, starts, checks}]}`;
 `check_detail {id, ts?}` → `{check, answers}`; `history {from?, to?, line_id?, unit_id?, types?, work_type?, q?, limit?, include_void?}`;
-`dashboard {days}`; `plan {from?, to?}`; ADMIN: `save {table,row}`, `remove`, `void {table,id,note,ts?}` (передавайте `ts`
+`dashboard {days?, from?, to?}` (`days` 1–62, типово 14 — останні дні до сьогодні; або минулий період `from`/`to` = `YYYY-MM-DD`:
+не довше 62 днів — довший обрізається до 62 днів, що закінчуються в `to`; `to` не пізніше сьогодні; недійсні дати ігноруються.
+Відповідь має `from`, `to` — межі періоду; клієнт, що не бачить їх у відповіді, має справу зі старим сервером; `status` і `due` —
+завжди «зараз»); `plan {from?, to?}`; ADMIN: `save {table,row}`, `remove`, `void {table,id,note,ts?}` (передавайте `ts`
 запису — сервер знайде його вікном навколо цього часу, а не читанням усього журналу),
 `settings_save {values}`, `digest_preview`, `notices {limit}`, `recompute`, `bootstrap` з `{admin:true}`
-(неактивні записи, `manager_emails`, `config_issues`).
+(неактивні записи, `manager_emails`, `config_issues`: `[{table, sheet, id, name, problem: 'no_id'|'duplicate'|'bad_pin'|'no_occasion'}]`).
+`save` приймає рядок, доданий у таблиці з ID не за шаблоном (кирилиця, пробіл), — він редагується як є; НОВИЙ ID — лише
+`[A-Za-z0-9_.:-]`. `notices` → `{notices:[{id, ts, kind, key, to, subject, status:'sent'|'error'|'preview', error}]}`
+(в аркуші «Сповіщення» статус — українською: «Надіслано», «Помилка», «Демо: не надсилалося»).
 Для `save` НОВОГО рядка передавайте `row.id = Api.newId()` — тоді повтор запиту не створить дубль.
 
 Відповіді «Н/З» (не застосовується) рахуються окремо:
 * рядок чек-листа (`checks` у `line`, `history`, `check_detail`): `{id, ts, started, line_id, occasion, operator, staff_id, product,
   result:'ok'|'remarks'|'fail', total, failed, out_of_range, missing, na /*к-сть відповідей «Н/З»; стовпець аркуша «Н/З»*/,
   comment, device, created, void, void_note}`;
-* `dashboard` → `compliance[line_id][]` (дні): `{day, status, starts, covered, run_h, uncovered, forced,
-  checks:[{id, ts, occasion, result, na}]}`;
+* `dashboard` → `compliance[line_id][]` (дні): `{day, status, starts, covered, run_h, uncovered, forced, long_runs,
+  checks:[{id, ts, occasion, result, na}]}`; `long_runs` — робіт, що почалися цього дня й тривали (чи ще тривають)
+  довше за `long_run_hours` без завершення (лише зміни, у яких лінія працювала); разом з `uncovered > 0` дають `status:'miss'`;
 * `dashboard` → `stats[line_id]`: `{…, checks, checks_ok, checks_remarks, checks_fail, out_of_range, checks_na}`.
 
 ### 4.2 Запис оператора — `Api.write(action, params, opts?)`
@@ -275,11 +292,17 @@ Api.write('event', { line_id, state: 'stop', reason: 'Перерва', note, ope
 Api.write('checklist', { line_id, occasion: 'start', started, operator: op.name, staff_id: op.staff_id, product, comment,
   answers: [{ item_id, value: 'ok'|'fail'|'na'|'12,5'|'текст'|'варіант', note }],
   then_event: { state: 'run', product }, readings: [{ meter_id, value, mode }], forced: false });
-// робота (ТО за регламентом; meter_value — показник лічильника правила)
+// робота (ТО за регламентом; meter_value — показник лічильника правила; meter_reset — лічильник скинуто / замінено)
 Api.write('work', { line_id, unit_id, work_type: 'to', rule_id, title, description, parts, performer: op.name,
-  staff_id: op.staff_id, started, duration_min, downtime_min, status: 'done', meter_value });
+  staff_id: op.staff_id, started, duration_min, downtime_min, status: 'done', meter_value, meter_reset });
 Api.write('reading', { meter_id, value: 1200, mode: 'inc', operator: op.name, note });
+Api.write('reading', { meter_id, value: 15, mode: 'abs', reset: true, operator: op.name });   // новий відлік
 ```
+
+Накопичувальний (`abs`) показник, менший за попередній, сервер приймає лише з `reset:true` (`reading`, `readings[].reset`
+у чек-листі) / `meter_reset:true` (`work`); інакше `reading` / `work` → `BAD_REQUEST` («… менший за попередній …»), а в
+чек-листі показник пропускається (`readings_skipped:[{meter_id, value, reason:'lower', prev, message}]`, чек-лист
+зберігається). Перевіряйте це до запису (`Operator` питає «Виправити число» / «Лічильник скинуто / замінено»).
 
 ### 4.3 Черга
 
@@ -518,7 +541,7 @@ field*, emptyState, spinner, kv, bars, stackBar, stateBar, legend, stateLegend, 
 | `Operator.showCheck(id, ts, row?)` | відповіді чек-листа (`check_detail`; `row` — рядок історії для заголовка) → `Promise` закриття |
 | `Operator.showWork(work)` | картка роботи (обʼєкт з історії / `line`) → `Promise` закриття |
 | `Operator.stripHtml(segs, fromMs, toMs, o?)` | HTML стрічки станів за вікно `[from, to)`; `segs = [{state, from, to, reason?, product?, pending?}]` (мс); `o: {axis, cls, info, label}` |
-| `Operator.evalItem(item, value)` | оцінка відповіді як у ядрі → `{answered, ok: true\|false\|null, text, num}` |
+| `Operator.evalItem(item, value, note?)` | оцінка відповіді як у ядрі → `{answered, ok: true\|false\|null, text, num}`. `note` — примітка до пункту: «Н/З» в обовʼязковому пункті без примітки (або в критичному — завжди) → `ok:false` (зауваження); з приміткою (у некритичному) — `ok:null`. Без `note` «Н/З» в обовʼязковому пункті дає `ok:false` |
 | `Operator.needStartCheck(lineId)` | чи потрібен чек-лист запуску перед «Працює» → `Promise<boolean>` |
 | `Operator.ranSinceOff(lineId)` | чи працювала лінія після останнього «Не працює» → `Promise<true \| false \| null /*невідомо*/>` |
 

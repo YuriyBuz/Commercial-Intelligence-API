@@ -363,7 +363,7 @@ describe('HTTP: doGet / doPost, токен', () => {
     assert.deepEqual(P.post({ action: 'ping', token: 'wrong' }), { ok: true, version: LinesCore.VERSION });
     const r = P.ok(P.call('ping'));
     assert.equal(r.company, 'Foodline Production');
-    assert.equal(r.server, '1.0.0');
+    assert.equal(r.server, '1.1.0');
     assert.equal(r.now, new Date(NOW).toISOString());
   });
 
@@ -796,7 +796,7 @@ describe('сповіщення: листи й журнал «Сповіщенн�
     const n = P.rows('notices')[0];
     assert.equal(n['Тип'], 'Зауваження в чек-листі');
     assert.equal(n['Ключ'], 'check:cbad');
-    assert.equal(n['Статус'], 'sent');
+    assert.equal(n['Статус'], 'Надіслано');
     assert.equal(n['Кому'], 'boss@example.com, chief@example.com');
     P.ok(P.call('checklist', { id: 'cbad', ts: P.iso(), line_id: 'L1', occasion: 'start', answers: [] }));
     assert.equal(P.I.mails.length, 1, 'дублікат чек-листа — без листа');
@@ -821,7 +821,7 @@ describe('сповіщення: листи й журнал «Сповіщенн�
     P.ok(P.call('event', { id: 'r1', ts: P.iso(), line_id: 'L1', state: 'repair' }));
     assert.equal(P.I.mails.length, 0);
     let n = P.rows('notices').at(-1);
-    assert.equal(n['Статус'], 'error');
+    assert.equal(n['Статус'], 'Помилка');
     assert.match(n['Помилка'], /ліміт/);
     P.I.mailQuota(10);
     P.I.failNextMail('Mail service down');
@@ -833,7 +833,7 @@ describe('сповіщення: листи й журнал «Сповіщенн�
     P.ok(P.call('event', { id: 'r3', ts: P.iso(2 * MIN), line_id: 'L1', state: 'repair' }));
     n = P.rows('notices').at(-1);
     assert.equal(n['Ключ'], 'repair:r3');
-    assert.equal(n['Статус'], 'error');
+    assert.equal(n['Статус'], 'Помилка');
     assert.match(n['Помилка'], /Немає отримувачів/);
     assert.equal(P.I.mails.length, 0);
   });
@@ -986,7 +986,7 @@ describe('задачі за розкладом', () => {
     J(P.G.hourlyJob());
     const n = P.rows('notices').filter((x) => x['Тип'] === 'Настав строк ТО');
     assert.equal(n.length, 1);
-    assert.equal(n[0]['Статус'], 'error');
+    assert.equal(n[0]['Статус'], 'Помилка');
     const d = P.rows('notices').filter((x) => /^digest:/.test(x['Ключ']));
     assert.equal(d.length, 1, 'надолужений звіт без отримувачів — одна помилка в журналі');
     assert.match(d[0]['Помилка'], /Немає отримувачів/);
@@ -1810,5 +1810,102 @@ describe('Server.gs: вихідний код', () => {
     // SpreadsheetApp.create — лише в архівуванні (з меню); чужі таблиці не відкриваються
     const code = SERVER_SRC.replace(/\/\*[\s\S]*?\*\//g, '');
     assert.deepEqual(code.match(/SpreadsheetApp\.create\(/g), ['SpreadsheetApp.create(']);
+  });
+});
+
+/* ================================================================== рецензія 4 */
+
+describe('рецензія 4: звіт, відлік рядків із таблиці, PIN керівника, пояс, тексти', () => {
+  test('щоденний звіт не пішов (ліміт Gmail) → LAST_DAILY не ставиться, щогодинна задача повторює; без отримувачів — ні', () => {
+    const P = ready();                                   // 25.09 09:00 за Києвом
+    configure(P);
+    P.ok(P.admin('settings_save', { values: { manager_emails: 'boss@example.com', digest_mode: 'always' } }));
+    const digests = () => P.I.mails.filter((m) => /звіт за/.test(m.subject));
+    P.I.mailQuota(0);
+    let r = J(P.G.dailyJob());
+    assert.equal(r.digest, 'error');
+    assert.equal(r.retry, true);
+    assert.equal(P.I.properties().LAST_DAILY, undefined, 'день не позначено — звіт не надіслано');
+    P.advance(HOUR);
+    r = J(P.G.hourlyJob());
+    assert.equal(r.daily.digest, 'error', 'ще раз спробувала');
+    assert.equal(P.rows('notices').filter((n) => /^digest:/.test(n['Ключ'])).length, 1, 'та сама помилка — один рядок журналу');
+    P.I.mailQuota(100);
+    P.advance(HOUR);
+    r = J(P.G.hourlyJob());
+    assert.equal(r.daily.digest, 'sent');
+    assert.equal(digests().length, 1);
+    assert.equal(P.I.properties().LAST_DAILY, '2026-09-25');
+    P.advance(HOUR);
+    assert.equal(J(P.G.hourlyJob()).daily, undefined);
+    // без отримувачів повтор марний: день позначається, помилка — в журналі
+    P.ok(P.admin('settings_save', { values: { manager_emails: '' } }));
+    P.advance(DAY);
+    r = J(P.G.dailyJob());
+    assert.equal(r.digest, 'error');
+    assert.equal(r.retry, false);
+    assert.equal(P.I.properties().LAST_DAILY, '2026-09-26');
+  });
+
+  test('регламент, доданий прямо в таблицю без «Відлік від дати», отримує відлік уже з першого читання (bootstrap)', () => {
+    const P = ready();
+    configure(P);
+    const st = P.store();
+    st.insert('rules', [{ id: 'R7', line_id: 'L1', title: 'Огляд кожні 10 днів', interval_days: 10, active: true }]);
+    const due1 = P.ok(P.call('bootstrap')).due.find((d) => d.rule_id === 'R7');
+    assert.equal(due1.status, 'ok');
+    const base = P.row('rules', 'R7')['Відлік від дати'];
+    assert.ok(base instanceof Date || base, 'відлік записано в таблицю після першого читання');
+    assert.equal(new Date(P.store().all('rules').find((r) => r.id === 'R7').base_date).toISOString(), P.iso());
+    P.advance(3 * DAY);
+    const due2 = P.ok(P.call('bootstrap')).due.find((d) => d.rule_id === 'R7');
+    assert.equal(due2.criteria[0].used, 3, 'відлік не «їде» за кожним оновленням планшета');
+    assert.equal(due2.summary, 'залишилось 7 дн.');
+    // зайняте блокування: читання працює, відлік — наступного разу
+    st.insert('rules', [{ id: 'R8', line_id: 'L1', title: 'Ще огляд', interval_days: 10, active: true }]);
+    P.I.lock.hold();
+    assert.equal(P.ok(P.call('bootstrap')).ok, true);
+    assert.equal(P.I.lock.attempts.at(-1).timeoutMs, 3000, 'коротке очікування, не 25 с');
+    P.I.lock.release();
+    assert.equal(P.store().all('rules').find((r) => r.id === 'R8').base_date, '');
+    P.ok(P.call('bootstrap'));
+    assert.ok(P.store().all('rules').find((r) => r.id === 'R8').base_date);
+    const n = P.I.lock.attempts.length;
+    P.ok(P.call('bootstrap'));
+    assert.equal(P.I.lock.attempts.length, n, 'усе вже записано — читання без блокування');
+  });
+
+  test('ADMIN_PIN не з 4–8 цифр → попередження в setup і «Показати токен і PIN»; пробіли довкола PIN не заважають', () => {
+    const P = ready();
+    configure(P);
+    const props = P.G.PropertiesService.getScriptProperties();
+    props.setProperty('ADMIN_PIN', 'admin2026');
+    let r = J(P.G.setup());
+    assert.match(r.message, /ADMIN_PIN\) має складатися з 4–8 цифр/);
+    assert.match(J(P.G.showSecrets()).message, /має складатися з 4–8 цифр/);
+    props.setProperty('ADMIN_PIN', ' 482913 ');
+    assert.doesNotMatch(J(P.G.setup()).message, /4–8 цифр/);
+    assert.equal(P.post({ action: 'admin_check', token: P.token, device: 'К', admin: '482913' }).ok, true);
+  });
+
+  test('пояс скрипту Europe/Kiev = Europe/Kyiv: setup не просить міняти appsscript.json', () => {
+    const P = project({ tz: 'Europe/Kiev' });
+    const r = J(P.G.setup());
+    assert.doesNotMatch(r.message, /пояс скрипту/);
+    const Q = project({ tz: 'Europe/Warsaw' });
+    assert.match(J(Q.G.setup()).message, /пояс скрипту \(Europe\/Warsaw\) відрізняється/);
+  });
+
+  test('тексти для розгортання: setup — з відкритого Server.gs; екран планшета названо так, як у майстрі', () => {
+    const P = ready();
+    const msg = J(P.G.showSecrets()).message;
+    assert.match(msg, /«Google-таблиця підприємства» → «Далі» → вставте «Адреса веб-застосунку \(\/exec\)» і «Токен доступу»/);
+    assert.doesNotMatch(msg, /Налаштування пристрою|робота з Google-таблицею/);
+    assert.doesNotMatch(SERVER_SRC, /робота з Google-таблицею/);
+    assert.match(SERVER_SRC, /Відкрийте файл Server\.gs/);
+    const app = readFileSync(fileURLToPath(new URL('../assets/app.js', import.meta.url)), 'utf8');
+    for (const s of ['Google-таблиця підприємства', 'Адреса веб-застосунку (/exec)', 'Токен доступу', 'Перевірити зв’язок']) {
+      assert.ok(app.includes(s), 'у майстрі є «' + s + '»');
+    }
   });
 });

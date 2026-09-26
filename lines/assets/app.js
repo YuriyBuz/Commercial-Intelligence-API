@@ -8,7 +8,7 @@
 var App = (function () {
   'use strict';
 
-  var VERSION = '1.0.0';
+  var VERSION = '1.1.0';
   var OPERATOR_TTL = 14 * 3600 * 1000;
   var esc = UI.esc, icon = UI.icon, fmt = UI.fmt;
   var L = LinesCore.LABELS;
@@ -79,20 +79,16 @@ var App = (function () {
     return h;
   }
   /* лінія працює без чек-листа запуску — одне правило для плитки, екрана лінії й таблиці керівника:
-     запуск цієї роботи позначено «без чек-листа» (або про нього нічого не відомо, а робота почалася недавно —
-     у межах checklist_valid_hours) і відтоді чинного чек-листа запуску не пройдено. Звичайна довга зміна
-     після чек-листа — НЕ порушення (для неї є попередження long_run). */
+     запуск цієї роботи позначено «без чек-листа» і відтоді чек-листа запуску не пройдено (сервер рахує це
+     за подією запуску: status.start_uncovered; черга планшета — Api.lineStatus). Пізній чек-лист закриває
+     питання; звичайна довга зміна після чек-листа — НЕ порушення (для неї є попередження long_run). */
   function checkMissing(s) {
     if (!s || (s.state !== 'run' && s.state !== 'stop') || s.start_check_valid) return false;
-    var S = (state && state.settings) || {}, validMs = (S.checklist_valid_hours || 12) * 3600000;
+    if (Object.prototype.hasOwnProperty.call(s, 'start_uncovered')) return !!s.start_uncovered;
+    // сервер старішої версії (без start_uncovered): лише за позначкою поточної події
     var ws = tms(s.work_since), lc = s.last_check;
-    // чек-лист запуску пройдено вже в цій роботі (зокрема пізній) — навіть якщо його строк минув
     if (lc && lc.occasion === 'start' && !isNaN(ws) && tms(lc.ts) >= ws) return false;
-    if (s.flag === 'no_checklist') return true;
-    // поточна подія й почала цю роботу, і сервер не позначив її — запуск був із чинним чек-листом
-    if (!isNaN(ws) && tms(s.since) === ws) return false;
-    if (S.require_start_checklist === false || isNaN(ws)) return false;
-    return now().getTime() - ws < validMs;
+    return s.flag === 'no_checklist';
   }
   function mode() { return Api.config().mode || ''; }
   function tms(v) { var d = UI.toDate(v); return d ? d.getTime() : NaN; }
@@ -692,7 +688,8 @@ var App = (function () {
     var list = lines();
     var S = state.settings || {};
     var n = Api.net();
-    var fresh = n.boot_at ? fmt.time(new Date(n.boot_at)) : '';
+    // boot_at — час пристрою; показуємо за годинником сервера (як шапка й App.now()), бо годинник планшета може бути неточним
+    var fresh = n.boot_at ? fmt.time(new Date(n.boot_at + Api.skew())) : '';
     var sub = esc(S.company || '') + (fresh ? ' · дані на ' + esc(fresh) + (n.online === false ? ' <span class="c-bad">(офлайн)</span>' : '') : '');
     if (!list.length) {
       host.innerHTML = UI.pageHead({ title: 'Лінії', sub: sub }) + UI.emptyState({ icon: 'grid', title: 'Ліній ще немає',
@@ -1014,7 +1011,10 @@ var App = (function () {
     }
     function aboutHtml() {
       var S = state && state.settings || {};
-      return UI.kv([['Застосунок', 'v' + esc(VERSION) + ' · ядро v' + esc(LinesCore.VERSION)], ['Сервер', state ? 'v' + esc(state.version || '—') : '—'],
+      // «Сервер» — версія Core.gs у Google-таблиці: має збігатися з ядром сторінки (README, розділ оновлення)
+      var srvV = state && state.version, diff = mode() === 'remote' && srvV && srvV !== LinesCore.VERSION;
+      return UI.kv([['Застосунок', 'v' + esc(VERSION) + ' · ядро v' + esc(LinesCore.VERSION)],
+        ['Сервер', (state ? 'v' + esc(srvV || '—') : '—') + (diff ? ' <span class="c-bad">— не збігається з ядром: оновіть Core.gs і Server.gs у Google-таблиці</span>' : '')],
         ['Підприємство', esc(S.company || '—')], ['Часовий пояс', esc(S.tz || '—')],
         ['Офлайн-режим', esc(swState())], ['Керівник', Api.isAdmin() ? 'вхід виконано' : 'не виконано']]) +
         '<div class="btn-row" style="margin-top:14px"><button type="button" class="btn" data-d="update">' + icon('download') + '<span>Оновити застосунок</span></button>' +

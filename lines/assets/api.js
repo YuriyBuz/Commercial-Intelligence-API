@@ -747,10 +747,14 @@ var Api = (function () {
     var isStart = e.state === 'run' && !ctx.ran;
     if (isStart && ctx.requireStart && !s.start_check_valid) s.flag = 'no_checklist';
     else s.flag = e.forced ? 'forced' : '';
+    if (isStart) s.start_uncovered = s.flag === 'no_checklist';
     if (e.state === 'off') {
       s.work_since = null;
+      s.start_uncovered = false;
+      // чек-лист запуску чинний до завершення роботи: «Не працює» після «Працює» / «Простій»
+      // (миття / налаштування / ТО без запуску → «Не працює» його не витрачають — як endsWork у ядрі)
+      if (prev !== 'off' && ctx.ran) s.start_check_valid = false;
       ctx.ran = false;
-      if (prev !== 'off') s.start_check_valid = false;     // чек-лист запуску чинний до завершення роботи
     } else {
       if (prev === 'off' || !s.work_since) s.work_since = e.ts;
       if (e.state === 'run' || e.state === 'stop') ctx.ran = true;
@@ -769,7 +773,8 @@ var Api = (function () {
     var b = bootData || cachedBoot();
     var base = b && b.status && b.status[lineId];
     var s = base ? clone(base) : { line_id: lineId, state: 'off', since: null, product: '', operator: '', staff_id: '', event_id: '', reason: '', note: '', flag: '',
-      cum_h: 0, starts: 0, today_h: 0, last_check: null, start_check_valid: false, long_run: false, work_since: null };
+      cum_h: 0, starts: 0, today_h: 0, last_check: null, start_check_valid: false, long_run: false, work_since: null,
+      ran_since_off: false, start_uncovered: false };
     s.as_of = b ? b.now : null;
     s.pending = 0;
     var ctx = { ran: ranSinceOff(s), requireStart: !(b && b.settings && b.settings.require_start_checklist === false) };
@@ -782,7 +787,7 @@ var Api = (function () {
       } else if (op.action === 'checklist') {
         s.pending++;
         s.last_check = { id: p.id, ts: p.ts, occasion: p.occasion, result: null, pending: true };
-        if (p.occasion === 'start') s.start_check_valid = true;
+        if (p.occasion === 'start') { s.start_check_valid = true; s.start_uncovered = false; }
         var te = p.then_event;
         if (te && te.state) {
           applyEvent(s, { id: te.id, ts: te.ts || p.ts, state: te.state, product: te.product || p.product, operator: p.operator,

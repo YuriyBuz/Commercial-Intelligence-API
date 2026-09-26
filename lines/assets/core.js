@@ -11,7 +11,7 @@
 var LinesCore = (function () {
   'use strict';
 
-  var VERSION = '1.0.0';
+  var VERSION = '1.1.0';
   var MIN = 60000, HOUR = 3600000, DAY = 86400000;
   var FUTURE_SLACK = 2 * MIN;            // допуск на розбіжність годинників клієнта
   var MAX_BACKDATE = 45 * DAY;           // найдавніший час події / чек-листа / показника з клієнта
@@ -293,8 +293,9 @@ var LinesCore = (function () {
     flag: { no_checklist: 'Запуск без чек-листа', no_end_checklist: 'Завершення без чек-листа', forced: 'Запуск попри зауваження' },
     due_status: { ok: 'У нормі', soon: 'Скоро', due: 'Потрібно виконати', none: 'Без інтервалу' },
     notice_kind: { digest: 'Щоденний звіт', due: 'Настав строк ТО', checklist: 'Зауваження в чек-листі', repair: 'Ремонт / аварійна зупинка', test: 'Тест' },
+    notice_status: { sent: 'Надіслано', error: 'Помилка', preview: 'Демо: не надсилалося' },
     // допоміжні набори (не зберігаються в таблицях як enum)
-    day_status: { miss: 'Запуск без чек-листа', warn: 'Із зауваженнями', ok: 'Перевірки виконано', cont: 'Робота без запуску', idle: 'Не працювала' },
+    day_status: { miss: 'Без чек-листа або завершення', warn: 'Із зауваженнями', ok: 'Перевірки виконано', cont: 'Робота без запуску', idle: 'Не працювала' },
     check_value: { ok: 'Норма', fail: 'Зауваження', na: 'Н/З' },
     criterion: { days: 'Календар', hours: 'Мотогодини', meter: 'Лічильник' }
   };
@@ -432,7 +433,8 @@ var LinesCore = (function () {
       col('name', 'Назва'), col('unit_label', 'Од. виміру'), col('mode', 'Тип обліку', 'enum:meter_mode', { def: 'abs' }),
       col('ask_on_end', 'Питати при завершенні роботи', 'bool'), col('sort', 'Порядок', 'num'),
       col('active', 'Активний', 'bool', { def: true }),
-      col('cur_value', 'Поточне значення', 'num', SRV), col('cur_ts', 'Оновлено', 'date', SRV)] },
+      col('cur_value', 'Поточне значення', 'num', SRV), col('cur_ts', 'Оновлено', 'date', SRV),
+      col('reset_ts', 'Останнє скидання', 'date', SRV)] },
     rules: { sheet: 'Регламент ТО і ППР', pk: 'id', kind: 'config', cols: [
       col('id', 'ID', 'id'), col('line_id', 'ID лінії', 'id'), col('unit_id', 'ID агрегату', 'id'),
       col('title', 'Робота'), col('work_type', 'Вид', 'enum:work_type', { def: 'to' }), col('part', 'Деталь / вузол'),
@@ -482,10 +484,10 @@ var LinesCore = (function () {
       col('id', 'ID', 'id'), col('ts', 'Час', 'date'), col('meter_id', 'ID лічильника', 'id'),
       col('line_id', 'ID лінії', 'id'), col('unit_id', 'ID агрегату', 'id'), col('value', 'Значення', 'num'),
       col('mode', 'Тип обліку', 'enum:meter_mode'), col('operator', 'Оператор'), col('event_id', 'ID події', 'id'),
-      col('note', 'Примітка')].concat(logTail()) },
+      col('note', 'Примітка'), col('reset', 'Лічильник скинуто / замінено', 'bool')].concat(logTail()) },
     notices: { sheet: 'Сповіщення', pk: 'id', kind: 'system', cols: [
       col('id', 'ID', 'id'), col('ts', 'Час', 'date'), col('kind', 'Тип', 'enum:notice_kind'), col('key', 'Ключ'),
-      col('to', 'Кому'), col('subject', 'Тема'), col('status', 'Статус'), col('error', 'Помилка')] },
+      col('to', 'Кому'), col('subject', 'Тема'), col('status', 'Статус', 'enum:notice_status'), col('error', 'Помилка')] },
     plan: { sheet: 'План ППР', pk: null, kind: 'system', cols: [
       col('date', 'Дата', 'date'), col('line', 'Лінія'), col('unit', 'Агрегат'), col('title', 'Робота'),
       col('work_type', 'Вид', 'enum:work_type'), col('basis', 'Підстава'), col('status', 'Статус', 'enum:due_status'),
@@ -807,6 +809,7 @@ var LinesCore = (function () {
     var env = makeEnv(envIn);
     var cache = {}, depth = 0;
     var readOnly = false;          // true під час READ-дій handle(): тоді ядро нічого не пише в сховище
+    var pendingInit = false;       // READ-дія знайшла рядки таблиці без відліку (initSheetRows) — хосту варто їх записати
 
     /* кеш живе протягом одного публічного виклику (скидається на вході) */
     function entry(fn) {
@@ -867,6 +870,8 @@ var LinesCore = (function () {
           }
           // PIN не з 4–8 цифр (напр. 427 — клітинка втратила текстовий формат і провідний нуль): увійти з ним не вийде
           if (t === 'staff' && n.pin && !PIN_RE.test(n.pin)) issues.push({ table: t, sheet: sc.sheet, id: n.id, name: n.name, problem: 'bad_pin' });
+          // пункт без «Коли» (порожньо або невідоме значення) не потрапить у жоден чек-лист
+          if (t === 'items' && n.active && !n.occasions.length) issues.push({ table: t, sheet: sc.sheet, id: n.id, name: n.text, problem: 'no_occasion' });
           out.push(n);
         });
         c[t] = out;
@@ -1092,8 +1097,27 @@ var LinesCore = (function () {
       }
       return null;
     }
-    /* перехід лінії в «Не працює» (завершення роботи) — після нього потрібен новий чек-лист запуску */
+    /* перехід лінії в «Не працює» (з іншого стану) */
     function isOffTr(e) { return e.state === 'off' && e.prev_state !== 'off'; }
+    /* завершення роботи: перехід у «Не працює» після того, як лінія працювала («Працює» / «Простій») з
+       попереднього «Не працює». Лише воно «витрачає» чек-лист запуску; миття / налаштування / ТО без запуску
+       → «Не працює» — ні (це підготовка до роботи). list — події лінії за зростанням ts; невідомо (початок
+       списку) — обережно вважаємо завершенням роботи */
+    function endsWork(list, i) {
+      var e = list[i];
+      if (!e || !isOffTr(e)) return false;
+      var ps = e.prev_state;
+      if (ps === 'run' || ps === 'stop') return true;
+      for (var k = i - 1; k >= 0; k--) {
+        var s = list[k].state;
+        if (s === 'run' || s === 'stop') return true;
+        if (s === 'off') return false;
+        ps = list[k].prev_state;
+        if (ps === 'run' || ps === 'stop') return true;
+        if (ps === 'off') return false;
+      }
+      return true;
+    }
     /* відрізки стану лінії у вікні [from, to); evs — непогашені події лінії за зростанням ts */
     function segments(line, evs, from, to) {
       var f = toMs(from), t = toMs(to), out = [];
@@ -1157,7 +1181,8 @@ var LinesCore = (function () {
       // робота триває довше за доступну історію — найраніша відома межа
       return new Date(Math.min(f, line.cur_since ? line.cur_since.getTime() : f));
     }
-    function statusOf(line, evs, checks, now, from) {
+    /* checksFrom — з якого моменту checks повні (типово from) */
+    function statusOf(line, evs, checks, now, from, checksFrom) {
       var S = settings(), K = kit(), t = now.getTime();
       var st = line.cur_state || 'off', last = null, i;
       for (i = evs.length - 1; i >= 0; i--) if (evs[i].id === line.cur_event) { last = evs[i]; break; }
@@ -1170,14 +1195,27 @@ var LinesCore = (function () {
         if (!lastCheck || c.ts >= lastCheck.ts) lastCheck = c;
         if (c.occasion === 'start' && x >= vFrom && x <= t + FUTURE_SLACK && x > newest) newest = x;
       }
-      // чек-лист запуску чинний до першого переходу лінії в «Не працює» після нього (нова зміна — новий чек-лист)
+      // чек-лист запуску чинний до першого завершення роботи лінії після нього (нова зміна — новий чек-лист)
       var valid = false;
       if (newest > -Infinity) {
         var f0 = from ? toMs(from) : (evs.length ? evs[0].ts.getTime() : t);
-        var offs = f0 > newest ? lineEvents(line.id, new Date(newest)) : evs;
-        valid = !offs.some(function (e) { var y = e.ts.getTime(); return isOffTr(e) && y >= newest && y <= t + FUTURE_SLACK; });
+        var offs = f0 > newest ? lineEvents(line.id, new Date(newest - DAY)) : evs;
+        valid = !offs.some(function (e, k) { var y = e.ts.getTime(); return y >= newest && y <= t + FUTURE_SLACK && endsWork(offs, k); });
       }
       var workSince = st !== 'off' ? workStart(line, evs, from, now) : null;
+      // лінія працює без чек-листа запуску: запуск цієї роботи позначено «без чек-листа» і відтоді чек-листа
+      // запуску не пройдено (пізній чек-лист закриває питання; довга зміна після чек-листа — не порушення)
+      var uncovered = false;
+      if ((st === 'run' || st === 'stop') && !valid && S.require_start_checklist) {
+        var se = startEventOf(evs, t), cf0 = toMs(checksFrom || from || 0);
+        if (se && se.flag === 'no_checklist' && se.ts.getTime() >= cf0) {
+          var st0 = se.ts.getTime();
+          uncovered = !checks.some(function (c) {
+            var x = c.ts.getTime();
+            return !c.void && c.line_id === line.id && c.occasion === 'start' && x >= st0 && x <= t + FUTURE_SLACK;
+          });
+        }
+      }
       // чи була лінія в «Працює» / «Простій» після останнього «Не працює» (як ran у addEvent: наступне «Працює» — не запуск)
       var ran = st === 'off' ? false : (st === 'run' || st === 'stop') ? true : ranBefore(evs, evs.length - 1);
       if (ran === null) {
@@ -1193,8 +1231,25 @@ var LinesCore = (function () {
         last_check: lastCheck ? { id: lastCheck.id, ts: lastCheck.ts, occasion: lastCheck.occasion, result: lastCheck.result } : null,
         start_check_valid: valid,
         long_run: !!(st !== 'off' && workSince && (t - workSince.getTime()) / HOUR >= S.long_run_hours),
-        work_since: workSince, ran_since_off: ran
+        work_since: workSince, ran_since_off: ran, start_uncovered: uncovered
       };
+    }
+    /* подія запуску поточної роботи (перше «Працює» після останнього переходу з «Не працює») або null */
+    function startEventOf(evs, t) {
+      var j = -1, i;
+      for (i = evs.length - 1; i >= 0; i--) {
+        var e = evs[i];
+        if (e.ts.getTime() > t) continue;
+        if (e.state === 'off') return null;
+        if (e.prev_state === 'off') { j = i; break; }
+      }
+      if (j < 0) return null;
+      for (i = j; i < evs.length; i++) {
+        if (evs[i].ts.getTime() > t) break;
+        if (evs[i].state === 'off') return null;
+        if (evs[i].state === 'run') return evs[i];
+      }
+      return null;
     }
     function statusFor(lineId, now) {
       var S = settings(), K = kit(), line = find('lines', lineId);
@@ -1204,7 +1259,7 @@ var LinesCore = (function () {
       var evs = lineEvents(line.id, new Date(from));
       var cf = now.getTime() - Math.max(7 * DAY, S.checklist_valid_hours * HOUR);
       var checks = logSince('checks', new Date(cf)).filter(function (c) { return c.line_id === line.id && !c.void; }).sort(byTs);
-      return statusOf(line, evs, checks, now, new Date(from));
+      return statusOf(line, evs, checks, now, new Date(from), new Date(cf));
     }
 
     /* ---------- лічильники ---------- */
@@ -1261,7 +1316,8 @@ var LinesCore = (function () {
           if (cum !== null) cum += v;
           if (start === null) start = Math.max(from.getTime(), r.ts.getTime() - DAY);
         } else {
-          if (cum !== null) inc += Math.max(0, v - cum);
+          // скидання / заміна лічильника — приріст від нуля; зниження без позначки — нова база без приросту
+          if (cum !== null) inc += r.reset ? v : Math.max(0, v - cum);
           cum = v;
           if (start === null) start = r.ts.getTime();
         }
@@ -1303,27 +1359,108 @@ var LinesCore = (function () {
         mval[m.id] = m.cur_ts && m.cur_ts.getTime() > now.getTime() ? meterValueAt(m, now) : (m.cur_value || 0);
         avgM[m.id] = meterAvg(m, rBy[m.id] || [], from, now);
       });
-      cache.dc = { now: now, S: S, from: from, evBy: evBy, avgH: avgH, cum: cum, avgM: avgM, mval: mval };
+      cache.dc = { now: now, S: S, from: from, evBy: evBy, avgH: avgH, cum: cum, avgM: avgM, mval: mval, rBy: rBy, deepR: {}, deepE: {} };
       return cache.dc;
     }
-    function critLeftText(c) {
-      if (c.kind === 'days') { var d = Math.floor(c.left); return d >= 1 ? fmtNum(d) + ' дн.' : 'менше доби'; }
+    /* календарних днів заводу від a до b (різниця днів, а не повних діб) */
+    function calDays(a, b) { var K = kit(); return keyDiff(K.key(a), K.key(b)); }
+    function critLeftText(c, now) {
+      if (c.kind === 'days') { var d = c.due_date ? calDays(now, c.due_date) : Math.floor(c.left); return d >= 1 ? fmtNum(d) + ' дн.' : 'менше доби'; }
       if (c.kind === 'hours') return (c.left >= 1 ? fmtNum(Math.round(c.left)) : '<1') + ' мотогод';
       return fmtNum(Math.round(c.left)) + ' ' + c.unit_label;
     }
-    function critOverText(c) {
+    function critOverText(c, now) {
       var over = -c.left;
-      if (c.kind === 'days') { var d = Math.floor(over); return d >= 1 ? 'прострочено на ' + fmtNum(d) + ' дн.' : 'строк настав сьогодні'; }
+      if (c.kind === 'days') {
+        var d = c.due_date ? calDays(c.due_date, now) : Math.floor(over);
+        return d >= 1 ? 'прострочено на ' + fmtNum(d) + ' дн.' : 'строк настав сьогодні';
+      }
       if (c.kind === 'hours') return 'перевищено на ' + fmtNum(Math.round(over)) + ' мотогод';
       return 'перевищено на ' + fmtNum(Math.round(over)) + ' ' + c.unit_label;
     }
-    function dueSummary(status, crit) {
+    function dueSummary(status, crit, now) {
       if (!crit.length) return 'без інтервалу';
       if (status === 'due') {
         var over = crit.filter(function (c) { return c.left <= 0; });
-        return (over.length ? over : crit).map(critOverText).join(' · ');
+        return (over.length ? over : crit).map(function (c) { return critOverText(c, now); }).join(' · ');
       }
-      return 'залишилось ' + crit.map(critLeftText).join(' · ');
+      return 'залишилось ' + crit.map(function (c) { return critLeftText(c, now); }).join(' · ');
+    }
+    /* показники лічильника після since: з вікна середніх (dc) або окремим читанням журналу (кеш у dc) */
+    function readsFor(dc, m, since) {
+      var t = toMs(since);
+      if (t >= dc.from.getTime()) return (dc.rBy[m.id] || []).filter(function (r) { return r.ts.getTime() > t; });
+      var c = dc.deepR[m.id];
+      if (!c || c.t > t) {
+        c = dc.deepR[m.id] = { t: t, rs: logSince('readings', new Date(t)).filter(function (r) { return r.meter_id === m.id && !r.void; }).sort(byTs) };
+      }
+      return c.rs.filter(function (r) { return r.ts.getTime() > t; });
+    }
+    /* напрацювання лічильника за показниками rs від стартової точки st {t0, prev (показник), used}: «лічильник
+       скинуто / замінено» — рахунок з нуля; зниження без позначки (напр. помилка вводу в таблиці) — нова база без
+       приросту (як meterAvg), тож напрацювання не зменшується. thr — інтервал: cross — момент, коли напрацювання
+       досягло його (інтерполяція між двома показниками), або null */
+    function meterUse(m, rs, now, thr, st) {
+      var t = now.getTime(), prev = st.prev, used = st.used, pT = st.t0, cross = null;
+      for (var i = 0; i < rs.length; i++) {
+        var r = rs[i], x = r.ts.getTime();
+        if (r.void || x <= st.t0 || x > t) continue;
+        var v = r.value || 0, md = r.mode || m.mode || 'abs', d;
+        if (md === 'inc') { d = v; prev += v; } else if (r.reset) { d = v; prev = v; } else { d = Math.max(0, v - prev); prev = v; }
+        if (cross === null && thr > 0 && d > 0 && used < thr && used + d >= thr) cross = new Date(Math.round(pT + (x - pT) * ((thr - used) / d)));
+        used += d;
+        pT = x;
+      }
+      return { used: r4(used), cross: cross };
+    }
+    /* напрацювання лічильника від відліку регламенту. Простий випадок — показник зараз мінус відлік; після
+       скидання / зниження показника або коли інтервал перевищено (потрібен момент перевищення) — за показниками.
+       Прострочене з давнім відліком: спершу вікно середніх (без читання журналу), глибше — лише якщо перевищення
+       сталося раніше за вікно */
+    function meterDue(meter, refDate, refMeter, IM, mv, dc) {
+      var now = dc.now, t0 = refDate.getTime(), simple = mv - refMeter;
+      var reset = !!meter.reset_ts && meter.reset_ts.getTime() > t0;
+      if (!reset && simple >= 0 && simple < IM) return { used: simple, cross: null };
+      if (!reset && simple >= IM && t0 < dc.from.getTime()) {
+        var w = dc.rBy[meter.id] || [], f = w[0];
+        // перший показник вікна — накопичувальний і ще нижче порогу: перевищення — у вікні
+        if (f && (f.mode || meter.mode || 'abs') !== 'inc' && !f.reset && (f.value || 0) - refMeter < IM) {
+          var u = meterUse(meter, w, now, IM, { t0: f.ts.getTime(), prev: f.value || 0, used: (f.value || 0) - refMeter });
+          return { used: Math.max(simple, u.used), cross: u.cross };
+        }
+      }
+      var res = meterUse(meter, readsFor(dc, meter, refDate), now, IM, { t0: t0, prev: refMeter, used: 0 });
+      // без скидань показники дають те саме, що й просте віднімання (якщо їх бракує — довіряємо поточному значенню)
+      return { used: reset || simple < 0 ? res.used : Math.max(simple, res.used), cross: res.cross };
+    }
+    /* події лінії для пошуку моменту, коли мотогодини досягли thr: вікно середніх, а якщо поріг перейдено ще
+       до вікна (і відлік давніший за нього) — окремим читанням журналу від відліку (кеш у dc) */
+    function eventsFor(dc, line, since, thr) {
+      var t = toMs(since), w = dc.evBy[line.id] || [];
+      // перша відома точка — перша подія вікна або (подій у вікні немає) поточний стан лінії
+      var c0 = w.length ? (w[0].cum_h || 0) : (line.cur_since ? line.cur_cum_h || 0 : 0);
+      if (t >= dc.from.getTime() || c0 < thr) return w;
+      var c = dc.deepE[line.id];
+      if (!c || c.t > t) c = dc.deepE[line.id] = { t: t, evs: lineEvents(line.id, new Date(t)) };
+      return c.evs;
+    }
+    /* момент, коли мотогодини лінії досягли thr (не раніше floorMs), за подіями evs (зростання ts) і поточним станом */
+    function hoursCross(line, evs, thr, floorMs, now) {
+      var pts = evs.map(function (e) { return { ts: e.ts, state: e.state, prev_state: e.prev_state, cum_h: e.cum_h || 0 }; });
+      var cur = lineCurSnap(line), t = now.getTime();
+      if (cur && (!pts.length || cur.ts.getTime() > pts[pts.length - 1].ts.getTime())) pts.push(cur);
+      for (var i = 0; i < pts.length; i++) {
+        var p = pts[i], a = p.ts.getTime(), c0 = p.cum_h;
+        if (a > t) break;
+        if (c0 >= thr) {
+          // досягнуто до цієї точки: у відрізку «Працює» перед нею (початок списку — назад від неї)
+          var back = i === 0 && p.prev_state === 'run' ? a - (c0 - thr) * HOUR : a;
+          return new Date(Math.max(floorMs, Math.min(a, back)));
+        }
+        var end = i + 1 < pts.length ? Math.min(pts[i + 1].ts.getTime(), t) : t;
+        if (p.state === 'run' && c0 + (end - a) / HOUR >= thr) return new Date(Math.max(floorMs, Math.round(a + (thr - c0) * HOUR)));
+      }
+      return null;
     }
     /* + n календарних днів у поясі заводу зі збереженням часу доби (DST-коректно); дробова частина — як тривалість */
     function calAdd(d, n) {
@@ -1361,19 +1498,27 @@ var LinesCore = (function () {
       }
       if (rule.interval_hours > 0 && line) {
         var IH = rule.interval_hours, cumNow = has(dc.cum, line.id) ? dc.cum[line.id] : cumAt(line, now);
-        var usedH = cumNow - refHours, leftH = IH - usedH, avg = dc.avgH[line.id] || 0;
+        var usedH = cumNow - refHours, leftH = IH - usedH, avg = dc.avgH[line.id] || 0, fcH = avg > 0, dh = null;
+        if (usedH >= IH) {
+          // перевищено: строк — коли мотогодини справді досягли порогу (за журналом), а не прогноз назад за середнім
+          dh = hoursCross(line, eventsFor(dc, line, refDate, refHours + IH), refHours + IH, refDate.getTime(), now);
+          if (dh) fcH = false;
+        }
         // перевищено, а прогнозу немає (лінія стоїть) — строк уже настав: сьогодні
-        var dh = avg > 0 ? new Date(t + leftH / avg * DAY) : (usedH >= IH ? new Date(t) : null);
+        if (!dh) dh = avg > 0 ? new Date(t + leftH / avg * DAY) : (usedH >= IH ? new Date(t) : null);
         crit.push({ kind: 'hours', interval: IH, used: r2(usedH), left: r2(leftH), pct: usedH / IH,
-          due_date: dh, unit_label: 'мотогод', forecast: avg > 0, avg: avg, period_days: avg > 0 ? r2(IH / avg) : null });
+          due_date: dh, unit_label: 'мотогод', forecast: fcH, avg: avg, period_days: avg > 0 ? r2(IH / avg) : null });
       }
       if (meter && rule.interval_meter > 0) {
         var IM = rule.interval_meter, mv = has(dc.mval, meter.id) ? dc.mval[meter.id] : (meter.cur_value || 0);
-        var usedM = mv - refMeter, leftM = IM - usedM, am = dc.avgM[meter.id] || 0;
-        var dm = am > 0 ? new Date(t + leftM / am * DAY) : (usedM >= IM ? new Date(t) : null);
+        var am = dc.avgM[meter.id] || 0, mu = meterDue(meter, refDate, refMeter, IM, mv, dc);
+        var usedM = Math.max(0, mu.used), leftM = IM - usedM, fcM = am > 0, dm = null;
+        // перевищено: строк — коли показник справді перейшов поріг (між двома показниками), а не прогноз назад
+        if (usedM >= IM && mu.cross) { dm = mu.cross; fcM = false; }
+        if (!dm) dm = am > 0 ? new Date(t + leftM / am * DAY) : (usedM >= IM ? new Date(t) : null);
         crit.push({ kind: 'meter', interval: IM, used: r2(usedM), left: r2(leftM), pct: usedM / IM,
           due_date: dm, unit_label: meter.unit_label || 'од.',
-          forecast: am > 0, avg: am, meter_id: meter.id, period_days: am > 0 ? r2(IM / am) : null });
+          forecast: fcM, avg: am, meter_id: meter.id, period_days: am > 0 ? r2(IM / am) : null });
       }
       var pct = null, dueDate = null, driver = null, basis = null, bc = null;
       crit.forEach(function (c) {
@@ -1391,7 +1536,7 @@ var LinesCore = (function () {
         var byDays = !!dueDate && dueDate.getTime() - t <= wd * DAY && !(bc && bc.period_days !== null && wd >= bc.period_days);
         status = (pct * 100 >= wp || byDays) ? 'soon' : 'ok';
       }
-      var summary = dueSummary(status, crit);
+      var summary = dueSummary(status, crit, now);
       crit.forEach(function (c) { c.pct = r4(c.pct); });
       return {
         rule_id: rule.id, line_id: rule.line_id, unit_id: rule.unit_id, title: rule.title, work_type: rule.work_type,
@@ -1432,7 +1577,7 @@ var LinesCore = (function () {
         if (n) patches.push(p);
       });
       if (!patches.length) return;
-      if (readOnly) patchCached('rules', patches);
+      if (readOnly) { patchCached('rules', patches); pendingInit = true; }
       else patchRows('rules', patches);
     }
     /* агрегати, додані прямо в таблиці (без «Мотогодини лінії при додаванні»): напрацювання — від «Створено»
@@ -1449,7 +1594,7 @@ var LinesCore = (function () {
         patches.push(p);
       });
       if (!patches.length) return;
-      if (readOnly) patchCached('units', patches);
+      if (readOnly) { patchCached('units', patches); pendingInit = true; }
       else patchRows('units', patches);
     }
     function initSheetRows() { initSheetRules(); initSheetUnits(); }
@@ -1547,9 +1692,26 @@ var LinesCore = (function () {
       if (!keys.length) return res;
       var bounds = keys.map(function (k) { return { key: k, a: K.start(k).getTime(), b: K.start(keyAdd(k, 1)).getTime() }; });
       var first = bounds[0].a, last = Math.min(bounds[bounds.length - 1].b, now.getTime());
+      var LR = settings().long_run_hours;
       lines.forEach(function (l) {
         var evs = data.evBy[l.id] || [], chs = data.checkBy[l.id] || [];
         var segs = segments(l, evs, first, last);
+        // зміна (від виходу з «Не працює» до наступного «Не працює», лінія працювала), що тривала довше за
+        // long_run_hours без завершення, — порушення дня, коли вона почалася (як позначка long_run на планшеті)
+        var longBy = {}, ws = null, wr = false;
+        evs.forEach(function (e) {
+          var x = e.ts.getTime();
+          if (x > now.getTime()) return;
+          if (e.state !== 'off' && e.prev_state === 'off' && ws === null) { ws = x; wr = false; }
+          if (ws !== null && (e.state === 'run' || e.state === 'stop')) wr = true;
+          if (e.state === 'off') {
+            if (ws !== null && wr && (x - ws) / HOUR >= LR) { var k0 = K.key(new Date(ws)); longBy[k0] = (longBy[k0] || 0) + 1; }
+            ws = null;
+          }
+        });
+        if (ws !== null && wr && (l.cur_state || 'off') !== 'off' && (now.getTime() - ws) / HOUR >= LR) {
+          var k1 = K.key(new Date(ws)); longBy[k1] = (longBy[k1] || 0) + 1;
+        }
         res[l.id] = bounds.map(function (bd) {
           var starts = 0, nc = 0, ne = 0, forced = 0, dayChecks = [], badCheck = false;
           evs.forEach(function (e, i) {
@@ -1567,14 +1729,14 @@ var LinesCore = (function () {
             if ((c.occasion === 'start' || c.occasion === 'changeover') && (c.result === 'remarks' || c.result === 'fail')) badCheck = true;
           });
           var runH = clipHours(segs, bd.a, Math.min(bd.b, last)).run;
-          var uncovered = nc + ne, status;
-          if (uncovered > 0) status = 'miss';
+          var uncovered = nc + ne, longRuns = longBy[bd.key] || 0, status;
+          if (uncovered > 0 || longRuns > 0) status = 'miss';
           else if (badCheck || forced > 0) status = 'warn';
           else if (starts > 0 || dayChecks.length > 0) status = 'ok';
           else if (runH > 0) status = 'cont';
           else status = 'idle';
           return { day: bd.key, status: status, starts: starts, covered: Math.max(0, starts - nc), run_h: r2(runH),
-            checks: dayChecks, uncovered: uncovered, forced: forced };
+            checks: dayChecks, uncovered: uncovered, forced: forced, long_runs: longRuns };
         });
       });
       return res;
@@ -1715,7 +1877,7 @@ var LinesCore = (function () {
       var cf = new Date(now.getTime() - Math.max(7 * DAY, S.checklist_valid_hours * HOUR));
       var chBy = groupBy(logSince('checks', cf).filter(function (c) { return !c.void; }).sort(byTs), 'line_id');
       var status = {};
-      lines.forEach(function (l) { status[l.id] = statusOf(l, dc.evBy[l.id] || [], chBy[l.id] || [], now, dc.from); });
+      lines.forEach(function (l) { status[l.id] = statusOf(l, dc.evBy[l.id] || [], chBy[l.id] || [], now, dc.from, cf); });
       var units = tbl('units').filter(keep).sort(bySort).map(function (u) {
         var o = copy(u);
         o.hours = r2((u.hours_offset || 0) + (has(dc.cum, u.line_id) ? dc.cum[u.line_id] : 0) - (u.base_cum || 0));
@@ -1863,22 +2025,23 @@ var LinesCore = (function () {
       });
     }
     /* чинний чек-лист запуску для запуску о ts: у вікні [ts − checklist_valid_hours, ts + 2 хв] і пізніший
-       за останній перехід лінії в «Не працює» до запуску (offFn → мс, ліниво; -Infinity — не було) */
+       за останнє завершення роботи лінії до запуску (offFn → мс, ліниво; -Infinity — не було) */
     function hasStartCheck(checks, ts, offFn) {
       var S = settings(), t = ts.getTime(), a = t - S.checklist_valid_hours * HOUR, b = t + FUTURE_SLACK, nb = -Infinity;
       checks.forEach(function (c) { var x = c.ts.getTime(); if (x >= a && x <= b && x > nb) nb = x; });
       if (nb === -Infinity) return false;
       return !offFn || offFn() < nb;
     }
-    /* останній перехід лінії в «Не працює» не пізніше ref (подія — з урахуванням порядку byTs, або момент часу).
-       Читаємо лише вікно чинності чек-листа: давніші переходи на чинність уже не впливають */
+    /* останнє завершення роботи лінії (endsWork) не пізніше ref (подія — з урахуванням порядку byTs, або момент часу).
+       Читаємо лише вікно чинності чек-листа (+ добу — щоб знати, чи лінія працювала перед «Не працює»):
+       давніші завершення на чинність уже не впливають */
     function lastOffUpTo(lineId, ref) {
       var isEv = !!(ref && ref.ts), t = isEv ? ref.ts.getTime() : toMs(ref);
-      var evs = lineEvents(lineId, new Date(t - settings().checklist_valid_hours * HOUR - FUTURE_SLACK));
+      var evs = lineEvents(lineId, new Date(t - settings().checklist_valid_hours * HOUR - FUTURE_SLACK - DAY));
       for (var i = evs.length - 1; i >= 0; i--) {
         var e = evs[i];
         if (isEv ? byTs(e, ref) > 0 : e.ts.getTime() > t) continue;
-        if (isOffTr(e)) return e.ts.getTime();
+        if (endsWork(evs, i)) return e.ts.getTime();
       }
       return -Infinity;
     }
@@ -1927,7 +2090,7 @@ var LinesCore = (function () {
         var start = e.state === 'run' && !ran;
         var st = (prev ? prev.starts : 0) + (start ? 1 : 0);
         var fl = flagFor(e, ps, start, e.flag === 'forced', getChecks, offAt);
-        if (e.state === 'off' && ps !== 'off') lastOff = e.ts.getTime();
+        if (e.state === 'off' && ps !== 'off' && ran) lastOff = e.ts.getTime();     // завершення роботи (лінія працювала)
         var cumChanged = e.prev_state !== ps || e.cum_h === null || Math.abs(e.cum_h - cum) > 1e-4;
         if (cumChanged || e.starts !== st || e.flag !== fl) {
           patches.push({ id: e.id, prev_state: ps, cum_h: cum, starts: st, flag: fl });
@@ -2163,20 +2326,22 @@ var LinesCore = (function () {
     }
     /* чек-лист запуску, що надійшов ПІСЛЯ події запуску (інший пристрій / черга): знімаємо «Запуск без чек-листа»
        з запусків, які він покриває (ts у [чек-лист − 2 хв, чек-лист + checklist_valid_hours] і до першого
-       переходу лінії в «Не працює» після чек-листа) */
+       завершення роботи лінії після чек-листа — endsWork) */
     function clearNoChecklist(line, cts) {
       var S = settings();
       if (!S.require_start_checklist || !line) return;
       var c = cts.getTime(), a = c - FUTURE_SLACK, b = c + S.checklist_valid_hours * HOUR;
       if (!line.cur_since || line.cur_since.getTime() < a) return;          // подій після чек-листа немає
-      var evs = logSince('events', new Date(a)).filter(function (e) {
+      // на добу раніше — щоб знати, чи працювала лінія перед «Не працює» (endsWork)
+      var evs = logSince('events', new Date(a - DAY)).filter(function (e) {
         return e.line_id === line.id && !e.void && e.ts.getTime() <= b;
       }).sort(byTs);
       var ps = [];
       for (var i = 0; i < evs.length; i++) {
         var e = evs[i];
+        if (e.ts.getTime() < a) continue;
         if (e.flag === 'no_checklist') ps.push({ id: e.id, flag: '' });
-        if (isOffTr(e) && e.ts.getTime() >= c) break;                      // робота завершилася — далі чек-лист не чинний
+        if (e.ts.getTime() >= c && endsWork(evs, i)) break;                // робота завершилася — далі чек-лист не чинний
       }
       patchRows('events', ps);
     }
@@ -2204,10 +2369,18 @@ var LinesCore = (function () {
         var m = find('meters', r.meter_id), v = toNum(r.value);
         var md = isBlank(r.mode) ? '' : toEnum('meter_mode', r.mode);
         if (!m || v === null || v < 0 || (!isBlank(r.mode) && !md)) {
-          skipped.push({ meter_id: toStr(r.meter_id), value: toStr(r.value), mode: toStr(r.mode) });
+          skipped.push({ meter_id: toStr(r.meter_id), value: toStr(r.value), mode: toStr(r.mode), reason: 'invalid' });
           return;
         }
-        rds.push({ id: cleanId(r.id, 'readings.id') || id + '-r' + (i + 1), meter_id: m.id, value: v, mode: md, note: r.note });
+        // накопичувальний показник, менший за попередній, без позначки «скинуто / замінено» — не записуємо
+        // (чек-лист зберігається; клієнт перевіряє це до надсилання)
+        var rst = (md || m.mode || 'abs') !== 'inc' && isTrue(r.reset);
+        var pv = (md || m.mode || 'abs') !== 'inc' && !rst ? lowerThanPrev(m, v, ts) : null;
+        if (pv !== null) {
+          skipped.push({ meter_id: m.id, value: toStr(r.value), mode: toStr(r.mode), reason: 'lower', prev: pv, message: lowerMsg(m, v, pv) });
+          return;
+        }
+        rds.push({ id: cleanId(r.id, 'readings.id') || id + '-r' + (i + 1), meter_id: m.id, value: v, mode: md, note: r.note, reset: rst });
       });
       var res, dup = findLog('checks', id, ts);
       if (dup) {
@@ -2251,7 +2424,7 @@ var LinesCore = (function () {
       var check = res.check;
       if (rds.length) {
         res.readings = rds.map(function (r) {
-          return addReadingI({ id: r.id, ts: check.ts, meter_id: r.meter_id, value: r.value, mode: r.mode,
+          return addReadingI({ id: r.id, ts: check.ts, meter_id: r.meter_id, value: r.value, mode: r.mode, reset: r.reset,
             operator: check.operator, event_id: teId, note: r.note }, ctx, MAX_BACKDATE_WORK).reading;
         });
       }
@@ -2300,7 +2473,7 @@ var LinesCore = (function () {
         meter = find('meters', p.meter_id);
         if (!meter) throw notFound('Лічильник не знайдено: ' + toStr(p.meter_id));
       } else if (rule && rule.meter_id) meter = find('meters', rule.meter_id);
-      var mv = toNum(p.meter_value);
+      var mv = toNum(p.meter_value), mreset = isTrue(p.meter_reset);
       if (!isBlank(p.meter_value) && (mv === null || mv < 0)) throw bad('Невірний показник лічильника');
       var dup = findLog('works', id, ts);
       if (dup) {
@@ -2308,7 +2481,7 @@ var LinesCore = (function () {
         var rd = { ok: true, work: dup, duplicate: true };
         if (!dup.void) {
           if (meter && mv !== null) {
-            rd.reading = addReadingI({ id: id + '-m', ts: dup.ts, meter_id: meter.id, value: mv, mode: 'abs', operator: dup.performer,
+            rd.reading = addReadingI({ id: id + '-m', ts: dup.ts, meter_id: meter.id, value: mv, mode: 'abs', reset: mreset, operator: dup.performer,
               note: 'Показник під час роботи «' + dup.title + '»' }, ctx, MAX_BACKDATE_WORK).reading;
           }
           var rl = rule ? find('rules', rule.id) : null;
@@ -2319,6 +2492,11 @@ var LinesCore = (function () {
         }
         if (rule) rd.due = computeDue(find('rules', rule.id), dueCtx(nowD()));
         return rd;
+      }
+      // показник, менший за попередній, — лише з позначкою meter_reset (лічильник скинуто / замінено); до запису роботи
+      if (meter && mv !== null && !mreset) {
+        var pvw = lowerThanPrev(meter, mv, ts);
+        if (pvw !== null) throw bad(lowerMsg(meter, mv, pvw));
       }
       var dur = toNum(p.duration_min), down = toNum(p.downtime_min);
       if (dur === null && started) dur = Math.round((ts.getTime() - started.getTime()) / MIN);
@@ -2334,7 +2512,7 @@ var LinesCore = (function () {
       insertRows('works', [w]);
       var res = { ok: true, work: w };
       if (meter && mv !== null) {
-        res.reading = addReadingI({ id: id + '-m', ts: ts, meter_id: meter.id, value: mv, mode: 'abs', operator: w.performer,
+        res.reading = addReadingI({ id: id + '-m', ts: ts, meter_id: meter.id, value: mv, mode: 'abs', reset: mreset, operator: w.performer,
           note: 'Показник під час роботи «' + w.title + '»' }, ctx, MAX_BACKDATE_WORK).reading;
       }
       if (rule && status === 'done' && (!rule.last_date || ts.getTime() >= rule.last_date.getTime())) {
@@ -2345,6 +2523,17 @@ var LinesCore = (function () {
     }
 
     /* ---------- WRITE: показник лічильника ---------- */
+    /* попередній показник, якщо накопичувальний v менший за нього (інакше null): для найновішого — поточне
+       значення лічильника, для показника «із минулого» — значення на його час */
+    function lowerThanPrev(m, v, ts) {
+      if (!m.cur_ts) return null;
+      var pv = ts.getTime() >= m.cur_ts.getTime() ? (m.cur_value || 0) : meterValueAt(m, ts);
+      return v < pv - 1e-9 ? r4(pv) : null;
+    }
+    function lowerMsg(m, v, pv) {
+      return 'Показник «' + m.name + '» ' + fmtNum(v) + ' менший за попередній ' + fmtNum(pv) +
+        '. Перевірте число; якщо лічильник замінили або скинули — позначте «Лічильник скинуто / замінено».';
+    }
     function addReading(p, ctx) { return addReadingI(p, ctx, MAX_BACKDATE); }
     function addReadingI(p, ctx, maxBack) {
       p = p || {}; ctx = ctx || {};
@@ -2356,6 +2545,7 @@ var LinesCore = (function () {
       if (v < 0) throw bad('Показник не може бути відʼємним');
       var mode = isBlank(p.mode) ? (m.mode || 'abs') : toEnum('meter_mode', p.mode);
       if (!mode) throw bad('Невідомий тип обліку: ' + toStr(p.mode));
+      var reset = mode !== 'inc' && isTrue(p.reset);
       var ts = clampTs(p.ts, now, maxBack);
       var id = cleanId(p.id, 'id') || env.uuid();
       var dup = findLog('readings', id, ts);
@@ -2367,12 +2557,19 @@ var LinesCore = (function () {
         }
         return { ok: true, reading: dup, meter: meterView(find('meters', m.id)), duplicate: true };
       }
+      // накопичувальний показник, менший за попередній, — помилка вводу або скидання / заміна лічильника:
+      // без явної позначки reset не приймаємо (інакше строк ТО «за лічильником» мовчки став би «У нормі»)
+      if (mode !== 'inc' && !reset) {
+        var pv = lowerThanPrev(m, v, ts);
+        if (pv !== null) throw bad(lowerMsg(m, v, pv));
+      }
       var r = assign(blank('readings'), {
         id: id, ts: ts, meter_id: m.id, line_id: m.line_id, unit_id: m.unit_id, value: v, mode: mode,
-        operator: txt(p.operator, 120), event_id: refId(p.event_id), note: txt(p.note, 1000), device: dev(ctx, p),
+        operator: txt(p.operator, 120), event_id: refId(p.event_id), note: txt(p.note, 1000), reset: reset, device: dev(ctx, p),
         created: now, 'void': false
       });
       insertRows('readings', [r]);
+      if (reset && (!m.reset_ts || ts.getTime() > m.reset_ts.getTime())) patchRows('meters', [{ id: m.id, reset_ts: ts }]);
       if (!m.cur_ts || ts.getTime() >= m.cur_ts.getTime()) {
         patchRows('meters', [{ id: m.id, cur_value: r4(mode === 'inc' ? (m.cur_value || 0) + v : v), cur_ts: ts }]);
       } else {
@@ -2395,7 +2592,15 @@ var LinesCore = (function () {
       if (!m) throw notFound('Лічильник не знайдено: ' + toStr(id));
       var rs = (allReadings || logAll('readings')).filter(function (r) { return r.meter_id === m.id && !r.void; }).sort(byTs);
       var v = rs.length ? r4(walkMeter(rs, m.mode)) : null;
-      patchRows('meters', [{ id: m.id, cur_value: v, cur_ts: rs.length ? rs[rs.length - 1].ts : null }]);
+      // останнє скидання / зниження накопичувального показника — з нього строки ТО рахують напрацювання за показниками
+      var rst = null, pv = null;
+      rs.forEach(function (r) {
+        var md = r.mode || m.mode || 'abs';
+        if (md === 'inc') { if (pv !== null) pv += r.value || 0; return; }
+        if (r.reset || (pv !== null && (r.value || 0) < pv - 1e-9)) rst = r.ts;
+        pv = r.value || 0;
+      });
+      patchRows('meters', [{ id: m.id, cur_value: v, cur_ts: rs.length ? rs[rs.length - 1].ts : null, reset_ts: rst }]);
       return { ok: true, meter_id: m.id, value: v };
     }
     function recomputeRuleI(id, allWorks) {
@@ -2552,9 +2757,10 @@ var LinesCore = (function () {
       if (!row || typeof row !== 'object' || Array.isArray(row)) throw bad('Не передано дані рядка');
       var now = nowD(), K = kit();
       var id = toStr(row.id);
-      if (id && !ID_RE.test(id)) throw bad('Некоректний ID: ' + id.slice(0, 40));
-      if (t === 'units') initSheetUnits();             // рядок із таблиці без відліку — спершу фіксуємо відлік
+      // новий ID — лише латиниця / цифри / _ . : - ; рядок, доданий у таблиці з іншим ID (напр. «Лінія 4»), редагується як є
       var existing = id ? find(t, id) : null;
+      if (id && !existing && !ID_RE.test(id)) throw bad('Некоректний ID: ' + id.slice(0, 40) + ' (лише латинські літери, цифри, _ . : -)');
+      if (t === 'units') { initSheetUnits(); existing = id ? find(t, id) : null; }   // рядок із таблиці без відліку — спершу фіксуємо відлік
       var inp = {};
       SCHEMA[t].cols.forEach(function (c) {
         if (c.service || c.secret || c.k === 'id' || c.k === 'created' || !has(row, c.k)) return;
@@ -2874,7 +3080,7 @@ var LinesCore = (function () {
           id: toStr(n.id) || env.uuid(), ts: n.ts ? (parseDate(n.ts, kit()) || now) : now,
           kind: toEnum('notice_kind', n.kind) || 'test', key: txt(n.key, 200),
           to: (Array.isArray(n.to) ? n.to : toEmails(n.to)).join(', '), subject: txt(n.subject, 300),
-          status: txt(n.status || 'sent', 20), error: txt(n.error, 500)
+          status: toEnum('notice_status', n.status || 'sent') || 'error', error: txt(n.error, 500)
         });
       });
       insertRows('notices', rows);
@@ -2902,8 +3108,16 @@ var LinesCore = (function () {
       var dayFrom = new Date(now.getTime() - DAY);
       var data = loadWindow(new Date(Math.min(K.start(yKey).getTime(), dayFrom.getTime())), lines);
       var comp = complianceData([yKey], lines, data, now);
-      var uncovered = 0;
-      lines.forEach(function (l) { (comp[l.id] || []).forEach(function (d) { uncovered += d.uncovered; }); });
+      var uncovered = 0, longRuns = 0;
+      lines.forEach(function (l) { (comp[l.id] || []).forEach(function (d) { uncovered += d.uncovered; longRuns += d.long_runs || 0; }); });
+      // лінії, що зараз довше за long_run_hours не в «Не працює» (як позначка long_run в огляді й на планшеті)
+      var running = [];
+      lines.forEach(function (l) {
+        if ((l.cur_state || 'off') === 'off') return;
+        var ws0 = workStart(l, data.evBy[l.id] || [], data.from, now);
+        var h = (now.getTime() - ws0.getTime()) / HOUR;
+        if (h >= S.long_run_hours) running.push({ line: l, since: ws0, h: h });
+      });
       var chk = {};
       data.checks.forEach(function (c) { chk[c.id] = c; });
       var inDay = function (d) { return d.getTime() >= dayFrom.getTime() && d.getTime() <= now.getTime(); };
@@ -2930,7 +3144,8 @@ var LinesCore = (function () {
         });
       };
       var repairs = repEvents.length + repWorks.filter(function (w) { return !linked(w); }).length;
-      var hasContent = dueItems.length > 0 || soonItems.length > 0 || failed.length > 0 || repairs > 0 || uncovered > 0;
+      var hasContent = dueItems.length > 0 || soonItems.length > 0 || failed.length > 0 || repairs > 0 || uncovered > 0 ||
+        longRuns > 0 || running.length > 0;
 
       var subject = 'Облік ліній — звіт за ' + K.fmtD(now);
       var html = '', text = subject + '\n' + S.company + '\n';
@@ -2955,6 +3170,7 @@ var LinesCore = (function () {
         var d = (comp[l.id] || [])[0];
         if (!d) return;
         var extra = 'запусків: ' + d.starts + (d.uncovered ? ' · без чек-листа: ' + d.uncovered : '') +
+          (d.long_runs ? ' · без завершення понад ' + fmtNum(S.long_run_hours) + ' год: ' + d.long_runs : '') +
           ' · чек-листів: ' + d.checks.length + ' · роботи: ' + fmtNum(d.run_h, 1) + ' год';
         compRows.push(trHtml([pill(label('day_status', d.status), DAY_COLOR[d.status]), esc(l.name) + small(extra)]));
         compText.push('— ' + l.name + ': ' + label('day_status', d.status) + ' (' + extra + ')');
@@ -2963,6 +3179,16 @@ var LinesCore = (function () {
         var ct = 'Щоденні перевірки за вчора (' + K.fmtD(K.start(yKey)) + ')';
         html += h2(ct) + tableHtml(compRows);
         text += '\n' + ct.toUpperCase() + '\n' + compText.join('\n') + '\n';
+      }
+      if (running.length) {
+        var rt = 'Без завершення зміни понад ' + fmtNum(S.long_run_hours) + ' год (' + running.length + ')';
+        html += h2(rt) + tableHtml(running.map(function (x) {
+          return trHtml([pill(label('state', x.line.cur_state), STATE_COLOR[x.line.cur_state] || C.grey),
+            esc(x.line.name) + small('не в «Не працює» з ' + K.fmtDT(x.since) + ' · ' + fmtNum(x.h, 1) + ' год · зміну не завершено')]);
+        }));
+        text += '\n' + rt.toUpperCase() + '\n' + running.map(function (x) {
+          return '— ' + x.line.name + ': ' + label('state', x.line.cur_state) + ' без завершення з ' + K.fmtDT(x.since) + ' (' + fmtNum(x.h, 1) + ' год)';
+        }).join('\n') + '\n';
       }
       if (failed.length) {
         html += h2('Зауваження в чек-листах за добу (' + failed.length + ')') + tableHtml(failed.map(function (a) {
@@ -3019,7 +3245,8 @@ var LinesCore = (function () {
       return {
         subject: subject, html: mailWrap(subject, 'Станом на ' + K.fmtDT(now), html), text: text + textFooter(),
         to: recipients('digest'), has_content: hasContent,
-        counts: { due: dueItems.length, soon: soonItems.length, failed: failed.length, repairs: repairs, uncovered: uncovered, stops: stopEvents.length }
+        counts: { due: dueItems.length, soon: soonItems.length, failed: failed.length, repairs: repairs, uncovered: uncovered,
+          long_runs: longRuns, running_long: running.length, stops: stopEvents.length }
       };
     }
 
@@ -3094,6 +3321,10 @@ var LinesCore = (function () {
       addChecklist: entry(addChecklist),
       addWork: entry(addWork),
       addReading: entry(addReading),
+      // рядки регламенту / агрегатів, додані прямо в таблиці: READ-дія лише обчислила відлік у пам'яті →
+      // хост (Server.gs) одразу записує його під блокуванням, інакше кожне оновлення планшета брало б «зараз»
+      pendingInit: function () { return pendingInit; },
+      initSheetRows: entry(function () { pendingInit = false; initSheetRows(); return { ok: true }; }),
       dueAll: entry(dueList),
       computeDue: entry(function (rule, dc) { return computeDue(rule, dc); }),
       buildPlan: entry(buildPlan),
